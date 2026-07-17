@@ -28,3 +28,4 @@ logs/
 htmlcov/
 .coverage
 .pytest_cache/
+data/

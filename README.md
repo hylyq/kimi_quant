@@ -136,6 +136,36 @@ uv run kimi-quant --mode debate --interval 300
 - **对抗验证**：Bear 和 Bull 互相平衡，Hold 防止 FOMO
 - **可追溯**：每次决策可回溯三方原始论据，便于事后复盘
 
+### LangGraph Checkpointing（状态持久化）
+
+Debate 模式下每个 cycle 的完整状态自动持久化到 SQLite 数据库：
+
+```
+LangGraph StateGraph
+      │
+      ├── checkpointer=SqliteSaver("data/debate.db")
+      │
+      ├── DebateState (每个 cycle 自动保存):
+      │     ├── market_prompt     ← 市场快照
+      │     ├── bull_argument     ← Bull Agent 论据
+      │     ├── bear_argument     ← Bear Agent 论据
+      │     ├── hold_argument     ← Hold Agent 论据
+      │     └── final_signal_json ← Judge 裁决
+      │
+      └── thread_id="btc-perpetual-trading"
+            └── 同一 thread 下形成完整时间线
+```
+
+**能力**：
+- **断点续传**：崩溃重启后 `get_latest_state()` 恢复上次未完成的 cycle
+- **历史回溯**：`--history` 打印所有历史 debate 完整记录
+- **零额外代码**：LangGraph 在每次 `ainvoke()` 后自动写 checkpoint
+
+```bash
+# 查看所有历史辩论记录
+uv run kimi-quant --history
+```
+
 ## LLM 输出格式
 
 Kimi K3 的响应通过 LangChain 结构化输出解析为：
@@ -171,11 +201,13 @@ kimi_quant/
 │   ├── config.py      # 配置管理
 │   ├── data.py        # 市场数据 (Hyperliquid)
 │   ├── llm.py         # 单 Agent 策略 + 共享工具
-│   ├── debate.py      # Multi-Agent 辩论策略 (LangGraph)
+│   ├── debate.py      # Multi-Agent 辩论 + LangGraph Checkpointing
 │   ├── risk.py        # 风控管理
 │   ├── executor.py    # 交易执行
 │   └── main.py        # 主程序入口
-├── .env.example       # 环境变量模板
+├── data/
+│   └── debate.db      # SQLite checkpoint 数据库 (自动生成)
+├── .env.example
 ├── .gitignore
 ├── pyproject.toml
 └── README.md
