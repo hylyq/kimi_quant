@@ -420,10 +420,11 @@ class DebateStrategy:
         }
 
     def build_market_prompt(self, market_data: dict[str, Any]) -> str:
-        """Build the market prompt from data."""
-        from kimi_quant.llm import build_market_prompt
+        """Build the market prompt from data (with multi-timeframe analysis)."""
+        from kimi_quant.data import DataProvider
 
-        return build_market_prompt(market_data)
+        dp = DataProvider.__new__(DataProvider)  # avoid __init__
+        return dp.build_llm_prompt(market_data)
 
     # ─── Public API ──────────────────────────────────────────────────────
 

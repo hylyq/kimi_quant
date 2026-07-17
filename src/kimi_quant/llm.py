@@ -161,8 +161,15 @@ No additional text outside the JSON."""
         )
 
     def build_prompt(self, market_data: dict[str, Any]) -> str:
-        """Build a structured prompt from market data."""
-        return build_market_prompt(market_data)
+        """Build a structured prompt from market data.
+
+        Uses the DataProvider's MarketAnalysis.to_llm_prompt() when available
+        (includes multi-timeframe analysis), falls back to basic prompt.
+        """
+        from kimi_quant.data import DataProvider
+
+        dp = DataProvider.__new__(DataProvider)  # avoid __init__
+        return dp.build_llm_prompt(market_data)
 
     def analyze(self, market_data: dict[str, Any]) -> TradingSignal | None:
         """Analyze market data and return a trading signal.

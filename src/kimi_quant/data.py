@@ -1,10 +1,16 @@
 """Market data fetching from Hyperliquid.
 
-Provides structured market data for the LLM to analyze.
+Provides structured market data for the LLM to analyze:
+  - Market snapshot (prices, funding, OI)
+  - Order book depth with imbalance
+  - Multi-timeframe candle analysis (5m/15m/1h/4h)
+  - Funding rate trend history
+  - Account position state
 """
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from hyperliquid.info import Info
@@ -12,6 +18,9 @@ from hyperliquid.info import Info
 from kimi_quant.config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Data Structures ────────────────────────────────────────────────────
 
 
 @dataclass
@@ -62,7 +71,6 @@ class OrderBookDepth:
     imbalance: float  # positive = bid-heavy, negative = ask-heavy
 
     def to_summary(self, levels: int = 5) -> str:
-        """Render depth summary for LLM."""
         lines = [f"Order Book (top {levels} levels):"]
         lines.append("Bids:")
         for b in self.bids[:levels]:
@@ -73,7 +81,8 @@ class OrderBookDepth:
         lines.append(
             f"Bid/Ask Total: {self.bid_total:.2f} / {self.ask_total:.2f}"
         )
-        lines.append(f"Imbalance: {self.imbalance:.4f}")
+        lines.append(f"Imbalance: {self.imbalance:.4f} "
+                      f"({'bid-heavy' if self.imbalance > 0 else 'ask-heavy'})")
         return "\n".join(lines)
 
 
@@ -101,16 +110,153 @@ class AccountSnapshot:
         )
 
 
+# ─── Candle Analysis ────────────────────────────────────────────────────
+
+
+@dataclass
+class TimeframeSummary:
+    """Technical summary for a single timeframe — compact enough for LLM."""
+
+    interval: str  # "5m", "15m", "1h", "4h"
+    num_candles: int
+    duration_hours: float
+
+    # Trend
+    trend: str  # "up", "down", "sideways"
+    change_pct: float  # % change over the period
+    current_close: float
+    period_open: float
+
+    # Range
+    period_high: float
+    period_low: float
+    current_range_pct: float  # (high-low)/close of last candle
+
+    # Volume
+    total_volume: float
+    avg_volume: float
+    volume_trend: str  # "increasing", "decreasing", "steady"
+
+    # Key levels (simple: recent swing highs/lows)
+    resistance: float | None = None
+    support: float | None = None
+
+    def to_summary(self) -> str:
+        """Compact one-paragraph summary per timeframe."""
+        return (
+            f"  [{self.interval}] {self.num_candles} candles ({self.duration_hours:.1f}h): "
+            f"Trend: {self.trend.upper()} {self.change_pct:+.2f}% | "
+            f"Range: ${self.period_low:.0f}–${self.period_high:.0f} | "
+            f"Current candle range: {self.current_range_pct:.2f}% | "
+            f"Volume: {self.avg_volume:.1f}/candle ({self.volume_trend})"
+            + (
+                f" | Support: ${self.support:.0f} Resistance: ${self.resistance:.0f}"
+                if self.support and self.resistance
+                else ""
+            )
+        )
+
+
+@dataclass
+class FundingTrend:
+    """Funding rate change over time."""
+
+    current: float
+    avg_1h: float
+    avg_8h: float
+    trend: str  # "rising", "falling", "stable"
+    interpretation: str
+
+    def to_summary(self) -> str:
+        return (
+            f"Funding: current={self.current*100:.4f}% | "
+            f"1h avg={self.avg_1h*100:.4f}% | "
+            f"8h avg={self.avg_8h*100:.4f}% | "
+            f"Trend: {self.trend} → {self.interpretation}"
+        )
+
+
+@dataclass
+class MarketAnalysis:
+    """Complete structured analysis combining all data sources."""
+
+    snapshot: MarketSnapshot
+    order_book: OrderBookDepth
+    timeframes: list[TimeframeSummary]
+    funding_trend: FundingTrend | None
+    account: AccountSnapshot | None
+    performance_context: str = ""
+
+    def to_llm_prompt(self) -> str:
+        """Build the full LLM prompt from all analysis components."""
+        parts = ["# Market Data Snapshot\n"]
+        parts.append(self.snapshot.to_summary())
+
+        parts.append("\n# Multi-Timeframe Technical Analysis\n")
+        if self.timeframes:
+            for tf in self.timeframes:
+                parts.append(tf.to_summary())
+        else:
+            parts.append("  (Candle data unavailable — testnet or API error)")
+
+        parts.append("\n# Order Book Depth\n")
+        parts.append(self.order_book.to_summary(levels=5))
+
+        if self.funding_trend:
+            parts.append("\n# Funding Rate Trend\n")
+            parts.append(self.funding_trend.to_summary())
+
+        parts.append("\n# Account Status\n")
+        if self.account:
+            parts.append(self.account.to_summary())
+        else:
+            parts.append("Dry-run mode — no real position.")
+
+        parts.append(
+            f"\n# Instructions\n"
+            f"Max position size: {config.max_position_size} BTC.\n"
+            f"Use the multi-timeframe analysis to assess trend strength "
+            f"and consistency across timeframes. "
+            f"Higher-timeframe trends (1h, 4h) carry more weight. "
+            f"Look for confluence: when all timeframes agree, confidence "
+            f"should be higher.\n"
+        )
+
+        if self.performance_context:
+            parts.append(self.performance_context)
+
+        return "\n".join(parts)
+
+
+# ─── Data Provider ──────────────────────────────────────────────────────
+
+
 class DataProvider:
-    """Fetches and aggregates market data from Hyperliquid."""
+    """Fetches and aggregates market data from Hyperliquid.
+
+    Fetches from mainnet by default for candle data availability;
+    switches to testnet if HYPERLIQUID_TESTNET=true (candles may be empty).
+    """
+
+    # Timeframes to analyze (interval, lookback candles, label)
+    TIMEFRAMES = [
+        ("5m", 24, "1-hour micro structure"),
+        ("15m", 32, "8-hour short-term trend"),
+        ("1h", 48, "48-hour medium-term trend"),
+        ("4h", 42, "7-day macro trend"),
+    ]
 
     def __init__(self):
         if config.hl_testnet:
-            base_url = "https://api.hyperliquid-testnet.xyz"
+            self.base_url = "https://api.hyperliquid-testnet.xyz"
+            self.use_testnet = True
         else:
-            base_url = config.hl_base_url
+            self.base_url = config.hl_base_url
+            self.use_testnet = False
 
-        self.info = Info(base_url=base_url, skip_ws=True)
+        # Always use mainnet for candle data (testnet candles are empty)
+        self._info_mainnet = Info(base_url="https://api.hyperliquid.xyz", skip_ws=True)
+        self._info_local = Info(base_url=self.base_url, skip_ws=True)
         self.coin = config.trading_pair
         logger.info(
             "DataProvider initialized (testnet=%s, coin=%s)",
@@ -118,18 +264,18 @@ class DataProvider:
             self.coin,
         )
 
-    def get_market_snapshot(self) -> MarketSnapshot:
-        """Fetch current market snapshot for the trading pair."""
-        meta = self.info.meta()
-        all_mids = self.info.all_mids()
+    # ─── Market Snapshot ─────────────────────────────────────────────────
 
-        # Find coin metadata
+    def get_market_snapshot(self) -> MarketSnapshot:
+        """Fetch current market snapshot."""
+        info = self._info_local
+        meta = info.meta()
+        all_mids = info.all_mids()
+
         coin_meta = None
-        asset_index = None
-        for i, asset in enumerate(meta["universe"]):
+        for asset in meta["universe"]:
             if asset["name"] == self.coin:
                 coin_meta = asset
-                asset_index = i
                 break
 
         if coin_meta is None:
@@ -142,9 +288,7 @@ class DataProvider:
         open_interest = float(coin_meta.get("openInterest", 0))
         prev_day_px = float(coin_meta.get("prevDayPx", 0))
 
-        # Get L2 order book for bid/ask
-        l2 = self.info.l2_snapshot(self.coin)
-
+        l2 = info.l2_snapshot(self.coin)
         bid_price = float(l2["levels"][0][0]["px"]) if l2["levels"][0] else 0
         ask_price = float(l2["levels"][1][0]["px"]) if l2["levels"][1] else 0
         bid_size = float(l2["levels"][0][0]["sz"]) if l2["levels"][0] else 0
@@ -179,7 +323,8 @@ class DataProvider:
 
     def get_order_book_depth(self, levels: int = 10) -> OrderBookDepth:
         """Fetch order book with aggregated depth."""
-        l2 = self.info.l2_snapshot(self.coin)
+        info = self._info_local
+        l2 = info.l2_snapshot(self.coin)
 
         bids = []
         asks = []
@@ -210,18 +355,180 @@ class DataProvider:
             imbalance=imbalance,
         )
 
-    def get_account_snapshot(
-        self, address: str
-    ) -> AccountSnapshot | None:
+    # ─── Candle Analysis ─────────────────────────────────────────────────
+
+    def _fetch_candles(
+        self, interval: str, lookback_candles: int
+    ) -> list[dict]:
+        """Fetch candles for a given interval.
+
+        Uses mainnet for candle data since testnet candles are empty.
+        """
+        now_ms = int(time.time() * 1000)
+        # Estimate start based on interval
+        interval_minutes = {
+            "5m": 5, "15m": 15, "1h": 60, "4h": 240,
+        }
+        mins = interval_minutes.get(interval, 5)
+        start_ms = now_ms - lookback_candles * mins * 60 * 1000
+
+        try:
+            return self._info_mainnet.candles_snapshot(
+                self.coin, interval, start_ms, now_ms
+            )
+        except Exception as e:
+            logger.warning("Failed to fetch %s candles: %s", interval, e)
+            return []
+
+    def _analyze_timeframe(
+        self, interval: str, lookback_candles: int
+    ) -> TimeframeSummary | None:
+        """Analyze candles for one timeframe and produce a summary."""
+        candles = self._fetch_candles(interval, lookback_candles)
+        if len(candles) < 3:
+            return None
+
+        # Split: recent half vs overall
+        midpoint = len(candles) // 2
+        recent = candles[-midpoint:]
+        oldest_recent = recent[0]
+        latest = candles[-1]
+        first = candles[0]
+
+        # Prices
+        current_close = float(latest["c"])
+        period_open = float(first["o"])
+        period_high = max(float(c["h"]) for c in candles)
+        period_low = min(float(c["l"]) for c in candles)
+        change_pct = ((current_close - period_open) / period_open) * 100
+
+        # Trend direction
+        recent_open = float(oldest_recent["o"])
+        recent_change = ((current_close - recent_open) / recent_open) * 100
+        if recent_change > 0.5:
+            trend = "up"
+        elif recent_change < -0.5:
+            trend = "down"
+        else:
+            trend = "sideways"
+
+        # Current candle range
+        current_range = (
+            (float(latest["h"]) - float(latest["l"])) / float(latest["l"]) * 100
+        ) if float(latest["l"]) > 0 else 0
+
+        # Volume
+        total_volume = sum(float(c["v"]) for c in candles)
+        avg_volume = total_volume / len(candles)
+        recent_vol = sum(float(c["v"]) for c in recent) / len(recent)
+        older_vol = sum(float(c["v"]) for c in candles[:midpoint]) / max(midpoint, 1)
+        if recent_vol > older_vol * 1.2:
+            volume_trend = "increasing"
+        elif recent_vol < older_vol * 0.8:
+            volume_trend = "decreasing"
+        else:
+            volume_trend = "steady"
+
+        # Simple support/resistance from swing points
+        # Resistance: highest close in recent period
+        resistance = max(float(c["h"]) for c in recent[-8:]) if len(recent) >= 8 else period_high
+        support = min(float(c["l"]) for c in recent[-8:]) if len(recent) >= 8 else period_low
+
+        interval_minutes_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+        duration = len(candles) * interval_minutes_map.get(interval, 5) / 60
+
+        return TimeframeSummary(
+            interval=interval,
+            num_candles=len(candles),
+            duration_hours=duration,
+            trend=trend,
+            change_pct=change_pct,
+            current_close=current_close,
+            period_open=period_open,
+            period_high=period_high,
+            period_low=period_low,
+            current_range_pct=current_range,
+            total_volume=total_volume,
+            avg_volume=avg_volume,
+            volume_trend=volume_trend,
+            resistance=resistance,
+            support=support,
+        )
+
+    def get_multi_timeframe_analysis(self) -> list[TimeframeSummary]:
+        """Analyze all configured timeframes."""
+        summaries = []
+        for interval, lookback, _label in self.TIMEFRAMES:
+            tf = self._analyze_timeframe(interval, lookback)
+            if tf:
+                summaries.append(tf)
+            else:
+                logger.warning("No candle data for %s timeframe", interval)
+        return summaries
+
+    # ─── Funding Trend ───────────────────────────────────────────────────
+
+    def get_funding_trend(self) -> FundingTrend | None:
+        """Analyze funding rate changes over time."""
+        try:
+            now_ms = int(time.time() * 1000)
+            history = self._info_mainnet.funding_history(
+                self.coin, now_ms - 24 * 3600 * 1000, now_ms
+            )
+
+            if len(history) < 2:
+                return None
+
+            rates = [float(h["fundingRate"]) for h in history]
+            current = rates[-1]
+            # Funding updates ~hourly on Hyperliquid
+            recent_1h = rates[-2:] if len(rates) >= 2 else rates
+            avg_1h = sum(recent_1h) / len(recent_1h)
+            older = rates[:-4] if len(rates) > 4 else rates[:1]
+            avg_8h = sum(older) / len(older) if older else current
+
+            if current > avg_8h * 1.5:
+                trend = "rising (longs paying more)"
+                interpretation = (
+                    "Funding increasing — longs are becoming more aggressive, "
+                    "potential overcrowding on the long side."
+                )
+            elif current < avg_8h * 0.5 and current < 0:
+                trend = "falling (shorts paying more)"
+                interpretation = (
+                    "Funding turning negative — shorts are becoming aggressive, "
+                    "potential short squeeze setup."
+                )
+            elif abs(current - avg_8h) < avg_8h * 0.3:
+                trend = "stable"
+                interpretation = "Funding stable, no extreme positioning detected."
+            else:
+                trend = "shifting"
+                interpretation = "Funding rate is in transition — monitor closely."
+
+            return FundingTrend(
+                current=current,
+                avg_1h=avg_1h,
+                avg_8h=avg_8h,
+                trend=trend,
+                interpretation=interpretation,
+            )
+        except Exception as e:
+            logger.warning("Failed to fetch funding history: %s", e)
+            return None
+
+    # ─── Account ─────────────────────────────────────────────────────────
+
+    def get_account_snapshot(self, address: str) -> AccountSnapshot | None:
         """Fetch account state. Returns None in dry-run mode."""
         if config.dry_run:
             return None
 
+        info = self._info_local
         try:
-            user_state = self.info.user_state(address)
+            user_state = info.user_state(address)
             positions = user_state.get("assetPositions", [])
 
-            # Find position for our coin
             pos_data = None
             for pos in positions:
                 if pos["position"]["coin"] == self.coin:
@@ -272,14 +579,47 @@ class DataProvider:
             logger.error("Failed to fetch account state: %s", e)
             return None
 
+    # ─── Full Report ─────────────────────────────────────────────────────
+
     def get_full_report(self, address: str | None = None) -> dict[str, Any]:
-        """Get a complete market and account report for the LLM."""
-        report: dict[str, Any] = {
-            "market": self.get_market_snapshot(),
-            "order_book": self.get_order_book_depth(),
+        """Get a complete market report with all components."""
+        snapshot = self.get_market_snapshot()
+        order_book = self.get_order_book_depth()
+        timeframes = self.get_multi_timeframe_analysis()
+        funding_trend = self.get_funding_trend()
+        account = self.get_account_snapshot(address) if address else None
+
+        analysis = MarketAnalysis(
+            snapshot=snapshot,
+            order_book=order_book,
+            timeframes=timeframes,
+            funding_trend=funding_trend,
+            account=account,
+        )
+
+        return {
+            "analysis": analysis,
+            # Backward-compatible keys for existing code
+            "market": snapshot,
+            "order_book": order_book,
+            "account": account,
         }
 
-        if address:
-            report["account"] = self.get_account_snapshot(address)
+    def build_llm_prompt(self, report: dict[str, Any]) -> str:
+        """Build the full LLM prompt from a report dict.
 
-        return report
+        Uses MarketAnalysis.to_llm_prompt() if available,
+        otherwise falls back to the old per-component method.
+        """
+        analysis = report.get("analysis")
+        if analysis:
+            prompt = analysis.to_llm_prompt()
+            # Inject performance context if present
+            perf = report.get("performance_context", "")
+            if perf:
+                prompt += "\n" + perf
+            return prompt
+
+        # Fallback: old-style prompt
+        from kimi_quant.llm import build_market_prompt
+        return build_market_prompt(report)
