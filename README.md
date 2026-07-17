@@ -208,7 +208,7 @@ Redis 连通    → 微信推送（通过 larky WeChatService）
 都没有        → 静默运行
 ```
 
-程序启动时自动 ping Redis，连通即走微信通道。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
+程序启动时自动 ping Redis，连通即走微信通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
 
 ## 快速开始
 
