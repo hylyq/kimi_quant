@@ -9,10 +9,11 @@ Provides structured market data for the LLM to analyze:
 """
 
 import logging
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from hyperliquid.info import Info
 
@@ -34,6 +35,77 @@ except ImportError:
 from kimi_quant.config import config
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+# ─── Retry Utility ────────────────────────────────────────────────────────
+
+# Errors that indicate a transient network issue (not a logic bug).
+# curl error 35 = SSL connect error, often "Connection reset by peer" from
+# TLS fingerprint inspection / rate-limiting on cloud egress gateways.
+_TRANSIENT_SUBSTRINGS = (
+    "Connection reset by peer",
+    "connection reset",
+    "Recv failure",
+    "SSL connect error",
+    "curl: (35)",
+    "curl: (56)",   # CURLE_RECV_ERROR — also transient
+    "curl: (28)",   # CURLE_OPERATION_TIMEDOUT
+    "curl: (7)",    # CURLE_COULDNT_CONNECT
+)
+
+
+def _is_transient_error(error: Exception) -> bool:
+    """Check if an error is likely transient and worth retrying."""
+    msg = str(error)
+    # Also check chained exceptions
+    cause = error.__cause__
+    if cause is not None:
+        msg += " " + str(cause)
+    return any(sub in msg for sub in _TRANSIENT_SUBSTRINGS)
+
+
+def retry_api_call(
+    fn: Callable[[], T],
+    description: str = "API call",
+    max_retries: int = 3,
+    base_delay: float = 1.5,
+) -> T:
+    """Call `fn` with exponential backoff on transient network errors.
+
+    On Alibaba Cloud, the egress gateway performs TLS fingerprint inspection
+    and rate-limits connections. A burst of parallel requests can trigger
+    blanket TCP RSTs that resolve after a short cooldown. Exponential backoff
+    with jitter gives the gateway time to reset.
+
+    Args:
+        fn: Zero-argument callable that makes the API request.
+        description: Human-readable label for log messages.
+        max_retries: Maximum number of retry attempts (default 3).
+        base_delay: Base delay in seconds before first retry (default 1.5).
+
+    Returns:
+        The return value of `fn()`.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries and _is_transient_error(e):
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(
+                    "%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                    description, attempt + 1, max_retries + 1, e, delay,
+                )
+                time.sleep(delay)
+            else:
+                raise
+
+    # Should be unreachable — retries exhausted on transient errors
+    assert last_error is not None
+    raise last_error
 
 
 # ─── Data Structures ────────────────────────────────────────────────────
@@ -305,7 +377,10 @@ class DataProvider:
         mark/oracle/OI). Uses meta_and_asset_ctxs() for full field coverage.
         """
         info = self._info_mainnet
-        meta, asset_ctxs = info.meta_and_asset_ctxs()
+        meta, asset_ctxs = retry_api_call(
+            lambda: info.meta_and_asset_ctxs(),
+            description="meta_and_asset_ctxs",
+        )
 
         # Find BTC in both universe (for name lookup) and asset contexts
         coin_ctx = None
@@ -325,7 +400,10 @@ class DataProvider:
         prev_day_px = float(coin_ctx.get("prevDayPx", 0))
         premium = float(coin_ctx.get("premium", 0))
 
-        l2 = info.l2_snapshot(self.coin)
+        l2 = retry_api_call(
+            lambda: info.l2_snapshot(self.coin),
+            description="l2_snapshot",
+        )
         bid_price = float(l2["levels"][0][0]["px"]) if l2["levels"][0] else 0
         ask_price = float(l2["levels"][1][0]["px"]) if l2["levels"][1] else 0
         bid_size = float(l2["levels"][0][0]["sz"]) if l2["levels"][0] else 0
@@ -363,7 +441,10 @@ class DataProvider:
         Always uses mainnet (testnet order books are too thin to analyze).
         """
         info = self._info_mainnet
-        l2 = info.l2_snapshot(self.coin)
+        l2 = retry_api_call(
+            lambda: info.l2_snapshot(self.coin),
+            description="l2_snapshot (order_book)",
+        )
 
         bids = []
         asks = []
@@ -420,8 +501,11 @@ class DataProvider:
         start_ms = now_ms - lookback_candles * mins * 60 * 1000
 
         try:
-            data = self._info_mainnet.candles_snapshot(
-                self.coin, interval, start_ms, now_ms
+            data = retry_api_call(
+                lambda: self._info_mainnet.candles_snapshot(
+                    self.coin, interval, start_ms, now_ms
+                ),
+                description=f"candles_snapshot({interval})",
             )
             self._candle_cache[interval] = (now_s, data)
             return data
@@ -537,8 +621,11 @@ class DataProvider:
         """Analyze funding rate changes over time."""
         try:
             now_ms = int(time.time() * 1000)
-            history = self._info_mainnet.funding_history(
-                self.coin, now_ms - 24 * 3600 * 1000, now_ms
+            history = retry_api_call(
+                lambda: self._info_mainnet.funding_history(
+                    self.coin, now_ms - 24 * 3600 * 1000, now_ms
+                ),
+                description="funding_history",
             )
 
             if len(history) < 2:
@@ -591,7 +678,10 @@ class DataProvider:
 
         info = self._info_local
         try:
-            user_state = info.user_state(address)
+            user_state = retry_api_call(
+                lambda: info.user_state(address),
+                description="user_state",
+            )
             positions = user_state.get("assetPositions", [])
 
             pos_data = None
@@ -670,15 +760,22 @@ class DataProvider:
         def _fetch_account():
             return self.get_account_snapshot(address) if address else None
 
-        # Run all 5 independent fetches in parallel (4 thread pool)
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {
-                pool.submit(_fetch_snapshot): "snapshot",
-                pool.submit(_fetch_order_book): "order_book",
-                pool.submit(_fetch_timeframes): "timeframes",
-                pool.submit(_fetch_funding): "funding",
-                pool.submit(_fetch_account): "account",
-            }
+        # Run independent fetches with limited concurrency (max_workers=2).
+        # On Alibaba Cloud, too many parallel TLS handshakes trigger rate-based
+        # fingerprint blocking (TCP RST). Low concurrency avoids the threshold.
+        # Tasks are also submitted with a small stagger delay for the same reason.
+        tasks = [
+            (_fetch_snapshot, "snapshot"),
+            (_fetch_order_book, "order_book"),
+            (_fetch_timeframes, "timeframes"),
+            (_fetch_funding, "funding"),
+            (_fetch_account, "account"),
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures: dict[Any, str] = {}
+            for fn, key in tasks:
+                futures[pool.submit(fn)] = key
+                time.sleep(0.15)  # 150ms stagger to avoid TLS handshake burst
 
             for future in as_completed(futures):
                 key = futures[future]
@@ -697,7 +794,7 @@ class DataProvider:
                 except Exception as e:
                     logger.error("Parallel fetch [%s] failed: %s", key, e)
 
-        # Fallback: if any failed, do sequential fetch
+        # Fallback: if any failed, do sequential fetch (retry logic is built in)
         if snapshot is None:
             snapshot = self.get_market_snapshot()
         if order_book is None:
