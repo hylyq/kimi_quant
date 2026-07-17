@@ -257,47 +257,10 @@ class TradeExecutor:
             logger.error("Failed to close position: %s", e)
             return {"action": "CLOSE", "executed": False, "error": str(e)}
 
-    # ─── Modify Orders ───────────────────────────────────────────────────
-
-    def modify_stop_loss(
-        self, oid: int, new_price: float, is_buy: bool, size: float
-    ) -> dict:
-        """Modify an existing stop loss order (e.g., move to breakeven).
-
-        Args:
-            oid: Order ID of the existing stop loss.
-            new_price: New trigger price.
-            is_buy: Direction of the stop loss order.
-            size: Position size.
-        """
-        if self.dry_run:
-            logger.info("DRY RUN: Move SL #%d to $%.1f", oid, new_price)
-            return {"action": "modify_sl", "executed": True, "dry_run": True}
-
-        try:
-            result = self.exchange.modify_order(
-                oid=oid,
-                name=self.coin,
-                is_buy=is_buy,
-                sz=size,
-                limit_px=new_price,
-                order_type={
-                    "trigger": {
-                        "triggerPx": new_price,
-                        "isMarket": True,
-                        "tpsl": "sl",
-                    }
-                },
-                reduce_only=True,
-            )
-            logger.info("Stop loss #%d moved to $%.1f", oid, new_price)
-            return {"action": "modify_sl", "executed": True, "result": result}
-        except Exception as e:
-            logger.error("Failed to modify stop loss #%d: %s", oid, e)
-            return {"action": "modify_sl", "executed": False, "error": str(e)}
+    # ─── Cancel Orders ──────────────────────────────────────────────────
 
     def cancel_order(self, oid: int) -> dict:
-        """Cancel a single order by ID."""
+        """Cancel a single order by exchange-assigned order ID."""
         if self.dry_run:
             logger.info("DRY RUN: Cancel order #%d", oid)
             return {"action": "cancel", "executed": True, "dry_run": True}
@@ -309,6 +272,120 @@ class TradeExecutor:
         except Exception as e:
             logger.error("Failed to cancel order #%d: %s", oid, e)
             return {"action": "cancel", "executed": False, "error": str(e)}
+
+    def cancel_by_cloid(self, cloid: str) -> dict:
+        """Cancel an order by client-assigned order ID (cloid).
+
+        Prefer this over cancel_order() when you set a cloid at order
+        creation — it's more reliable since you control the ID.
+        """
+        if self.dry_run:
+            logger.info("DRY RUN: Cancel order cloid=%s", cloid)
+            return {"action": "cancel", "executed": True, "dry_run": True}
+
+        try:
+            result = self.exchange.cancel_by_cloid(self.coin, cloid)
+            logger.info("Order cloid=%s cancelled", cloid)
+            return {"action": "cancel", "executed": True, "result": result}
+        except Exception as e:
+            logger.error("Failed to cancel cloid=%s: %s", cloid, e)
+            return {"action": "cancel", "executed": False, "error": str(e)}
+
+    def cancel_all_orders(self) -> dict:
+        """Cancel ALL open orders for the trading pair.
+
+        Useful on shutdown or before opening a new position to ensure
+        no stale orders remain.
+        """
+        if self.dry_run:
+            logger.info("DRY RUN: Cancel all %s orders", self.coin)
+            return {"action": "cancel_all", "executed": True, "dry_run": True}
+
+        try:
+            orders = self.exchange.bulk_cancel(self.coin)
+            logger.info("Cancelled %d orders", len(orders) if orders else 0)
+            return {"action": "cancel_all", "executed": True, "result": orders}
+        except Exception as e:
+            logger.error("Failed to cancel all orders: %s", e)
+            return {"action": "cancel_all", "executed": False, "error": str(e)}
+
+    # ─── Modify Orders ───────────────────────────────────────────────────
+
+    def modify_order(
+        self,
+        oid: int,
+        is_buy: bool,
+        size: float,
+        limit_px: float,
+        order_type: dict,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Modify any existing order — limit, trigger, or otherwise.
+
+        This is the general-purpose wrapper. For common operations,
+        use the specialized helpers below.
+        """
+        if self.dry_run:
+            logger.info("DRY RUN: Modify order #%d", oid)
+            return {"action": "modify_order", "executed": True, "dry_run": True}
+
+        try:
+            result = self.exchange.modify_order(
+                oid=oid,
+                name=self.coin,
+                is_buy=is_buy,
+                sz=size,
+                limit_px=limit_px,
+                order_type=order_type,
+                reduce_only=reduce_only,
+            )
+            logger.info("Order #%d modified", oid)
+            return {"action": "modify_order", "executed": True, "result": result}
+        except Exception as e:
+            logger.error("Failed to modify order #%d: %s", oid, e)
+            return {"action": "modify_order", "executed": False, "error": str(e)}
+
+    def modify_stop_loss(
+        self, oid: int, new_price: float, is_buy: bool, size: float
+    ) -> dict:
+        """Move an existing stop loss to a new price.
+
+        Convenience wrapper around modify_order() for the common
+        case of trailing a stop or moving to breakeven.
+        """
+        return self.modify_order(
+            oid=oid,
+            is_buy=is_buy,
+            size=size,
+            limit_px=new_price,
+            order_type={
+                "trigger": {
+                    "triggerPx": new_price,
+                    "isMarket": True,
+                    "tpsl": "sl",
+                }
+            },
+            reduce_only=True,
+        )
+
+    def modify_take_profit(
+        self, oid: int, new_price: float, is_buy: bool, size: float
+    ) -> dict:
+        """Move an existing take profit to a new price."""
+        return self.modify_order(
+            oid=oid,
+            is_buy=is_buy,
+            size=size,
+            limit_px=new_price,
+            order_type={
+                "trigger": {
+                    "triggerPx": new_price,
+                    "isMarket": True,
+                    "tpsl": "tp",
+                }
+            },
+            reduce_only=True,
+        )
 
     def _handle_modify_sl(self, signal: TradingSignal) -> dict:
         """Move stop loss to a new price.
