@@ -138,24 +138,27 @@ class TimeframeSummary:
     avg_volume: float
     volume_trend: str  # "increasing", "decreasing", "steady"
 
+    # ATR (Average True Range)
+    atr: float = 0.0
+    atr_pct: float = 0.0  # ATR as % of current price
+
     # Key levels (simple: recent swing highs/lows)
     resistance: float | None = None
     support: float | None = None
 
     def to_summary(self) -> str:
         """Compact one-paragraph summary per timeframe."""
-        return (
+        base = (
             f"  [{self.interval}] {self.num_candles} candles ({self.duration_hours:.1f}h): "
             f"Trend: {self.trend.upper()} {self.change_pct:+.2f}% | "
             f"Range: ${self.period_low:.0f}–${self.period_high:.0f} | "
+            f"ATR: ${self.atr:.1f} ({self.atr_pct:.2f}%) | "
             f"Current candle range: {self.current_range_pct:.2f}% | "
             f"Volume: {self.avg_volume:.1f}/candle ({self.volume_trend})"
-            + (
-                f" | Support: ${self.support:.0f} Resistance: ${self.resistance:.0f}"
-                if self.support and self.resistance
-                else ""
-            )
         )
+        if self.support and self.resistance:
+            base += f" | Support: ${self.support:.0f} Resistance: ${self.resistance:.0f}"
+        return base
 
 
 @dataclass
@@ -191,7 +194,11 @@ class MarketAnalysis:
     def to_llm_prompt(self) -> str:
         """Build the full LLM prompt from all analysis components."""
         parts = ["# Market Data Snapshot\n"]
-        parts.append(self.snapshot.to_summary())
+
+        if self.snapshot is not None:
+            parts.append(self.snapshot.to_summary())
+        else:
+            parts.append("  (Market snapshot unavailable)")
 
         parts.append("\n# Multi-Timeframe Technical Analysis\n")
         if self.timeframes:
@@ -201,7 +208,10 @@ class MarketAnalysis:
             parts.append("  (Candle data unavailable — testnet or API error)")
 
         parts.append("\n# Order Book Depth\n")
-        parts.append(self.order_book.to_summary(levels=5))
+        if self.order_book is not None:
+            parts.append(self.order_book.to_summary(levels=5))
+        else:
+            parts.append("  (Order book data unavailable)")
 
         if self.funding_trend:
             parts.append("\n# Funding Rate Trend\n")
@@ -239,12 +249,12 @@ class DataProvider:
     switches to testnet if HYPERLIQUID_TESTNET=true (candles may be empty).
     """
 
-    # Timeframes to analyze (interval, lookback candles, label)
+    # Timeframes to analyze (interval, lookback candles, label, cache TTL seconds)
     TIMEFRAMES = [
-        ("5m", 24, "1-hour micro structure"),
-        ("15m", 32, "8-hour short-term trend"),
-        ("1h", 48, "48-hour medium-term trend"),
-        ("4h", 42, "7-day macro trend"),
+        ("5m", 24, "1-hour micro structure", 60),     # cache 1 min
+        ("15m", 32, "8-hour short-term trend", 180),   # cache 3 min
+        ("1h", 48, "48-hour medium-term trend", 600),   # cache 10 min
+        ("4h", 42, "7-day macro trend", 1200),          # cache 20 min
     ]
 
     def __init__(self):
@@ -259,6 +269,10 @@ class DataProvider:
         self._info_mainnet = Info(base_url="https://api.hyperliquid.xyz", skip_ws=True)
         self._info_local = Info(base_url=self.base_url, skip_ws=True)
         self.coin = config.trading_pair
+
+        # Candle cache: {interval: (timestamp, candles_list)}
+        self._candle_cache: dict[str, tuple[float, list[dict]]] = {}
+
         logger.info(
             "DataProvider initialized (testnet=%s, coin=%s)",
             config.hl_testnet,
@@ -359,14 +373,22 @@ class DataProvider:
     # ─── Candle Analysis ─────────────────────────────────────────────────
 
     def _fetch_candles(
-        self, interval: str, lookback_candles: int
+        self, interval: str, lookback_candles: int, cache_ttl: int = 60
     ) -> list[dict]:
-        """Fetch candles for a given interval.
+        """Fetch candles for a given interval with TTL caching.
 
         Uses mainnet for candle data since testnet candles are empty.
         """
-        now_ms = int(time.time() * 1000)
-        # Estimate start based on interval
+        now_s = time.time()
+
+        # Check cache
+        cached = self._candle_cache.get(interval)
+        if cached is not None:
+            cached_time, cached_data = cached
+            if now_s - cached_time < cache_ttl:
+                return cached_data
+
+        now_ms = int(now_s * 1000)
         interval_minutes = {
             "5m": 5, "15m": 15, "1h": 60, "4h": 240,
         }
@@ -374,18 +396,24 @@ class DataProvider:
         start_ms = now_ms - lookback_candles * mins * 60 * 1000
 
         try:
-            return self._info_mainnet.candles_snapshot(
+            data = self._info_mainnet.candles_snapshot(
                 self.coin, interval, start_ms, now_ms
             )
+            self._candle_cache[interval] = (now_s, data)
+            return data
         except Exception as e:
             logger.warning("Failed to fetch %s candles: %s", interval, e)
+            # Return stale cache if available, otherwise empty
+            if cached is not None:
+                logger.info("Using stale cache for %s candles", interval)
+                return cached[1]
             return []
 
     def _analyze_timeframe(
-        self, interval: str, lookback_candles: int
+        self, interval: str, lookback_candles: int, cache_ttl: int = 60
     ) -> TimeframeSummary | None:
         """Analyze candles for one timeframe and produce a summary."""
-        candles = self._fetch_candles(interval, lookback_candles)
+        candles = self._fetch_candles(interval, lookback_candles, cache_ttl)
         if len(candles) < 3:
             return None
 
@@ -435,6 +463,16 @@ class DataProvider:
         resistance = max(float(c["h"]) for c in recent[-8:]) if len(recent) >= 8 else period_high
         support = min(float(c["l"]) for c in recent[-8:]) if len(recent) >= 8 else period_low
 
+        # ATR: Average True Range over recent candles
+        true_ranges = []
+        for i in range(1, len(recent)):
+            h, l = float(recent[i]["h"]), float(recent[i]["l"])
+            prev_c = float(recent[i - 1]["c"])
+            tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+            true_ranges.append(tr)
+        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+        atr_pct = (atr / current_close * 100) if current_close > 0 else 0.0
+
         interval_minutes_map = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
         duration = len(candles) * interval_minutes_map.get(interval, 5) / 60
 
@@ -452,6 +490,8 @@ class DataProvider:
             total_volume=total_volume,
             avg_volume=avg_volume,
             volume_trend=volume_trend,
+            atr=atr,
+            atr_pct=atr_pct,
             resistance=resistance,
             support=support,
         )
@@ -459,8 +499,8 @@ class DataProvider:
     def get_multi_timeframe_analysis(self) -> list[TimeframeSummary]:
         """Analyze all configured timeframes."""
         summaries = []
-        for interval, lookback, _label in self.TIMEFRAMES:
-            tf = self._analyze_timeframe(interval, lookback)
+        for interval, lookback, _label, cache_ttl in self.TIMEFRAMES:
+            tf = self._analyze_timeframe(interval, lookback, cache_ttl)
             if tf:
                 summaries.append(tf)
             else:
@@ -658,7 +698,8 @@ class DataProvider:
             "account": account,
         }
 
-    def build_llm_prompt(self, report: dict[str, Any]) -> str:
+    @staticmethod
+    def build_llm_prompt(report: dict[str, Any]) -> str:
         """Build the full LLM prompt from a report dict.
 
         Uses MarketAnalysis.to_llm_prompt() if available,

@@ -243,7 +243,7 @@ class JudgeAgent:
             api_key=config.moonshot_api_key,
             base_url=config.moonshot_base_url,
             model=config.kimi_model,
-            temperature=0.05,
+            temperature=config.judge_temperature,
             max_tokens=config.llm_max_tokens,
         )
         self.structured_llm = self.llm.with_structured_output(
@@ -447,9 +447,7 @@ class DebateStrategy:
     def build_market_prompt(self, market_data: dict[str, Any]) -> str:
         """Build the market prompt from data (with multi-timeframe analysis)."""
         from kimi_quant.data import DataProvider
-
-        dp = DataProvider.__new__(DataProvider)  # avoid __init__
-        return dp.build_llm_prompt(market_data)
+        return DataProvider.build_llm_prompt(market_data)
 
     # ─── Public API ──────────────────────────────────────────────────────
 

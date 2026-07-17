@@ -160,16 +160,15 @@ No additional text outside the JSON."""
             config.moonshot_base_url,
         )
 
-    def build_prompt(self, market_data: dict[str, Any]) -> str:
+    @staticmethod
+    def build_prompt(market_data: dict[str, Any]) -> str:
         """Build a structured prompt from market data.
 
         Uses the DataProvider's MarketAnalysis.to_llm_prompt() when available
         (includes multi-timeframe analysis), falls back to basic prompt.
         """
         from kimi_quant.data import DataProvider
-
-        dp = DataProvider.__new__(DataProvider)  # avoid __init__
-        return dp.build_llm_prompt(market_data)
+        return DataProvider.build_llm_prompt(market_data)
 
     def analyze(self, market_data: dict[str, Any]) -> TradingSignal | None:
         """Analyze market data and return a trading signal.

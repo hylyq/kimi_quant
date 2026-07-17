@@ -324,7 +324,14 @@ class TradeExecutor:
 
         # Case 1: Resting order → now filled (chain has position but tracker says resting)
         if tracker_resting and has_chain_pos:
-            logger.info("Limit order filled! Confirming position on-chain.")
+            if abs(chain_size - self.tracker.size) > 1e-8:
+                logger.info(
+                    "Partial fill detected: requested=%.4f, filled=%.4f (%.1f%%)",
+                    self.tracker.size, chain_size,
+                    (chain_size / self.tracker.size * 100) if self.tracker.size > 0 else 0,
+                )
+            else:
+                logger.info("Limit order filled! Confirming position on-chain.")
             self.tracker.confirm_active(chain_entry, chain_size)
 
         # Case 2: Resting order → still resting (chain has no position)

@@ -37,6 +37,7 @@ class TradeRecord:
     side: str  # "long" or "short"
     size: float  # BTC
     entry_price: float
+    dry_run: bool = False  # True if this is a simulated trade
 
     # Exit
     closed_at: str | None = None
@@ -89,6 +90,7 @@ class TradeRecord:
             "side": self.side,
             "size": self.size,
             "entry_price": self.entry_price,
+            "dry_run": self.dry_run,
             "closed_at": self.closed_at,
             "exit_price": self.exit_price,
             "close_reason": self.close_reason,
@@ -147,7 +149,8 @@ class TradeLogger:
     # ─── Lifecycle ───────────────────────────────────────────────────────
 
     def open_trade(
-        self, side: str, size: float, entry_price: float
+        self, side: str, size: float, entry_price: float,
+        dry_run: bool = False,
     ) -> TradeRecord:
         """Record a new trade opening."""
         if self._pending is not None:
@@ -162,10 +165,13 @@ class TradeLogger:
             side=side,
             size=size,
             entry_price=entry_price,
+            dry_run=dry_run,
         )
         self._pending = trade
+        mode = " (dry-run)" if dry_run else ""
         logger.info(
-            "Trade opened: %s %.4f @ $%.1f", side.upper(), size, entry_price
+            "Trade opened%s: %s %.4f @ $%.1f",
+            mode, side.upper(), size, entry_price,
         )
         return trade
 
@@ -214,6 +220,33 @@ class TradeLogger:
             )
             self._pending = None
 
+    def recover_trade(
+        self, side: str, size: float, entry_price: float
+    ) -> TradeRecord | None:
+        """Recover a pending trade from chain state after a restart.
+
+        Called when the bot restarts and finds an existing position on chain
+        that was not previously recorded in the trade log.
+        """
+        if self._pending is not None:
+            logger.warning(
+                "Pending trade already exists — not overwriting with recovered trade"
+            )
+            return None
+
+        trade = TradeRecord(
+            opened_at=datetime.now(timezone.utc).isoformat(),
+            side=side,
+            size=size,
+            entry_price=entry_price,
+        )
+        self._pending = trade
+        logger.info(
+            "Trade recovered from chain: %s %.4f @ $%.1f",
+            side.upper(), size, entry_price,
+        )
+        return trade
+
     @property
     def has_pending(self) -> bool:
         return self._pending is not None
@@ -222,7 +255,11 @@ class TradeLogger:
 
     def get_stats(self) -> PerformanceStats:
         """Compute running performance statistics from all closed trades."""
-        trades = self._closed
+        return self._compute_stats(self._closed)
+
+    @staticmethod
+    def _compute_stats(trades: list[TradeRecord]) -> PerformanceStats:
+        """Compute performance statistics from a list of trades."""
         stats = PerformanceStats()
         stats.total_trades = len(trades)
 
@@ -263,24 +300,29 @@ class TradeLogger:
         """Build a short performance summary for LLM self-reflection.
 
         Append this to the market prompt so the LLM knows its own track record.
+        Only includes real (non-simulated) trades.
         """
         stats = self.get_stats()
-        if stats.total_trades == 0:
+        real_trades = [t for t in self._closed if not t.dry_run]
+        if len(real_trades) == 0:
             return ""
 
+        # Compute real-trade-only stats
+        real_stats = self._compute_stats(real_trades)
+
         lines = [
-            "\n# Your Trading Performance (Historical)",
-            f"Total Trades: {stats.total_trades}",
-            f"Win Rate: {stats.win_rate:.1f}% ({stats.wins}W / {stats.losses}L)",
-            f"Net P&L: ${stats.net_pnl:+.2f}",
-            f"Gross P&L: ${stats.total_pnl:+.2f} (Fees: ${stats.total_fees:.2f})",
-            f"Avg Win: ${stats.avg_win:+.2f} | Avg Loss: ${stats.avg_loss:+.2f}",
-            f"Largest Win: ${stats.largest_win:+.2f} | Largest Loss: ${stats.largest_loss:+.2f}",
-            f"Profit Factor: {stats.profit_factor:.2f}",
+            "\n# Your Trading Performance (Historical — Real Trades Only)",
+            f"Total Trades: {real_stats.total_trades}",
+            f"Win Rate: {real_stats.win_rate:.1f}% ({real_stats.wins}W / {real_stats.losses}L)",
+            f"Net P&L: ${real_stats.net_pnl:+.2f}",
+            f"Gross P&L: ${real_stats.total_pnl:+.2f} (Fees: ${real_stats.total_fees:.2f})",
+            f"Avg Win: ${real_stats.avg_win:+.2f} | Avg Loss: ${real_stats.avg_loss:+.2f}",
+            f"Largest Win: ${real_stats.largest_win:+.2f} | Largest Loss: ${real_stats.largest_loss:+.2f}",
+            f"Profit Factor: {real_stats.profit_factor:.2f}",
         ]
 
-        # Add recent trades context
-        recent = self._closed[-5:]
+        # Add recent trades context (real only)
+        recent = real_trades[-5:]
         if recent:
             lines.append("\n## Recent Trades")
             for t in recent:
@@ -292,12 +334,12 @@ class TradeLogger:
                 )
 
         # Self-reflection guidance
-        if stats.win_rate < 40:
+        if real_stats.win_rate < 40:
             lines.append(
                 "\n⚠️ Your win rate is below 40%. Consider being more "
                 "conservative — only trade when confidence is very high."
             )
-        elif stats.losses >= 3 and stats.avg_loss > stats.avg_win:
+        elif real_stats.losses >= 3 and real_stats.avg_loss > real_stats.avg_win:
             lines.append(
                 "\n⚠️ Your average loss exceeds your average win. "
                 "Tighten stop losses or reduce position sizes."
@@ -341,6 +383,7 @@ class TradeLogger:
                                 side=data["side"],
                                 size=data["size"],
                                 entry_price=data["entry_price"],
+                                dry_run=data.get("dry_run", False),
                                 closed_at=data.get("closed_at"),
                                 exit_price=data.get("exit_price", 0),
                                 close_reason=data.get("close_reason", ""),

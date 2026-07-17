@@ -87,12 +87,20 @@ class RiskManager:
         self.consecutive_losses += 1
         self.total_realized_pnl += pnl
         if self.consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
-            self.cooldown_remaining = self.COOLDOWN_CYCLES
-            logger.warning(
-                "CIRCUIT BREAKER: %d consecutive losses. "
-                "Pausing new positions for %d cycles.",
-                self.consecutive_losses, self.COOLDOWN_CYCLES,
-            )
+            # Only trigger if not already in cooldown (don't extend indefinitely)
+            if self.cooldown_remaining <= 0:
+                self.cooldown_remaining = self.COOLDOWN_CYCLES
+                logger.warning(
+                    "CIRCUIT BREAKER: %d consecutive losses. "
+                    "Pausing new positions for %d cycles.",
+                    self.consecutive_losses, self.COOLDOWN_CYCLES,
+                )
+            else:
+                logger.warning(
+                    "Loss during active cooldown (%d remaining cycles) — "
+                    "not extending cooldown. %d consecutive losses.",
+                    self.cooldown_remaining, self.consecutive_losses,
+                )
 
     def record_win(self, pnl: float) -> None:
         """Called when a trade closes at a profit."""
@@ -182,15 +190,25 @@ class RiskManager:
             entry = signal.entry_price or mid_price
             risk_per_unit = abs(entry - signal.stop_loss)
             risk_amount = risk_per_unit * size
-            max_risk = account_balance * 0.01  # 1% risk per trade
-            if risk_amount > max_risk and risk_per_unit > 0:
-                suggested_size = max_risk / risk_per_unit
+            max_risk_warn = account_balance * 0.01  # 1% risk: warn
+            max_risk_hard = account_balance * 0.02  # 2% risk: reject
+            if risk_amount > max_risk_hard and risk_per_unit > 0:
+                suggested_size = max_risk_warn / risk_per_unit
+                return RiskCheck(
+                    passed=False,
+                    reason=(
+                        f"Position risk ${risk_amount:.2f} exceeds 2% "
+                        f"hard cap of balance ${account_balance:.2f}. "
+                        f"Suggested size: {suggested_size:.4f} (actual: {size:.4f})"
+                    ),
+                )
+            elif risk_amount > max_risk_warn and risk_per_unit > 0:
+                suggested_size = max_risk_warn / risk_per_unit
                 logger.warning(
                     "Position risk $%.2f exceeds 1%% of balance $%.2f. "
                     "Suggested size: %.4f (actual: %.4f)",
                     risk_amount, account_balance, suggested_size, size,
                 )
-                # Don't block, but log a strong warning
 
         return RiskCheck(passed=True, reason="Size OK")
 

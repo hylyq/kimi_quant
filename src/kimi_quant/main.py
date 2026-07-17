@@ -174,21 +174,31 @@ def _validate_and_execute(
         chain_entry = account.entry_price
         account_balance = account.balance
 
+    # Capture tracker state BEFORE sync (sync may clear it)
+    tracker_was_resting = executor.tracker.has_resting_order()
+    tracker_entry_before_sync = executor.tracker.entry_price
+    tracker_side_before_sync = executor.tracker.side
+
     # Use the smart sync: handles resting→active, active→gone, recovery
     executor.sync_with_chain(current_side, current_size, chain_entry)
 
+    # If a resting limit order timed out and was cancelled, clean up the trade log
+    if tracker_was_resting and not executor.tracker.has_resting_order() \
+            and not executor.tracker.has_position():
+        if trade_logger.has_pending:
+            trade_logger.cancel_pending()
+            logger.info("Limit order timed out — cancelled pending trade record")
+
     # If sync detected a close event, record it
-    was_active = executor.tracker.has_position() is False and (
-        current_side != "none"  # was active before sync cleared it
-    )
     if not executor.tracker.has_position() and not executor.tracker.has_resting_order():
         # Check if trade_logger has a pending trade that was just closed by SL/TP
         if trade_logger.has_pending and current_side == "none":
-            _record_close_from_chain(executor, trade_logger, report)
-            # Circuit breaker: record loss
-            pending_trade = trade_logger._pending  # already moved to _closed
-            # Actually, close_from_chain already calls close_trade, so check the
-            # last closed trade from stats
+            _record_close_from_chain(
+                trade_logger, report,
+                entry_price=tracker_entry_before_sync,
+                side=tracker_side_before_sync,
+            )
+            # Record the P&L result for circuit breaker tracking
             stats = trade_logger.get_stats()
             if stats.total_trades > 0:
                 last_trades = trade_logger.get_all_trades()
@@ -224,17 +234,24 @@ def _validate_and_execute(
         }
 
     # ── Phase 3: Record trade open intent ──
-    if signal_result.action in ("LONG", "SHORT") and not executor.dry_run:
+    if signal_result.action in ("LONG", "SHORT"):
         trade_logger.open_trade(
             side="long" if signal_result.action == "LONG" else "short",
             size=signal_result.size or config.max_position_size,
             entry_price=signal_result.entry_price or mid_price,
+            dry_run=executor.dry_run,
         )
 
     # ── Phase 4: Execute ──
     result = executor.execute(signal_result)
     logger.info("Execution result: %s | Position: %s",
                 result, executor.tracker.to_summary())
+
+    # If execution failed after opening a pending trade, clean it up
+    if (signal_result.action in ("LONG", "SHORT")
+            and not result.get("executed")):
+        trade_logger.cancel_pending()
+        logger.warning("Execution failed — cancelled pending trade record")
 
     # ── Phase 5: Post-execution recording ──
     if signal_result.action == "CLOSE" and result.get("executed"):
@@ -246,12 +263,9 @@ def _validate_and_execute(
             else:
                 risk.record_loss(trade.net_pnl)
 
-    # If position was opened with market order, update entry from chain
-    if signal_result.action in ("LONG", "SHORT") and result.get("executed"):
-        if account and account.entry_price > 0:
-            pending = trade_logger._pending
-            if pending and pending.entry_price == 0:
-                pending.entry_price = account.entry_price
+    # Entry price is already set in open_trade() from signal.entry_price
+    # or approximated from mid_price. The next cycle's sync_with_chain()
+    # will update it from actual chain fill data.
 
     return {
         "status": "executed" if result.get("executed") else "failed",
@@ -271,20 +285,28 @@ def _get_exit_price(report: dict) -> float:
 
 
 def _record_close_from_chain(
-    executor: TradeExecutor, trade_logger: TradeLogger, report: dict
+    trade_logger: TradeLogger,
+    report: dict,
+    entry_price: float = 0.0,
+    side: str = "none",
 ) -> None:
-    """Record a trade close detected from on-chain state (SL/TP filled)."""
+    """Record a trade close detected from on-chain state (SL/TP filled).
+
+    Args:
+        trade_logger: The trade logger instance.
+        report: Market data report (for mid price as exit price).
+        entry_price: The entry price BEFORE the tracker was cleared.
+        side: The position side BEFORE the tracker was cleared.
+    """
     market = report.get("market")
     exit_price = market.mid_price if market else 0.0
 
-    # Determine reason from tracker state (before clear happened)
-    entry = executor.tracker.entry_price
-    side = executor.tracker.side
-    if entry > 0 and exit_price > 0:
+    # Determine reason from the captured pre-sync values
+    if entry_price > 0 and exit_price > 0 and side != "none":
         if side == "long":
-            reason = "take_profit" if exit_price > entry else "stop_loss"
+            reason = "take_profit" if exit_price > entry_price else "stop_loss"
         else:
-            reason = "take_profit" if exit_price < entry else "stop_loss"
+            reason = "take_profit" if exit_price < entry_price else "stop_loss"
     else:
         reason = "manual"
 
@@ -310,6 +332,20 @@ def run_loop():
     risk = RiskManager()
     executor = TradeExecutor()
     trade_logger = TradeLogger()
+
+    # If executor recovered a position from chain that isn't in the trade log,
+    # create a pending trade so the eventual close is recorded correctly
+    if executor.tracker.has_position() and not trade_logger.has_pending:
+        trade_logger.recover_trade(
+            side=executor.tracker.side,
+            size=executor.tracker.size,
+            entry_price=executor.tracker.entry_price,
+        )
+        logger.info(
+            "Recovered trade from chain for existing position: %s %.4f @ $%.1f",
+            executor.tracker.side, executor.tracker.size,
+            executor.tracker.entry_price,
+        )
 
     # Set initial balance for drawdown tracking (first report will have account)
     # We'll set it on the first cycle when account data is available
@@ -353,7 +389,6 @@ def run_loop():
     llm = KimiLLM() if mode == "single" else None
 
     cycle_count = 0
-    signals_history: list[dict] = []
 
     while not _shutdown_requested:
         cycle_count += 1
@@ -370,7 +405,6 @@ def run_loop():
             result["cycle"] = cycle_count
             result["timestamp"] = datetime.now(timezone.utc).isoformat()
             result["mode"] = mode
-            signals_history.append(result)
 
             status = result.get("status", "unknown")
             sig = result.get("signal", "N/A")
@@ -383,9 +417,6 @@ def run_loop():
         except Exception as e:
             logger.error("Cycle %d failed with error: %s", cycle_count, e,
                          exc_info=True)
-
-        if len(signals_history) > 100:
-            signals_history = signals_history[-100:]
 
         elapsed = time.monotonic() - start_time
         sleep_time = max(0, config.trading_interval_seconds - elapsed)
@@ -414,35 +445,47 @@ def run_loop():
 def cmd_stats():
     """Print trade P&L statistics."""
     trade_logger = TradeLogger()
-    stats = trade_logger.get_stats()
+    all_trades = trade_logger.get_all_trades()
+    real_trades = [t for t in all_trades if not t.dry_run]
+    sim_trades = [t for t in all_trades if t.dry_run]
 
-    if stats.total_trades == 0:
+    if not all_trades:
         print("No trade history found.")
         return
 
-    print(f"=== Trading Performance ===")
-    print(f"Total Trades:    {stats.total_trades}")
-    print(f"Wins:            {stats.wins}")
-    print(f"Losses:          {stats.losses}")
-    print(f"Win Rate:        {stats.win_rate:.1f}%")
-    print(f"")
-    print(f"Gross P&L:       ${stats.total_pnl:+.2f}")
-    print(f"Total Fees:      ${stats.total_fees:.2f}")
-    print(f"Net P&L:         ${stats.net_pnl:+.2f}")
-    print(f"")
-    print(f"Avg Win:         ${stats.avg_win:+.2f}")
-    print(f"Avg Loss:        ${stats.avg_loss:+.2f}")
-    print(f"Largest Win:     ${stats.largest_win:+.2f}")
-    print(f"Largest Loss:    ${stats.largest_loss:+.2f}")
-    print(f"Profit Factor:   {stats.profit_factor:.2f}")
-    print()
+    def _print_stats(label: str, trades: list):
+        from kimi_quant.analytics import TradeLogger as TL
+        stats = TL._compute_stats(trades)
+        if stats.total_trades == 0:
+            return
+        print(f"=== {label} ===")
+        print(f"Total Trades:    {stats.total_trades}")
+        print(f"Wins:            {stats.wins}")
+        print(f"Losses:          {stats.losses}")
+        print(f"Win Rate:        {stats.win_rate:.1f}%")
+        print(f"")
+        print(f"Gross P&L:       ${stats.total_pnl:+.2f}")
+        print(f"Total Fees:      ${stats.total_fees:.2f}")
+        print(f"Net P&L:         ${stats.net_pnl:+.2f}")
+        print(f"")
+        print(f"Avg Win:         ${stats.avg_win:+.2f}")
+        print(f"Avg Loss:        ${stats.avg_loss:+.2f}")
+        print(f"Largest Win:     ${stats.largest_win:+.2f}")
+        print(f"Largest Loss:    ${stats.largest_loss:+.2f}")
+        print(f"Profit Factor:   {stats.profit_factor:.2f}")
+        print()
+
+    if real_trades:
+        _print_stats("Trading Performance (Real)", real_trades)
+    if sim_trades:
+        _print_stats("Trading Performance (Simulated / Dry-Run)", sim_trades)
 
     # Recent trades
-    trades = trade_logger.get_all_trades()
     print("=== Recent Trades ===")
-    for t in trades[-10:]:
+    for t in all_trades[-10:]:
+        tag = "[SIM]" if t.dry_run else "[LIVE]"
         print(
-            f"{t.opened_at[:19]} | {t.side.upper():5s} | "
+            f"{t.opened_at[:19]} {tag} | {t.side.upper():5s} | "
             f"in: ${t.entry_price:>8.1f} → out: ${t.exit_price:>8.1f} | "
             f"P&L: ${t.pnl:+7.2f} ({t.pnl_pct:+.2f}%) | "
             f"{t.close_reason}"

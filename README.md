@@ -32,7 +32,7 @@
 
 ### 数据流
 
-1. **DataProvider** — 并行获取多周期 K 线（5m/15m/1h/4h）+ 订单簿 + 资金费率趋势
+1. **DataProvider** — 并行获取多周期 K 线（5m/15m/1h/4h，内置 TTL 缓存）+ 订单簿 + 资金费率趋势
 2. **策略引擎** — Single：Kimi K3 单次分析；Debate：三 Agent 辩论 + 裁判裁决（LangGraph，45s 超时）
 3. **RiskManager** — 六层风控校验（熔断、置信度、仓位、止损距离、方向、降级）
 4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + 完整订单管理
@@ -73,8 +73,7 @@ MOONSHOT_API_KEY=sk-your-key-here
 
 # 策略模式
 STRATEGY_MODE=single          # single | debate
-
-# 交易参数
+JUDGE_TEMPERATURE=0.05        # Debate 模式 Judge 温度（越低越确定）
 TRADING_PAIR=BTC
 MAX_POSITION_SIZE=0.01         # 单位：BTC（0.01 = 0.01 BTC，非 USD 或百分比）
 MIN_CONFIDENCE=0.7
@@ -190,6 +189,7 @@ TradeExecutor 启动时自动查询链上状态：
 - 恢复已有持仓（`user_state` → positions）
 - 恢复挂单 ID（`open_orders` → SL/TP oid）
 - 崩溃重启后可立即管理现有仓位（平仓、移止损）
+- **恢复仓位自动补录交易日志**：重启后检测到的链上持仓会自动创建 pending trade，确保后续平仓被正确记录
 
 ### LangGraph Checkpointing
 
@@ -215,23 +215,40 @@ DebateState (每个 cycle 自动保存):
 
 | 层级 | 检查项 | 规则 |
 |------|--------|------|
-| 1 | 熔断机制 | 连续 4 笔亏损 → 暂停 6 个 cycle；日回撤 > 5% 冻结 |
+| 1 | 熔断机制 | 连续 4 笔亏损 → 暂停 6 个 cycle（不延长）；日回撤 > 5% 冻结 |
 | 2 | 置信度 | >= `MIN_CONFIDENCE` (默认 0.7) 才执行 |
-| 3 | 仓位上限 | 不超过 `MAX_POSITION_SIZE` + 动态风险敞口检查（单笔风险 ≤ 1% 账户） |
+| 3 | 仓位上限 | 不超过 `MAX_POSITION_SIZE` + 动态风险敞口检查（单笔风险 > 1% 警告，> 2% 拒绝） |
 | 4 | 止损距离 | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝） |
 | 5 | 方向 | 已有同向仓位拒绝 / MODIFY_SL 需已持仓 |
 | 6 | 熔断退出 | CLOSE 和 MODIFY_SL 始终允许（降风险操作） |
+
+### 多周期 ATR 分析
+
+DataProvider 自动计算每个时间周期的 ATR（Average True Range），为 LLM 和风控提供动态波动率参考：
+- 5m / 15m / 1h / 4h 各周期的 ATR 绝对值与百分比
+- LLM 可根据 ATR 设定更合理的止损距离
+- 风控系统使用 ATR 辅助判断止损是否合理
 
 ### 仓位状态追踪
 
 ```
 PositionTracker 三态模型:
   none ──(下单)──▶ resting ──(链上确认)──▶ active
-                      │                        │
-                      │ (超时 3 cycle)          │ (SL/TP 触发)
-                      ▼                        ▼
-                   cancel_resting()           clear()
+       │                 │                        │
+       │                 │ (超时 3 cycle)          │ (SL/TP 触发)
+       │                 ▼                        ▼
+       │            cancel_resting()           clear()
+       │            + cancel_pending()         + record_close()
+       └────────────────────────────────────────────┘
+                     (崩溃恢复 + 补录交易)
 ```
+
+### Dry-Run 模拟盈亏
+
+Dry-run 模式现在支持完整的模拟交易记录：
+- 所有交易（包括模拟）持久化到 `data/trades.jsonl`
+- `--stats` 命令分开展示真实/模拟交易统计
+- LLM 表现反馈仅基于真实交易，避免模拟数据污染
 
 ## 项目结构
 
@@ -247,7 +264,8 @@ kimi_quant/
 │   ├── executor.py    # 15/15 SDK 全覆盖交易执行
 │   └── main.py        # CLI 入口 + 交易循环
 ├── data/
-│   └── debate.db      # SQLite checkpoint 数据库 (自动生成)
+│   ├── debate.db      # SQLite checkpoint 数据库 (自动生成)
+│   └── trades.jsonl   # 交易记录（含模拟/真实交易）
 ├── .env.example
 ├── .gitignore
 ├── pyproject.toml

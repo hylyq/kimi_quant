@@ -68,6 +68,9 @@ class Config:
     strategy_mode: str = field(
         default_factory=lambda: os.getenv("STRATEGY_MODE", "single")
     )  # "single" | "debate"
+    judge_temperature: float = field(
+        default_factory=lambda: float(os.getenv("JUDGE_TEMPERATURE", "0.05"))
+    )
     trading_interval_seconds: int = field(
         default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "300"))
     )
