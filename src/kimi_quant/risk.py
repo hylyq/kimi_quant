@@ -65,8 +65,8 @@ class RiskManager:
         current_size: float,
         current_side: str,
     ) -> RiskCheck:
-        # HOLD and CLOSE don't need size checks
-        if signal.action in ("HOLD", "CLOSE"):
+        # HOLD, CLOSE, and MODIFY_SL don't need size checks
+        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL"):
             return RiskCheck(passed=True, reason="No size needed")
 
         if signal.size is None or signal.size <= 0:
@@ -104,6 +104,12 @@ class RiskManager:
                 passed=False,
                 reason="No position to close",
             )
+        # MODIFY_SL requires an existing position
+        if signal.action == "MODIFY_SL" and current_side == "none":
+            return RiskCheck(
+                passed=False,
+                reason="No position to modify stop loss for",
+            )
 
         return RiskCheck(passed=True, reason="Direction OK")
 
@@ -113,5 +119,12 @@ class RiskManager:
                 return RiskCheck(
                     passed=False,
                     reason="Stop loss is required for directional trades",
+                )
+        if signal.action == "MODIFY_SL":
+            new_sl = signal.modify_sl_to or signal.stop_loss
+            if new_sl is None:
+                return RiskCheck(
+                    passed=False,
+                    reason="New stop loss price is required for MODIFY_SL",
                 )
         return RiskCheck(passed=True, reason="Stop loss OK")

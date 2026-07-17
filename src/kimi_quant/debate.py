@@ -176,13 +176,15 @@ incorporates elements from multiple perspectives.
 - Confidence 0.7+ only when the evidence is compelling
 
 Output a JSON trading signal matching the TradingSignal schema:
-- action: "LONG" | "SHORT" | "CLOSE" | "HOLD"
+- action: "LONG" | "SHORT" | "CLOSE" | "HOLD" | "MODIFY_SL"
+  (MODIFY_SL = move stop loss to breakeven or trail price)
 - confidence: 0.0-1.0
 - reasoning: your synthesis of the debate
-- size: position size in BTC (null for CLOSE/HOLD)
+- size: position size in BTC (null for CLOSE/HOLD/MODIFY_SL)
 - entry_price: suggested entry (null = market order)
 - stop_loss: mandatory for directional trades
 - take_profit: realistic target
+- modify_sl_to: new stop loss price (only for MODIFY_SL action)
 - key_factors: 2-4 factors that drove the decision
 """
 

@@ -16,10 +16,18 @@ logger = logging.getLogger(__name__)
 
 
 class TradingSignal(BaseModel):
-    """Structured trading signal from the LLM analysis."""
+    """Structured trading signal from the LLM analysis.
+
+    Supported actions:
+      LONG  — open a long position (with SL + TP)
+      SHORT — open a short position (with SL + TP)
+      CLOSE — close the current position
+      HOLD  — no action
+      MODIFY_SL — move existing stop loss to a new price (trailing/breakeven)
+    """
 
     action: str = Field(
-        description="Trading action: LONG, SHORT, CLOSE, or HOLD"
+        description="Trading action: LONG, SHORT, CLOSE, HOLD, or MODIFY_SL"
     )
     confidence: float = Field(
         ge=0.0,
@@ -35,15 +43,19 @@ class TradingSignal(BaseModel):
     )
     entry_price: float | None = Field(
         default=None,
-        description="Suggested entry price, use None for market order",
+        description="Suggested entry price, None for market order",
     )
     stop_loss: float | None = Field(
         default=None,
-        description="Suggested stop loss price",
+        description="Stop loss price (for LONG/SHORT) or new SL price (for MODIFY_SL)",
     )
     take_profit: float | None = Field(
         default=None,
         description="Suggested take profit price",
+    )
+    modify_sl_to: float | None = Field(
+        default=None,
+        description="New stop loss price when action=MODIFY_SL (e.g., move to breakeven)",
     )
     key_factors: list[str] = Field(
         default_factory=list,
@@ -110,11 +122,13 @@ indicate resistance. Imbalance reveals short-term pressure.
 prefer HOLD. Confidence below 0.7 means skip.
 
 **Output Rules:**
-- action: "LONG" (go long), "SHORT" (go short), "CLOSE" (close existing \
-position), or "HOLD" (no action)
+- action: "LONG", "SHORT", "CLOSE", "HOLD", or "MODIFY_SL"
+  - MODIFY_SL: move existing stop loss (e.g., to breakeven after price moves favorably)
+    Use modify_sl_to field for the new stop loss price.
 - confidence: 0.0-1.0 reflecting strength of conviction
 - size: suggested BTC size (respect max position size)
-- stop_loss: price level where thesis is invalidated (mandatory for LONG/SHORT)
+- stop_loss: price level where thesis is invalidated (mandatory for LONG/SHORT;
+  for MODIFY_SL this is redundant with modify_sl_to)
 - take_profit: realistic target based on order book levels
 - key_factors: 2-4 bullet points summarizing what drove the decision
 
