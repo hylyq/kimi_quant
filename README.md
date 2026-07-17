@@ -8,7 +8,7 @@
 ```
 市场数据 → Kimi K3 分析 → TradingSignal → 风控 → 执行
 ```
-快速，1 次 LLM 调用。适合高频轮询。
+1 次 LLM 调用，快速轻量。
 
 ### Multi-Agent Debate (多 Agent 辩论模式)
 ```
@@ -16,37 +16,37 @@
 市场数据 ───┼── 🐻 Bear Agent (论证做空) ──┼── ⚖️ Judge ──→ TradingSignal ──→ 风控 ──→ 执行
               └── 😐 Hold Agent (论证观望) ──┘
 ```
-4 次 LLM 调用（3 debate + 1 judge）。通过对抗辩论减少单一模型偏见，决策更稳健。
+3 个 Agent 并行辩论 + 1 个裁判裁决，通过对抗验证减少单一模型偏见。
 
 ## 架构概览
 
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  DataProvider │───▶│   策略引擎    │───▶│  RiskManager │───▶│TradeExecutor │
-│  (Hyperliquid)│    │ single/debate│    │  (风控校验)   │    │  (下单执行)   │
-└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
-      ▲                                                          │
-      │                    交易循环 (每 N 秒)                      │
-      └──────────────────────────────────────────────────────────┘
+┌──────────────┐    ┌─────────────────┐    ┌──────────────┐    ┌──────────────────┐
+│  DataProvider │───▶│    策略引擎      │───▶│  RiskManager │───▶│  TradeExecutor   │
+│  (Hyperliquid)│    │ single / debate │    │  (风控校验)   │    │  (全订单生命周期)  │
+└──────────────┘    └─────────────────┘    └──────────────┘    └──────────────────┘
+      ▲                                                               │
+      │                      交易循环 (每 N 秒)                         │
+      └───────────────────────────────────────────────────────────────┘
 ```
 
 ### 数据流
 
 1. **DataProvider** — 从 Hyperliquid 获取 BTC 市场快照（价格、订单簿、资金费率、持仓）
-2. **策略引擎** — Single：Kimi K3 单次分析；Debate：三 Agent 辩论 + 裁判裁决
-3. **RiskManager** — 校验信号：置信度阈值、仓位限制、方向检查、止损要求
-4. **TradeExecutor** — 执行交易（市价/限价单），同时下止损单
+2. **策略引擎** — Single：Kimi K3 单次分析；Debate：三 Agent 辩论 + 裁判裁决（LangGraph）
+3. **RiskManager** — 四层风控校验（置信度、仓位、方向、止损）
+4. **TradeExecutor** — 执行交易并管理完整订单生命周期
 
 ### 技术栈
 
 | 组件 | 技术 |
 |------|------|
 | 大模型 | Kimi K3 (Moonshot API, OpenAI 兼容) |
-| LLM 框架 | LangChain + LangGraph |
-| Multi-Agent | LangGraph StateGraph orchestration |
+| LLM 编排 | LangChain + LangGraph StateGraph |
+| 状态持久化 | LangGraph SqliteSaver Checkpointing |
 | 交易所 | Hyperliquid (Perpetual DEX) |
-| 数据验证 | Pydantic 结构化输出 |
-| 交易执行 | hyperliquid-python-sdk |
+| 结构化输出 | Pydantic + LangChain json_schema |
+| 交易执行 | hyperliquid-python-sdk (15/15 全覆盖) |
 
 ## 快速开始
 
@@ -59,57 +59,108 @@
 ### 安装
 
 ```bash
-# 克隆项目
-git clone <repo-url>
-cd kimi_quant
-
-# 安装依赖
+git clone <repo-url> && cd kimi_quant
 uv sync
-
-# 配置环境变量
 cp .env.example .env
-# 编辑 .env 填入你的 API Key
+# 编辑 .env 填入 MOONSHOT_API_KEY
 ```
 
 ### 配置
 
-编辑 `.env` 文件：
-
 ```bash
-# 必填：Kimi API Key
+# 必填
 MOONSHOT_API_KEY=sk-your-key-here
 
-# 策略模式：single（单Agent）或 debate（多Agent辩论）
-STRATEGY_MODE=single
-
-# 可选：Hyperliquid 私钥（仅实盘需要）
-HYPERLIQUID_PRIVATE_KEY=your_private_key_hex
+# 策略模式
+STRATEGY_MODE=single          # single | debate
 
 # 交易参数
-TRADING_PAIR=BTC          # 交易对
-MAX_POSITION_SIZE=0.01    # 最大仓位 (BTC)
-MIN_CONFIDENCE=0.7        # 最低置信度阈值
-MAX_LEVERAGE=3            # 最大杠杆
+TRADING_PAIR=BTC
+MAX_POSITION_SIZE=0.01
+MIN_CONFIDENCE=0.7
+MAX_LEVERAGE=3
 
 # 运行模式
-DRY_RUN=true              # true=模拟交易, false=实盘
-TRADING_INTERVAL=300      # 交易间隔 (秒)
+DRY_RUN=true                  # true=模拟, false=实盘
+TRADING_INTERVAL=300          # 交易间隔 (秒)
+
+# 实盘需要
+HYPERLIQUID_PRIVATE_KEY=...
+HYPERLIQUID_TESTNET=true
 ```
 
 ### 运行
 
 ```bash
-# 单次分析 — single 模式
-uv run kimi-quant --once
+# 单次分析
+uv run kimi-quant --once                      # single 模式
+uv run kimi-quant --once --mode debate         # debate 模式
 
-# 单次分析 — debate 模式（3 Agent 辩论）
-uv run kimi-quant --once --mode debate
-
-# 启动交易循环
-uv run kimi-quant
-
-# 以 debate 模式启动交易循环
+# 交易循环
+uv run kimi-quant                              # 默认 single
 uv run kimi-quant --mode debate --interval 300
+
+# 查看历史辩论记录
+uv run kimi-quant --history
+```
+
+## TradingSignal（LLM 输出格式）
+
+```json
+{
+  "action": "LONG",              // LONG | SHORT | CLOSE | HOLD | MODIFY_SL
+  "confidence": 0.85,
+  "reasoning": "...",
+  "size": 0.005,
+  "entry_price": 85000.0,        // null = 市价单
+  "stop_loss": 84500.0,
+  "take_profit": 86000.0,
+  "modify_sl_to": 63000.0,       // MODIFY_SL 时的新止损价
+  "key_factors": ["..."]
+}
+```
+
+### Action 说明
+
+| Action | 触发条件 | 订单操作 |
+|--------|---------|---------|
+| `LONG` | 看多信号 | 开多仓 + 止损 + 止盈（bulk_orders 原子执行） |
+| `SHORT` | 看空信号 | 开空仓 + 止损 + 止盈（bulk_orders 原子执行） |
+| `CLOSE` | 平仓信号 | 市价平仓 |
+| `HOLD` | 观望/不确定 | 无操作 |
+| `MODIFY_SL` | 移动止损 | 将止损移至新价格（保本/追踪） |
+
+## TradeExecutor — SDK 全覆盖
+
+Hyperliquid Python SDK 的 **15 个交易相关方法全部封装**：
+
+```
+开仓
+  market_open              ✅  市价开仓（Ioc）
+  market_close             ✅  市价平仓
+  order (limit/trigger)    ✅  限价单 / 止损止盈触发单
+  bulk_orders              ✅  开仓+SL+TP 一笔原子交易
+
+撤单
+  cancel                   ✅  cancel_order(oid)
+  cancel_by_cloid          ✅  cancel_by_cloid(cloid)
+  bulk_cancel              ✅  cancel_all_orders()
+  bulk_cancel_by_cloid     ✅  cancel_by_cloids([...])
+
+改单
+  modify_order             ✅  modify_order (通用)
+  bulk_modify_orders_new   ✅  modify_orders (批量)
+
+便捷封装
+  modify_stop_loss         ✅  移动止损
+  modify_take_profit       ✅  移动止盈
+
+配置
+  update_leverage          ✅  设置杠杆
+  update_isolated_margin   ✅  调整保证金
+
+安全
+  schedule_cancel          ✅  心跳保护（崩溃自动撤单）
 ```
 
 ## Debate 模式详解
@@ -121,76 +172,42 @@ uv run kimi-quant --mode debate --interval 300
 | 🐂 Bull | 激进多头分析师 | 寻找做多证据：支撑位、bid wall、负资金费率 |
 | 🐻 Bear | 怀疑派空头分析师 | 寻找做空证据：阻力位、ask wall、正资金费率 |
 | 😐 Hold | 谨慎风控官 | 寻找观望理由：信号矛盾、波动过大、无明确方向 |
-| ⚖️ Judge | 首席交易官 | 权衡三方论据，做出最终决策，输出 TradingSignal |
+| ⚖️ Judge | 首席交易官 | 权衡三方论据，做出最终决策 |
 
 ### 决策流程
 
-1. 三个 Debater **并行**接收同一份市场数据（通过 `asyncio.gather`）
-2. 每个 Debater 从自身角色出发提供 150-250 字的论证
+1. 三个 Debater **并行**接收同一份市场数据（`asyncio.gather`）
+2. 每个 Debater 从自身角色出发提供 150-250 字论证
 3. Judge 收到三方论据 + 原始市场数据，综合裁决
-4. Judge 输出结构化 TradingSignal（含置信度、仓位、止损止盈）
+4. Judge 输出结构化 TradingSignal → 风控 → 执行
 
-### 为什么 Debate 更稳健？
+### LangGraph Checkpointing
 
-- **减少单一偏见**：单个模型容易被某个信号误导，三方辩论暴露多空分歧
-- **对抗验证**：Bear 和 Bull 互相平衡，Hold 防止 FOMO
-- **可追溯**：每次决策可回溯三方原始论据，便于事后复盘
-
-### LangGraph Checkpointing（状态持久化）
-
-Debate 模式下每个 cycle 的完整状态自动持久化到 SQLite 数据库：
+每个 cycle 的完整状态自动持久化到 `data/debate.db`：
 
 ```
-LangGraph StateGraph
-      │
-      ├── checkpointer=SqliteSaver("data/debate.db")
-      │
-      ├── DebateState (每个 cycle 自动保存):
-      │     ├── market_prompt     ← 市场快照
-      │     ├── bull_argument     ← Bull Agent 论据
-      │     ├── bear_argument     ← Bear Agent 论据
-      │     ├── hold_argument     ← Hold Agent 论据
-      │     └── final_signal_json ← Judge 裁决
-      │
-      └── thread_id="btc-perpetual-trading"
-            └── 同一 thread 下形成完整时间线
+DebateState (每个 cycle 自动保存):
+  ├── cycle_id             ← ISO 时间戳
+  ├── market_prompt        ← 市场快照
+  ├── bull_argument        ← Bull Agent 论据
+  ├── bear_argument        ← Bear Agent 论据
+  ├── hold_argument        ← Hold Agent 论据
+  └── final_signal_json    ← Judge 裁决
 ```
 
-**能力**：
-- **断点续传**：崩溃重启后 `get_latest_state()` 恢复上次未完成的 cycle
-- **历史回溯**：`--history` 打印所有历史 debate 完整记录
+- **断点续传**：崩溃重启后 `get_latest_state()` 恢复
+- **历史回溯**：`--history` 打印完整辩论记录
 - **零额外代码**：LangGraph 在每次 `ainvoke()` 后自动写 checkpoint
-
-```bash
-# 查看所有历史辩论记录
-uv run kimi-quant --history
-```
-
-## LLM 输出格式
-
-Kimi K3 的响应通过 LangChain 结构化输出解析为：
-
-```json
-{
-  "action": "LONG",           // LONG | SHORT | CLOSE | HOLD
-  "confidence": 0.85,         // 0.0 - 1.0
-  "reasoning": "...",         // 决策理由
-  "size": 0.005,              // 建议仓位 (BTC)
-  "entry_price": 85000.0,     // 入场价 (null = 市价单)
-  "stop_loss": 84500.0,       // 止损价
-  "take_profit": 86000.0,     // 止盈价
-  "key_factors": ["..."]      // 关键决策因子
-}
-```
 
 ## 风控规则
 
 | 检查项 | 规则 |
 |--------|------|
-| 置信度 | >= 0.7 才执行 |
-| 仓位上限 | 不超过 MAX_POSITION_SIZE |
+| 置信度 | >= `MIN_CONFIDENCE` (默认 0.7) 才执行 |
+| 仓位上限 | 不超过 `MAX_POSITION_SIZE` |
 | 重复交易 | 已有同向仓位时拒绝 |
-| 止损 | 方向性交易必须有止损 |
+| 止损 | 方向性交易必须有止损价格 |
+| MODIFY_SL | 需要已持仓 + 新止损价 |
 
 ## 项目结构
 
@@ -198,13 +215,13 @@ Kimi K3 的响应通过 LangChain 结构化输出解析为：
 kimi_quant/
 ├── src/kimi_quant/
 │   ├── __init__.py
-│   ├── config.py      # 配置管理
-│   ├── data.py        # 市场数据 (Hyperliquid)
-│   ├── llm.py         # 单 Agent 策略 + 共享工具
+│   ├── config.py      # 配置管理（env + .env）
+│   ├── data.py        # 市场数据 (Hyperliquid Info API)
+│   ├── llm.py         # TradingSignal + Kimi K3 单 Agent 策略
 │   ├── debate.py      # Multi-Agent 辩论 + LangGraph Checkpointing
-│   ├── risk.py        # 风控管理
-│   ├── executor.py    # 交易执行
-│   └── main.py        # 主程序入口
+│   ├── risk.py        # 四层风控校验
+│   ├── executor.py    # 15/15 SDK 全覆盖交易执行
+│   └── main.py        # CLI 入口 + 交易循环
 ├── data/
 │   └── debate.db      # SQLite checkpoint 数据库 (自动生成)
 ├── .env.example
