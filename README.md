@@ -758,6 +758,19 @@ kimi_quant/
 
 ## 常见问题
 
+### Q: 阿里云服务器无法连接 Hyperliquid API？
+
+阿里云出口会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`）。本项目已内置 `curl_cffi` 解决方案，自动伪装成 Chrome 浏览器的 TLS 指纹绕过检测。
+
+服务器上运行前确保 `curl_cffi` 已安装：
+```bash
+uv sync   # 自动安装 curl_cffi
+```
+启动日志中显示 `curl_cffi=True` 表示已激活：
+```
+DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
+```
+
 ### Q: API 费用多少钱？怎么省钱？
 
 **定价对比**（每 1M tokens）：
