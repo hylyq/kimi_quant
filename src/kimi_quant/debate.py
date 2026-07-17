@@ -1,12 +1,11 @@
-"""Multi-Agent Debate Strategy via LangGraph with Checkpointing.
+"""Multi-Agent Debate Strategy via LangGraph.
 
 Three specialized agents (Bull, Bear, Hold) independently analyze market data
 and present their arguments. A Judge agent weighs all arguments and makes
 the final trading decision.
 
-Each cycle's full state (market data → three arguments → verdict) is
-automatically persisted via LangGraph's checkpointer, enabling:
-  - Cycle history with thread_id
+Each cycle's result is persisted to a JSONL file for:
+  - Cycle history
   - Crash recovery (resume from last checkpoint)
   - Full traceability for post-trade analysis
 
@@ -42,6 +41,7 @@ Architecture (LangGraph StateGraph):
 """
 
 import asyncio
+import fcntl
 import json as _json
 import logging
 from datetime import datetime, timezone
@@ -49,9 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
@@ -60,8 +58,10 @@ from kimi_quant.llm import TradingSignal
 
 logger = logging.getLogger(__name__)
 
-# Default checkpoint database path
-DEFAULT_DB_PATH = str(Path(__file__).parent.parent.parent / "data" / "debate.db")
+# Default debate history path
+DEFAULT_HISTORY_PATH = str(
+    Path(__file__).parent.parent.parent / "data" / "debate.jsonl"
+)
 
 
 # ─── Debate State ────────────────────────────────────────────────────────────
@@ -244,7 +244,7 @@ class JudgeAgent:
             base_url=config.moonshot_base_url,
             model=config.kimi_model,
             temperature=config.judge_temperature,
-            max_tokens=config.llm_max_tokens,
+            max_tokens=4096,  # Judge needs more room for synthesizing 3 arguments
         )
         self.structured_llm = self.llm.with_structured_output(
             TradingSignal, method="json_schema"
@@ -285,51 +285,46 @@ class JudgeAgent:
             return None
 
 
-# ─── Checkpointer Factory ───────────────────────────────────────────────────
+# ─── Debate History Persistence ──────────────────────────────────────────────
 
 
-class CheckpointerHandle:
-    """Holds a checkpointer and manages its lifecycle.
-
-    SqliteSaver.from_conn_string() is a context manager — the connection
-    closes on __exit__. This handle keeps the context open for the
-    application lifetime and closes it cleanly on shutdown.
-    """
-
-    def __init__(self, saver: BaseCheckpointSaver, ctx: Any | None = None):
-        self.saver = saver
-        self._ctx = ctx  # SqliteSaver context manager handle
-
-    def close(self) -> None:
-        """Release the checkpointer resources."""
-        if self._ctx is not None:
-            try:
-                self._ctx.__exit__(None, None, None)
-                logger.info("Checkpointer connection closed")
-            except Exception as e:
-                logger.warning("Error closing checkpointer: %s", e)
-
-
-def create_checkpointer(db_path: str | None = None) -> CheckpointerHandle:
-    """Create the appropriate checkpointer.
-
-    Uses SqliteSaver for production (persists to disk),
-    MemorySaver as fallback.
-    """
-    if db_path is None:
-        db_path = DEFAULT_DB_PATH
-
+def _read_history(history_path: str) -> list[dict[str, Any]]:
+    """Read all debate history entries from the JSONL file."""
+    entries: list[dict] = []
     try:
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        ctx = SqliteSaver.from_conn_string(db_path)
-        saver = ctx.__enter__()
-        logger.info("Checkpointer: SqliteSaver at %s", db_path)
-        return CheckpointerHandle(saver, ctx)
+        path = Path(history_path)
+        if not path.exists():
+            return entries
+        with open(path) as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(_json.loads(line))
+                        except _json.JSONDecodeError:
+                            pass
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception as e:
-        logger.warning(
-            "SqliteSaver unavailable (%s), falling back to MemorySaver", e
-        )
-        return CheckpointerHandle(MemorySaver())
+        logger.error("Failed to read debate history: %s", e)
+    return entries
+
+
+def _append_history(history_path: str, entry: dict[str, Any]) -> None:
+    """Append a single debate cycle entry to the JSONL file."""
+    try:
+        Path(history_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(history_path, "a") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(_json.dumps(entry, default=str) + "\n")
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logger.error("Failed to persist debate history: %s", e)
 
 
 # ─── LangGraph Debate Graph ──────────────────────────────────────────────────
@@ -338,39 +333,35 @@ def create_checkpointer(db_path: str | None = None) -> CheckpointerHandle:
 class DebateStrategy:
     """Multi-agent debate strategy orchestrated by LangGraph.
 
-    Uses LangGraph's built-in checkpointing to persist every cycle's
-    full state: market data, each agent's argument, and the judge's verdict.
+    Each cycle's debate is persisted to a JSONL file (debate.jsonl)
+    alongside LangGraph's MemorySaver (intra-session checkpointing).
 
     Usage:
-        strategy = DebateStrategy(checkpointer=SqliteSaver(...))
-        signal, transcript = strategy.analyze_sync(market_data, thread_id="btc-1")
-        # State is now persisted. Retrieve history:
-        history = strategy.get_history("btc-1")
+        strategy = DebateStrategy()
+        signal, transcript = strategy.analyze_sync(market_data)
+        history = strategy.get_history()
     """
 
     # Config key passed to graph.ainvoke to identify the trading session
     THREAD_ID = "btc-perpetual-trading"
 
-    def __init__(self, checkpointer_handle: "CheckpointerHandle | None" = None,
-                 debate_timeout: int = 45):
+    def __init__(self, history_path: str | None = None,
+                 debate_timeout: int = 60):
         self.bull = SingleTurnAgent("Bull", BULL_SYSTEM_PROMPT)
         self.bear = SingleTurnAgent("Bear", BEAR_SYSTEM_PROMPT)
         self.hold = SingleTurnAgent("Hold", HOLD_SYSTEM_PROMPT)
         self.judge = JudgeAgent()
-        self.debate_timeout = debate_timeout  # seconds per agent
+        self.debate_timeout = debate_timeout
+        self._history_path = history_path or DEFAULT_HISTORY_PATH
 
-        if checkpointer_handle is None:
-            checkpointer_handle = create_checkpointer()
-
-        self._checkpointer_handle = checkpointer_handle
-        self.checkpointer = checkpointer_handle.saver
+        self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         logger.info("DebateStrategy initialized: 4 agents, timeout=%ds",
                      debate_timeout)
 
     def close(self) -> None:
-        """Release checkpointer resources."""
-        self._checkpointer_handle.close()
+        """No-op (MemorySaver needs no cleanup)."""
+        pass
 
     def _build_graph(self):
         """Construct the debate StateGraph with checkpointing.
@@ -464,7 +455,7 @@ class DebateStrategy:
         market_data: dict[str, Any],
         thread_id: str | None = None,
     ) -> tuple[TradingSignal | None, dict[str, str]]:
-        """Run the full debate asynchronously with checkpointing.
+        """Run the full debate asynchronously, persisting results to JSONL.
 
         Args:
             market_data: Market snapshot from DataProvider.
@@ -493,11 +484,13 @@ class DebateStrategy:
         logger.info("Starting debate [%s]...", cycle_id)
         start = datetime.now(timezone.utc)
 
-        # State automatically checkpointed after each node execution
         final_state = await self.graph.ainvoke(initial_state, config=graph_config)
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info("Debate + judgment complete in %.1fs", elapsed)
+
+        # Persist to JSONL for cross-session history
+        self._save_cycle(final_state)
 
         if final_state.get("error"):
             logger.error("Debate error: %s", final_state["error"])
@@ -533,6 +526,19 @@ class DebateStrategy:
             "hold": final_state["hold_argument"],
         }
 
+    def _save_cycle(self, final_state: dict) -> None:
+        """Persist a debate cycle to the JSONL history file."""
+        entry = {
+            "cycle_id": final_state.get("cycle_id", ""),
+            "account_summary": final_state.get("account_summary", ""),
+            "bull_argument": final_state.get("bull_argument", ""),
+            "bear_argument": final_state.get("bear_argument", ""),
+            "hold_argument": final_state.get("hold_argument", ""),
+            "final_signal_json": final_state.get("final_signal_json", ""),
+            "error": final_state.get("error", ""),
+        }
+        _append_history(self._history_path, entry)
+
     def analyze_sync(
         self,
         market_data: dict[str, Any],
@@ -544,35 +550,15 @@ class DebateStrategy:
     def get_history(
         self, thread_id: str | None = None
     ) -> list[dict[str, Any]]:
-        """Retrieve all checkpointed debate cycles from the database.
+        """Retrieve all debate cycles from the JSONL history file.
 
-        Each entry contains the full DebateState for one cycle.
         Returns list ordered from oldest to newest.
         """
-        graph_config = self._make_config(thread_id)
-        history: list[dict] = []
-
-        try:
-            for checkpoint in self.graph.get_state_history(config=graph_config):
-                # Filter out empty placeholder states
-                if checkpoint.values.get("cycle_id"):
-                    history.append(dict(checkpoint.values))
-        except Exception as e:
-            logger.error("Failed to retrieve history: %s", e)
-
-        # get_state_history returns newest first, reverse to oldest first
-        history.reverse()
-        return history
+        return _read_history(self._history_path)
 
     def get_latest_state(
         self, thread_id: str | None = None
     ) -> dict[str, Any] | None:
-        """Get the most recent checkpointed state (e.g. for crash recovery)."""
-        graph_config = self._make_config(thread_id)
-        try:
-            snapshot = self.graph.get_state(config=graph_config)
-            if snapshot and snapshot.values.get("cycle_id"):
-                return dict(snapshot.values)
-        except Exception as e:
-            logger.error("Failed to get latest state: %s", e)
-        return None
+        """Get the most recent debate cycle (e.g. for crash recovery)."""
+        history = _read_history(self._history_path)
+        return history[-1] if history else None

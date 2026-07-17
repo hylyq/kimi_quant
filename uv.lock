@@ -783,6 +783,7 @@ name = "kimi-quant"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiosqlite" },
     { name = "eth-account" },
     { name = "hyperliquid-python-sdk" },
     { name = "instructor" },
@@ -795,6 +796,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.22.1" },
     { name = "eth-account", specifier = ">=0.13.7" },
     { name = "hyperliquid-python-sdk", specifier = ">=0.24.0" },
     { name = "instructor", specifier = ">=1.15.4" },

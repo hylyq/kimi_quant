@@ -64,7 +64,7 @@
 |------|------|
 | 大模型 | Kimi K3 (Moonshot API, OpenAI 兼容) |
 | LLM 编排 | LangChain + LangGraph StateGraph |
-| 状态持久化 | LangGraph SqliteSaver Checkpointing |
+| 状态持久化 | LangGraph MemorySaver + JSONL 文件（fcntl 锁） |
 | 交易所 | Hyperliquid (Perpetual DEX) |
 | 结构化输出 | Pydantic + LangChain json_schema |
 | 交易执行 | hyperliquid-python-sdk (15/15 全覆盖) |
@@ -527,12 +527,12 @@ TradeExecutor 启动时自动查询链上状态：
 
 ### LangGraph Checkpointing
 
-每个 cycle 的完整状态自动持久化到 `data/debate.db`：
+每个 cycle 的完整辩论结果持久化到 `data/debate.jsonl`：
 
 ```
-DebateState (每个 cycle 自动保存):
+每行一个 JSON 对象:
   ├── cycle_id             ← ISO 时间戳
-  ├── market_prompt        ← 市场快照
+  ├── account_summary      ← 账户摘要
   ├── bull_argument        ← Bull Agent 论据
   ├── bear_argument        ← Bear Agent 论据
   ├── hold_argument        ← Hold Agent 论据
@@ -595,8 +595,8 @@ kimi_quant/
 │   ├── analytics.py     # TradeLogger — 盈亏分析 + LLM 自省反馈
 │   └── main.py          # CLI 入口 + 交易循环
 ├── data/
-│   ├── debate.db        # SQLite checkpoint 数据库（自动生成）
-│   └── trades.jsonl     # 交易记录 JSONL（fcntl 文件锁，支持并发读写）
+│   ├── debate.jsonl   # 辩论历史记录 (JSONL, fcntl 文件锁)
+│   └── trades.jsonl   # 交易记录 JSONL（fcntl 文件锁，支持并发读写）
 ├── .env                 # 实际配置（gitignore，不提交）
 ├── .env.example         # 配置模板
 ├── .gitignore
@@ -654,9 +654,9 @@ uv run kimi-quant --history
 tail -5 data/trades.jsonl | python -m json.tool
 ```
 
-### Q: Debate 模式报错 "SqliteSaver unavailable"？
+### Q: 辩论历史存在哪里？重启后能恢复吗？
 
-这是 langgraph-checkpoint-sqlite 的已知兼容性问题。程序会自动回退到 MemorySaver（仅内存，重启丢失历史）。不影响交易功能。
+辩论结果持久化在 `data/debate.jsonl`（JSONL 格式，使用 `fcntl` 文件锁支持并发读写）。`--history` 命令可随时查看，重启不丢失。
 
 ### Q: 怎么停止程序？
 

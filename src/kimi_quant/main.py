@@ -378,12 +378,11 @@ def run_loop():
             logger.info("Seeded circuit breaker: %d consecutive losses from history",
                         consecutive)
 
-    # Debate mode: create strategy ONCE with persistent checkpointer
+    # Debate mode: create strategy ONCE (checkpointer lazy-inits on first use)
     strategy = None
     if mode == "debate":
-        from kimi_quant.debate import DebateStrategy, create_checkpointer
-        handle = create_checkpointer()
-        strategy = DebateStrategy(checkpointer_handle=handle)
+        from kimi_quant.debate import DebateStrategy
+        strategy = DebateStrategy()
 
         # Crash recovery: check if we have state from a prior run
         latest = strategy.get_latest_state()
@@ -501,10 +500,9 @@ def cmd_stats():
 
 def cmd_history():
     """Print the full debate history from the checkpoint database."""
-    from kimi_quant.debate import DebateStrategy, create_checkpointer
+    from kimi_quant.debate import DebateStrategy
 
-    handle = create_checkpointer()
-    strategy = DebateStrategy(checkpointer_handle=handle)
+    strategy = DebateStrategy()
     try:
         history = strategy.get_history()
 
@@ -588,9 +586,8 @@ def main():
         trade_logger = TradeLogger()
 
         if config.strategy_mode == "debate":
-            from kimi_quant.debate import DebateStrategy, create_checkpointer
-            handle = create_checkpointer()
-            strategy = DebateStrategy(checkpointer_handle=handle)
+            from kimi_quant.debate import DebateStrategy
+            strategy = DebateStrategy()
             try:
                 result = run_once_debate(strategy, data, risk, executor, trade_logger)
             finally:
