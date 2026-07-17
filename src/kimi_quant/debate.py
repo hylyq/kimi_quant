@@ -80,33 +80,42 @@ class DebateState(TypedDict):
 
 
 # ─── Agent Persona Prompts ───────────────────────────────────────────────────
+#
+# Prefix-caching design: market data is placed in the system message (shared
+# across all 3 agents) so DeepSeek V3's automatic KV-cache reuse kicks in.
+# Persona instructions go in the user message (the varying suffix).
+# Result: agent 2 and 3 only pay for ~50 new input tokens instead of ~1500.
+#
+# Shared system context — prepended to market data for all 3 agents.
+DEBATE_SHARED_SYSTEM = (
+    "You are a BTC perpetual quant analyst on Hyperliquid. "
+    "Below is real-time market data. Analyze it from the specific perspective "
+    "requested in the user message.\n"
+    "Rules: Be specific — cite actual prices, sizes, funding rates. "
+    "Be honest — if your side has weak evidence, say so. "
+    "150-200 words. Plain text only, no JSON."
+)
 
-BULL_SYSTEM_PROMPT = """\
-You are a bullish BTC trader. Find the strongest case for LONG.
+# Persona instructions — these are the varying suffix (NOT cached).
+BULL_USER_PROMPT = (
+    "Role: Bullish BTC Trader\n"
+    "Find the strongest case for LONG: bid walls, buying pressure, "
+    "low/negative funding, support levels, oversold bounces, accumulation signals."
+)
 
-Analyze: bid walls, buying pressure, low/negative funding, support levels, \
-oversold bounces, accumulation signals.
+BEAR_USER_PROMPT = (
+    "Role: Bearish BTC Trader\n"
+    "Find the strongest case for SHORT: ask walls, selling pressure, "
+    "high positive funding (crowded longs), resistance levels, distribution "
+    "signals, bearish divergences."
+)
 
-Rules: Be specific (cite prices/sizes). Be honest — flag weak evidence. \
-150-200 words. Plain text only, no JSON."""
-
-BEAR_SYSTEM_PROMPT = """\
-You are a bearish BTC trader. Find the strongest case for SHORT.
-
-Analyze: ask walls, selling pressure, high positive funding (crowded longs), \
-resistance levels, distribution signals, bearish divergences.
-
-Rules: Be specific (cite prices/sizes). Be honest — flag weak evidence. \
-150-200 words. Plain text only, no JSON."""
-
-HOLD_SYSTEM_PROMPT = """\
-You are a cautious risk manager. Find reasons to STAY OUT.
-
-Analyze: conflicting signals, wide spreads, choppy action, mid-range price, \
-unclear multi-TF alignment, poor risk/reward, data gaps.
-
-Rules: Be specific about what would change your mind. If market truly has \
-clear direction, acknowledge it. 150-200 words. Plain text only, no JSON."""
+HOLD_USER_PROMPT = (
+    "Role: Cautious Risk Manager\n"
+    "Find reasons to STAY OUT: conflicting signals, wide spreads, choppy action, "
+    "mid-range price, unclear multi-TF alignment, poor risk/reward. "
+    "If market truly has clear direction, acknowledge it."
+)
 
 JUDGE_SYSTEM_PROMPT = """\
 You are the Head Trader. Your team (Bull/Long, Bear/Short, Risk/Hold) debated. \
@@ -128,8 +137,9 @@ Guidelines:
 Output TradingSignal JSON:
 - action, confidence, reasoning, size (BTC), entry_price (null=market),
   stop_loss, take_profit, modify_sl_to, key_factors (2-4 items),
-  next_interval (null=default, range 60-10800s): shorter (60-300s) near
-  key levels/high vol, longer (1800-10800s) when quiet/sideways
+  next_interval (null=default, range 300-10800s): ONLY use 300-600 for
+  active positions or confirmed breakout setups. Default to null or 1800+
+  for normal HOLD conditions. When in doubt, go longer.
 """
 
 
@@ -141,21 +151,31 @@ class SingleTurnAgent:
 
     Used for the debaters — each gets one turn to produce their output.
     Automatically falls back to DeepSeek if Kimi fails.
+
+    Prefix-caching: the market data is placed in the system message so all
+    3 agents share an identical prompt prefix. DeepSeek V3's automatic
+    KV-cache reuse means agents 2 and 3 only pay for the ~50-token user
+    message instead of the full ~1500-token market prompt.
     """
 
-    def __init__(self, name: str, system_prompt: str):
+    def __init__(self, name: str, user_prompt: str):
         from kimi_quant.llm import create_llm
 
         self.name = name
-        self.system_prompt = system_prompt
+        self.user_prompt = user_prompt  # Persona instruction (short, varying)
         self.llm = create_llm()
 
-    async def arun(self, user_prompt: str) -> str:
-        """Run the agent asynchronously and return its text response."""
+    async def arun(self, market_prompt: str) -> str:
+        """Run the agent asynchronously and return its text response.
+
+        Args:
+            market_prompt: The full market data text — placed in the system
+                message as a shared prefix for all 3 agents (cacheable).
+        """
         try:
             messages = [
-                ("system", self.system_prompt),
-                ("user", user_prompt),
+                ("system", DEBATE_SHARED_SYSTEM + "\n\n" + market_prompt),
+                ("user", self.user_prompt),
             ]
             response = await self.llm.ainvoke(messages)
             return str(response.content)
@@ -282,9 +302,9 @@ class DebateStrategy:
 
     def __init__(self, history_path: str | None = None,
                  debate_timeout: int = 60):
-        self.bull = SingleTurnAgent("Bull", BULL_SYSTEM_PROMPT)
-        self.bear = SingleTurnAgent("Bear", BEAR_SYSTEM_PROMPT)
-        self.hold = SingleTurnAgent("Hold", HOLD_SYSTEM_PROMPT)
+        self.bull = SingleTurnAgent("Bull", BULL_USER_PROMPT)
+        self.bear = SingleTurnAgent("Bear", BEAR_USER_PROMPT)
+        self.hold = SingleTurnAgent("Hold", HOLD_USER_PROMPT)
         self.judge = JudgeAgent()
         self.debate_timeout = debate_timeout
         self._history_path = history_path or DEFAULT_HISTORY_PATH
