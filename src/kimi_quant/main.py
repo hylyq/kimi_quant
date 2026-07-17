@@ -325,7 +325,14 @@ def _record_close_from_chain(
 
 
 def run_loop():
-    """Main trading loop — runs at configured intervals."""
+    """Main trading loop — runs at configured intervals.
+
+    Multi-layer error protection:
+      - Startup errors: logged and raised (must fix config)
+      - Per-cycle errors: caught, logged, loop continues
+      - Sleep errors: caught, loop continues
+      - Fatal (KeyboardInterrupt, SystemExit): clean shutdown
+    """
     mode = config.strategy_mode
     logger.info("=" * 50)
     logger.info("Kimi Quant — BTC Perpetual Contract Trading")
@@ -334,12 +341,16 @@ def run_loop():
                 config.trading_interval_seconds, config.dry_run)
     logger.info("=" * 50)
 
-    config.validate()
-
-    data = DataProvider()
-    risk = RiskManager()
-    executor = TradeExecutor()
-    trade_logger = TradeLogger()
+    # ── Startup ──────────────────────────────────────────────────────────
+    try:
+        config.validate()
+        data = DataProvider()
+        risk = RiskManager()
+        executor = TradeExecutor()
+        trade_logger = TradeLogger()
+    except Exception as e:
+        logger.critical("Startup failed: %s", e, exc_info=True)
+        raise  # can't recover from startup failures
 
     # If executor recovered a position from chain that isn't in the trade log,
     # create a pending trade so the eventual close is recorded correctly
@@ -355,17 +366,13 @@ def run_loop():
             executor.tracker.entry_price,
         )
 
-    # Set initial balance for drawdown tracking (first report will have account)
-    # We'll set it on the first cycle when account data is available
-
-    # Log startup stats
+    # Seed circuit breaker from history
     stats = trade_logger.get_stats()
     if stats.total_trades > 0:
         logger.info(
             "Loaded trade history: %d trades | Win Rate: %.1f%% | Net P&L: $%.2f",
             stats.total_trades, stats.win_rate, stats.net_pnl,
         )
-        # Seed circuit breaker from history
         recent = trade_logger.get_all_trades()[-10:]
         consecutive = 0
         for t in reversed(recent):
@@ -384,8 +391,6 @@ def run_loop():
     if mode == "debate":
         from kimi_quant.debate import DebateStrategy
         strategy = DebateStrategy()
-
-        # Crash recovery: check if we have state from a prior run
         latest = strategy.get_latest_state()
         if latest:
             logger.info(
@@ -395,18 +400,18 @@ def run_loop():
 
     llm = KimiLLM() if mode == "single" else None
 
+    # ── Main Loop ────────────────────────────────────────────────────────
     cycle_count = 0
-    next_interval = config.trading_interval_seconds  # may be overridden by LLM
+    next_interval = config.trading_interval_seconds
 
-    # Adaptive interval bounds (seconds)
-    # Min: prevent API rate limiting. Max: don't drift too far in quiet markets.
-    MIN_INTERVAL = 60     # 1 minute
-    MAX_INTERVAL = 10800  # 3 hours
+    MIN_INTERVAL = 60     # 1 minute — prevent API rate limiting
+    MAX_INTERVAL = 10800  # 3 hours — don't drift too far
 
     while not _shutdown_requested:
         cycle_count += 1
         start_time = time.monotonic()
 
+        # ═══ Layer 1: Per-cycle protection ═══
         try:
             if mode == "debate":
                 assert strategy is not None
@@ -427,7 +432,7 @@ def run_loop():
                 cycle_count, mode, status, sig, conf,
             )
 
-            # ── Adaptive interval: let the LLM decide when to wake next ──
+            # Adaptive interval: LLM decides when to wake next
             llm_interval = result.get("next_interval")
             if llm_interval and isinstance(llm_interval, (int, float)):
                 bounded = max(MIN_INTERVAL, min(MAX_INTERVAL, int(llm_interval)))
@@ -439,24 +444,25 @@ def run_loop():
             else:
                 next_interval = config.trading_interval_seconds
 
-        except Exception as e:
-            logger.error("Cycle %d failed with error: %s", cycle_count, e,
-                         exc_info=True)
+        except Exception:
+            logger.error("Cycle %d failed — continuing", cycle_count, exc_info=True)
 
-        elapsed = time.monotonic() - start_time
-        sleep_time = max(0, next_interval - elapsed)
-        if not _shutdown_requested and sleep_time > 0:
-            logger.info("Sleeping %.1fs until next cycle...", sleep_time)
-            # Wake every 10s to check shutdown flag (1s granularity
-            # is unnecessary for long sleeps and wastes CPU cycles)
-            tick = min(10, sleep_time)
-            while sleep_time > 0 and not _shutdown_requested:
-                time.sleep(min(tick, sleep_time))
-                sleep_time -= tick
+        # ═══ Layer 2: Sleep protection ═══
+        try:
+            elapsed = time.monotonic() - start_time
+            sleep_time = max(0, next_interval - elapsed)
+            if not _shutdown_requested and sleep_time > 0:
+                logger.info("Sleeping %.1fs until next cycle...", sleep_time)
+                tick = min(10, sleep_time)
+                while sleep_time > 0 and not _shutdown_requested:
+                    time.sleep(min(tick, sleep_time))
+                    sleep_time -= tick
+        except Exception:
+            logger.error("Sleep interrupted — continuing", exc_info=True)
 
+    # ── Shutdown ─────────────────────────────────────────────────────────
     logger.info("Shutting down. Total cycles: %d", cycle_count)
 
-    # Final stats
     stats = trade_logger.get_stats()
     if stats.total_trades > 0:
         logger.info(
@@ -466,7 +472,6 @@ def run_loop():
 
     if strategy is not None:
         strategy.close()
-        logger.info("Checkpointer closed. States persisted to debate.db")
     logger.info("Session complete.")
 
 
