@@ -399,8 +399,9 @@ def run_loop():
     next_interval = config.trading_interval_seconds  # may be overridden by LLM
 
     # Adaptive interval bounds (seconds)
-    MIN_INTERVAL = 60    # don't spam the API
-    MAX_INTERVAL = 3600  # don't go longer than 1 hour
+    # Min: prevent API rate limiting. Max: don't drift too far in quiet markets.
+    MIN_INTERVAL = 60     # 1 minute
+    MAX_INTERVAL = 10800  # 3 hours
 
     while not _shutdown_requested:
         cycle_count += 1
@@ -446,9 +447,12 @@ def run_loop():
         sleep_time = max(0, next_interval - elapsed)
         if not _shutdown_requested and sleep_time > 0:
             logger.info("Sleeping %.1fs until next cycle...", sleep_time)
+            # Wake every 10s to check shutdown flag (1s granularity
+            # is unnecessary for long sleeps and wastes CPU cycles)
+            tick = min(10, sleep_time)
             while sleep_time > 0 and not _shutdown_requested:
-                time.sleep(min(1, sleep_time))
-                sleep_time -= 1
+                time.sleep(min(tick, sleep_time))
+                sleep_time -= tick
 
     logger.info("Shutting down. Total cycles: %d", cycle_count)
 

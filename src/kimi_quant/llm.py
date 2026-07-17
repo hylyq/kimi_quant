@@ -197,9 +197,9 @@ class TradingSignal(BaseModel):
     next_interval: int | None = Field(
         default=None,
         description=(
-            "Suggested seconds until next analysis cycle. "
+            "Suggested seconds until next analysis cycle (range 60-10800). "
             "Shorter (60-300) when near key levels or high volatility. "
-            "Longer (600-1800) when market is quiet/sideways. "
+            "Longer (1800-10800) when market is quiet/sideways. "
             "Leave null to use default interval."
         ),
     )
@@ -272,8 +272,8 @@ Output JSON only (no markdown):
 - modify_sl_to: new SL price (MODIFY_SL only)
 - key_factors: 2-4 items
 - next_interval: suggested seconds until next cycle (null=use default).
-  Set shorter (60-300) near key levels, high vol, or after a signal.
-  Set longer (600-1800) when market is quiet/sideways.
+  Range 60-10800 (1min-3h). Shorter (60-300) near key levels or high vol.
+  Longer (1800-10800) when market is quiet/sideways.
 """
 
     def __init__(self):
