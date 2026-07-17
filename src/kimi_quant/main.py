@@ -280,6 +280,7 @@ def _validate_and_execute(
         "confidence": signal_result.confidence,
         "reasoning": signal_result.reasoning,
         "execution": result,
+        "next_interval": getattr(signal_result, "next_interval", None),
     }
 
 
@@ -395,6 +396,11 @@ def run_loop():
     llm = KimiLLM() if mode == "single" else None
 
     cycle_count = 0
+    next_interval = config.trading_interval_seconds  # may be overridden by LLM
+
+    # Adaptive interval bounds (seconds)
+    MIN_INTERVAL = 60    # don't spam the API
+    MAX_INTERVAL = 3600  # don't go longer than 1 hour
 
     while not _shutdown_requested:
         cycle_count += 1
@@ -420,12 +426,24 @@ def run_loop():
                 cycle_count, mode, status, sig, conf,
             )
 
+            # ── Adaptive interval: let the LLM decide when to wake next ──
+            llm_interval = result.get("next_interval")
+            if llm_interval and isinstance(llm_interval, (int, float)):
+                bounded = max(MIN_INTERVAL, min(MAX_INTERVAL, int(llm_interval)))
+                if bounded != next_interval:
+                    logger.info(
+                        "LLM adjusted interval: %ds → %ds", next_interval, bounded
+                    )
+                next_interval = bounded
+            else:
+                next_interval = config.trading_interval_seconds
+
         except Exception as e:
             logger.error("Cycle %d failed with error: %s", cycle_count, e,
                          exc_info=True)
 
         elapsed = time.monotonic() - start_time
-        sleep_time = max(0, config.trading_interval_seconds - elapsed)
+        sleep_time = max(0, next_interval - elapsed)
         if not _shutdown_requested and sleep_time > 0:
             logger.info("Sleeping %.1fs until next cycle...", sleep_time)
             while sleep_time > 0 and not _shutdown_requested:

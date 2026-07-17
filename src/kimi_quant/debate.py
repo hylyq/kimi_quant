@@ -127,7 +127,9 @@ Guidelines:
 
 Output TradingSignal JSON:
 - action, confidence, reasoning, size (BTC), entry_price (null=market),
-  stop_loss, take_profit, modify_sl_to, key_factors (2-4 items)
+  stop_loss, take_profit, modify_sl_to, key_factors (2-4 items),
+  next_interval (null=default): suggest shorter (60-300s) near key levels
+  or high vol, longer (600-1800s) when quiet/sideways
 """
 
 

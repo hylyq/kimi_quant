@@ -194,6 +194,15 @@ class TradingSignal(BaseModel):
         default_factory=list,
         description="Key factors that influenced this decision",
     )
+    next_interval: int | None = Field(
+        default=None,
+        description=(
+            "Suggested seconds until next analysis cycle. "
+            "Shorter (60-300) when near key levels or high volatility. "
+            "Longer (600-1800) when market is quiet/sideways. "
+            "Leave null to use default interval."
+        ),
+    )
 
 
 def build_market_prompt(market_data: dict[str, Any]) -> str:
@@ -262,6 +271,9 @@ Output JSON only (no markdown):
 - take_profit: realistic target
 - modify_sl_to: new SL price (MODIFY_SL only)
 - key_factors: 2-4 items
+- next_interval: suggested seconds until next cycle (null=use default).
+  Set shorter (60-300) near key levels, high vol, or after a signal.
+  Set longer (600-1800) when market is quiet/sideways.
 """
 
     def __init__(self):
