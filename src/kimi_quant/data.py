@@ -21,12 +21,14 @@ from hyperliquid.info import Info
 try:
     from curl_cffi import requests as _cf_requests
 
-    # Override Session() to always impersonate Chrome's TLS fingerprint.
+    # Override Session() to always impersonate Firefox's TLS fingerprint.
+    # Firefox is less commonly impersonated than Chrome — TLS inspection
+    # services focus on Chrome anomalies, making Firefox a quieter choice.
     # The SDK calls requests.Session() with no args — we inject impersonation.
     _OriginalSession = _cf_requests.Session
 
     def _make_session(**kw):
-        return _OriginalSession(impersonate="chrome131", timeout=30, **kw)
+        return _OriginalSession(impersonate="firefox147", timeout=30, **kw)
 
     _cf_requests.Session = _make_session  # type: ignore[assignment]
 except ImportError:
