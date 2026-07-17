@@ -355,7 +355,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `MOONSHOT_BASE_URL` | `https://api.moonshot.cn/v1` | API 端点 |
 | `KIMI_MODEL` | `kimi-k3` | 模型名称 |
 | `LLM_TEMPERATURE` | `0.1` | LLM 温度 (0-2) |
-| `LLM_MAX_TOKENS` | `1024` | 最大输出 token |
+| `LLM_MAX_TOKENS` | `2048` | 最大**输出** token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
 | **Hyperliquid** | | |
 | `HYPERLIQUID_PRIVATE_KEY` | — | 钱包私钥（实盘必填） |

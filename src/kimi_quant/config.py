@@ -33,7 +33,7 @@ class Config:
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1"))
     )
     llm_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "1024"))
+        default_factory=lambda: int(os.getenv("LLM_MAX_TOKENS", "2048"))
     )
 
     # --- Hyperliquid ---
