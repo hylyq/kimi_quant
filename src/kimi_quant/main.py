@@ -11,10 +11,19 @@ Supports two strategy modes:
 import argparse
 import json as _json
 import logging
+import os
 import signal
 import time
 from datetime import datetime, timezone
 from typing import Any
+
+# Configure logging BEFORE project imports — some modules (e.g. notify)
+# run detection logic at import time and must be able to log.
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO"), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 from kimi_quant.analytics import TradeLogger
 from kimi_quant.config import config
@@ -23,13 +32,6 @@ from kimi_quant.executor import TradeExecutor
 from kimi_quant.llm import KimiLLM
 from kimi_quant.notify import notify
 from kimi_quant.risk import RiskManager
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, config.log_level, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("kimi_quant")
 
 # Graceful shutdown flag
