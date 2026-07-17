@@ -14,30 +14,39 @@ Architecture (LangGraph StateGraph):
     START
       │
       ▼
-  ┌─────────┐    asyncio.gather    ┌──────────────┐
-  │ Prepare │───┬──────────────────▶│ Bull Agent   │──┐
-  └─────────┘   │                  │ (论证做多)    │  │
-                │                  └──────────────┘  │
-                │                  ┌──────────────┐  │
-                ├──────────────────▶│ Bear Agent   │──┤
-                │                  │ (论证做空)    │  │
-                │                  └──────────────┘  │
-                │                  ┌──────────────┐  │
-                └──────────────────▶│ Hold Agent   │──┘
-                                   │ (论证观望)    │
-                                   └──────────────┘
-                                          │
-                                          ▼
-                                   ┌──────────────┐
-                                   │ Judge Agent  │
-                                   │ (裁决)        │
-                                   └──────┬───────┘
-                                          │
-                                          ▼
-                                   TradingSignal
-                                          │
-                                          ▼
-                                         END
+  ┌─────────┐
+  │ Prepare │
+  └────┬────┘
+       │
+       ▼
+  ╔══════════════════════════════════════════════════╗
+  ║  Phase 1: Hold Agent (cache warm-up)             ║
+  ║  ┌──────────────┐                                ║
+  ║  │ Hold Agent   │──▶ populates KV-cache          ║
+  ║  │ (论证观望)    │    for shared market prefix    ║
+  ║  └──────────────┘                                ║
+  ╚══════════════════════════════════════════════════╝
+       │
+       ▼
+  ╔══════════════════════════════════════════════════╗
+  ║  Phase 2: Bull + Bear (cache hits)               ║
+  ║  ┌──────────────┐  ┌──────────────┐              ║
+  ║  │ Bull Agent   │  │ Bear Agent   │  parallel    ║
+  ║  │ (论证做多)    │  │ (论证做空)    │  ~63% fewer  ║
+  ║  └──────────────┘  └──────────────┘  input tokens║
+  ╚══════════════════════════════════════════════════╝
+       │
+       ▼
+  ┌──────────────┐
+  │ Judge Agent  │
+  │ (裁决)        │
+  └──────┬───────┘
+         │
+         ▼
+  TradingSignal
+         │
+         ▼
+        END
 """
 
 import asyncio
@@ -335,11 +344,21 @@ class DebateStrategy:
         return builder.compile(checkpointer=self.checkpointer)
 
     async def _debate_node(self, state: DebateState) -> DebateState:
-        """Run all three debaters in parallel with timeout."""
+        """Two-phase debate with prefix-cache warmup.
+
+        Phase 1 — Hold runs solo. Its prefill populates the KV-cache for
+        the shared market-data prefix on the API backend.
+        Phase 2 — Bull + Bear run in parallel. Both hit the warm cache,
+        paying only for their ~50-token persona suffix (vs ~1500 tokens).
+
+        Trade-off: adds ~Hold's latency to total wall time vs pure parallel.
+        Hold is typically the fastest agent (simplest analysis), and the
+        input-token savings (~63%) outweigh the latency cost for most users.
+        """
         prompt = state["market_prompt"]
         cycle_id = state.get("cycle_id", "?")
-        logger.info("Debate [%s]: launching 3 agents (timeout=%ds)...",
-                     cycle_id, self.debate_timeout)
+        logger.info("Debate [%s]: Phase 1 — warming cache via Hold agent...",
+                     cycle_id)
         start = datetime.now(timezone.utc)
 
         async def _run_with_timeout(agent, name: str) -> str:
@@ -355,10 +374,15 @@ class DebateStrategy:
                     f"Proceed with available arguments from other agents.]"
                 )
 
-        bull_arg, bear_arg, hold_arg = await asyncio.gather(
+        # Phase 1: Hold warms the prefix cache
+        hold_arg = await _run_with_timeout(self.hold, "Hold")
+
+        # Phase 2: Bull + Bear in parallel, both hit the warm cache
+        logger.info("Debate [%s]: Phase 2 — Bull + Bear (cache warm)...",
+                     cycle_id)
+        bull_arg, bear_arg = await asyncio.gather(
             _run_with_timeout(self.bull, "Bull"),
             _run_with_timeout(self.bear, "Bear"),
-            _run_with_timeout(self.hold, "Hold"),
         )
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
