@@ -234,21 +234,28 @@ def _validate_and_execute(
         }
 
     # ── Phase 3: Record trade open intent ──
-    if signal_result.action in ("LONG", "SHORT"):
+    # Only open a new trade record if we don't already have a position/order
+    # (prevents clobbering an existing pending trade from a resting limit order)
+    trade_opened_this_cycle = False
+    if (signal_result.action in ("LONG", "SHORT")
+            and not executor.tracker.has_resting_order()
+            and not executor.tracker.has_position()):
         trade_logger.open_trade(
             side="long" if signal_result.action == "LONG" else "short",
             size=signal_result.size or config.max_position_size,
             entry_price=signal_result.entry_price or mid_price,
             dry_run=executor.dry_run,
         )
+        trade_opened_this_cycle = True
 
     # ── Phase 4: Execute ──
     result = executor.execute(signal_result)
     logger.info("Execution result: %s | Position: %s",
                 result, executor.tracker.to_summary())
 
-    # If execution failed after opening a pending trade, clean it up
+    # If execution failed after opening a pending trade this cycle, clean it up
     if (signal_result.action in ("LONG", "SHORT")
+            and trade_opened_this_cycle
             and not result.get("executed")):
         trade_logger.cancel_pending()
         logger.warning("Execution failed — cancelled pending trade record")
