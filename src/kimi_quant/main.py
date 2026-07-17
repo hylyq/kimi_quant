@@ -21,6 +21,7 @@ from kimi_quant.config import config
 from kimi_quant.data import DataProvider
 from kimi_quant.executor import TradeExecutor
 from kimi_quant.llm import KimiLLM
+from kimi_quant.notify import notify
 from kimi_quant.risk import RiskManager
 
 # Configure logging
@@ -226,6 +227,7 @@ def _validate_and_execute(
     )
     if not risk_check.passed:
         logger.warning("Risk check failed: %s", risk_check.reason)
+        notify.send(f"🛡️ Risk rejected: {risk_check.reason}")
         return {
             "status": "rejected",
             "signal": signal_result.action,
@@ -234,19 +236,23 @@ def _validate_and_execute(
         }
 
     # ── Phase 3: Record trade open intent ──
-    # Only open a new trade record if we don't already have a position/order
-    # (prevents clobbering an existing pending trade from a resting limit order)
     trade_opened_this_cycle = False
     if (signal_result.action in ("LONG", "SHORT")
             and not executor.tracker.has_resting_order()
             and not executor.tracker.has_position()):
+        side = "long" if signal_result.action == "LONG" else "short"
+        size = signal_result.size or config.max_position_size
+        entry_price = signal_result.entry_price or mid_price
         trade_logger.open_trade(
-            side="long" if signal_result.action == "LONG" else "short",
-            size=signal_result.size or config.max_position_size,
-            entry_price=signal_result.entry_price or mid_price,
+            side=side, size=size, entry_price=entry_price,
             dry_run=executor.dry_run,
         )
         trade_opened_this_cycle = True
+        notify.send(
+            f"📈 {signal_result.action} {size} BTC @ ${entry_price:.0f}\n"
+            f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
+            f"Confidence: {signal_result.confidence:.2f}"
+        )
 
     # ── Phase 4: Execute ──
     result = executor.execute(signal_result)
@@ -269,6 +275,12 @@ def _validate_and_execute(
                 risk.record_win(trade.net_pnl)
             else:
                 risk.record_loss(trade.net_pnl)
+            emoji = "🟢" if trade.is_win else "🔴"
+            notify.send(
+                f"{emoji} Position closed: {trade.side.upper()}\n"
+                f"P&L: ${trade.net_pnl:+.2f} ({trade.pnl_pct:+.2f}%)\n"
+                f"Reason: {trade.close_reason}"
+            )
 
     # Entry price is already set in open_trade() from signal.entry_price
     # or approximated from mid_price. The next cycle's sync_with_chain()
@@ -350,7 +362,14 @@ def run_loop():
         trade_logger = TradeLogger()
     except Exception as e:
         logger.critical("Startup failed: %s", e, exc_info=True)
+        notify.send(f"❌ Kimi Quant startup failed: {e}")
         raise  # can't recover from startup failures
+
+    notify.send(
+        f"🚀 Kimi Quant started\n"
+        f"Mode: {mode} | Dry Run: {config.dry_run}\n"
+        f"Primary: {config.primary_llm} | {config.trading_interval_seconds}s interval"
+    )
 
     # If executor recovered a position from chain that isn't in the trade log,
     # create a pending trade so the eventual close is recorded correctly
@@ -446,6 +465,9 @@ def run_loop():
 
         except Exception:
             logger.error("Cycle %d failed — continuing", cycle_count, exc_info=True)
+            # Notify on first error, then every 10th to avoid spam
+            if cycle_count == 1 or cycle_count % 10 == 0:
+                notify.send(f"⚠️ Cycle {cycle_count} failed — check logs")
 
         # ═══ Layer 2: Sleep protection ═══
         try:
@@ -469,9 +491,17 @@ def run_loop():
             "Session P&L: %d trades | Win Rate: %.1f%% | Net P&L: $%.2f",
             stats.total_trades, stats.win_rate, stats.net_pnl,
         )
+        notify.send(
+            f"⏹️ Kimi Quant stopped\n"
+            f"Cycles: {cycle_count} | Trades: {stats.total_trades}\n"
+            f"Win: {stats.win_rate:.0f}% | P&L: ${stats.net_pnl:+.2f}"
+        )
+    else:
+        notify.send(f"⏹️ Kimi Quant stopped — {cycle_count} cycles, no trades")
 
     if strategy is not None:
         strategy.close()
+    notify.shutdown()
     logger.info("Session complete.")
 
 

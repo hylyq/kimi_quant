@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from kimi_quant.config import config
 from kimi_quant.llm import TradingSignal
+from kimi_quant.notify import notify
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,11 @@ class RiskManager:
                     "CIRCUIT BREAKER: %d consecutive losses. "
                     "Pausing new positions for %d cycles.",
                     self.consecutive_losses, self.COOLDOWN_CYCLES,
+                )
+                notify.send(
+                    f"⚠️ Circuit breaker activated\n"
+                    f"{self.consecutive_losses} consecutive losses\n"
+                    f"Paused {self.COOLDOWN_CYCLES} cycles | P&L: ${self.total_realized_pnl:+.2f}"
                 )
             else:
                 logger.warning(
