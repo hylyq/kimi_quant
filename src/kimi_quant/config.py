@@ -95,6 +95,12 @@ class Config:
     trading_interval_seconds: int = field(
         default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "600"))
     )
+    min_interval: int = field(
+        default_factory=lambda: int(os.getenv("MIN_INTERVAL", "300"))
+    )  # hard lower bound for LLM-suggested intervals (default 5 min)
+    max_interval: int = field(
+        default_factory=lambda: int(os.getenv("MAX_INTERVAL", "10800"))
+    )  # hard upper bound (default 3 hours)
     dry_run: bool = field(
         default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true"
     )

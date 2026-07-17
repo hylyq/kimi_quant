@@ -423,8 +423,8 @@ def run_loop():
     cycle_count = 0
     next_interval = config.trading_interval_seconds
 
-    MIN_INTERVAL = 60     # 1 minute — prevent API rate limiting
-    MAX_INTERVAL = 10800  # 3 hours — don't drift too far
+    MIN_INTERVAL = config.min_interval      # default 300s (5 min) — cost control
+    MAX_INTERVAL = config.max_interval      # default 10800s (3h) — don't drift too far
 
     while not _shutdown_requested:
         cycle_count += 1

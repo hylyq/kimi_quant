@@ -518,6 +518,8 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | **策略** | | |
 | `STRATEGY_MODE` | `single` | `single` 或 `debate` |
 | `TRADING_INTERVAL` | `600` | 默认间隔（秒）。LLM 可通过 `next_interval` 动态覆盖 |
+| `MIN_INTERVAL` | `300` | LLM 建议间隔的硬下限（秒，默认 5 分钟） |
+| `MAX_INTERVAL` | `10800` | LLM 建议间隔的硬上限（秒，默认 3 小时） |
 | `DRY_RUN` | `true` | 模拟模式开关 |
 | **日志** | | |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
