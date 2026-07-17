@@ -249,10 +249,20 @@ class DataProvider:
             self.base_url = config.hl_base_url
             self.use_testnet = False
 
-        # Always use mainnet for candle data (testnet candles are empty)
-        self._info_mainnet = Info(base_url="https://api.hyperliquid.xyz", skip_ws=True)
         self._info_local = Info(base_url=self.base_url, skip_ws=True)
         self.coin = config.trading_pair
+
+        # Mainnet for candle data (testnet candles are empty).
+        # If unreachable (e.g. GFW), fall back to local API.
+        try:
+            self._info_mainnet = Info(
+                base_url="https://api.hyperliquid.xyz", skip_ws=True
+            )
+        except Exception as e:
+            logger.warning(
+                "Mainnet API unreachable (%s), using local for candles", e
+            )
+            self._info_mainnet = self._info_local
 
         # Candle cache: {interval: (timestamp, candles_list)}
         self._candle_cache: dict[str, tuple[float, list[dict]]] = {}
