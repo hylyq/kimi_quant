@@ -5,7 +5,7 @@
 - 🧠 **双模型容灾**：Kimi K3 + DeepSeek V3，一键切换主备，自动降级
 - 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、LLM 引导长间隔、可配置唤醒下限
 - 📱 **消息推送**：飞书实时通知交易事件，自动检测无需配置
-- 🛡️ **多层防护**：启动验证 + 六层风控 + 单轮隔离 + 异常熔断 + API 重试，炸不穿
+- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 六层风控 + 启动重试 + 异常熔断，炸不穿
 - 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
 - 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
 - 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + 前缀缓存 + Judge 裁决）
@@ -783,7 +783,7 @@ kimi_quant/
 
 阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置两层防护：
 
-**第一层 — TLS 指纹伪装（curl_cffi）**：自动伪装成 Chrome 120 浏览器的 JA3 TLS 指纹，绕过指纹静态检测。
+**第一层 — TLS 指纹伪装（curl_cffi）**：自动伪装成 Firefox 147 浏览器的 JA3 TLS 指纹。选择 Firefox 而非 Chrome 是因为反爬服务对 Chrome 指纹的检测最严格（Chrome 是最常被仿冒的浏览器），Firefox 的 TLS 密码套件和扩展信号不同，不在重点盯防范围。
 
 **第二层 — 重试+限流保护**：阿里云不仅检测指纹，还会对并发请求频率敏感。如果同一时刻发起过多 TLS 握手（例如多线程并行请求），即使指纹正确也会被临时封锁。代码已内置：
 - **指数退避重试**：遇到 `Connection reset by peer` 等瞬时错误时自动重试（最多 3 次，间隔 1.5s → 3s → 6s + 随机抖动）
