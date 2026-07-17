@@ -3,11 +3,12 @@
 **BTC 永续合约量化交易程序** — 基于大模型的智能交易决策系统，运行于 Hyperliquid 去中心化交易所。
 
 - 🧠 **双模型容灾**：Kimi K3 + DeepSeek V3，一键切换主备，自动降级
+- 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、LLM 引导长间隔、可配置唤醒下限
 - 📱 **消息推送**：飞书实时通知交易事件，自动检测无需配置
-- 🛡️ **多层防护**：启动验证 + 六层风控 + 单轮隔离 + 异常熔断，炸不穿
-- 🕐 **自适应唤醒**：LLM 自决下次分析时间，关键位盯紧/横盘省费
+- 🛡️ **多层防护**：启动验证 + 六层风控 + 单轮隔离 + 异常熔断 + API 重试，炸不穿
+- 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
 - 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
-- 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + Judge 裁决）
+- 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + 前缀缓存 + Judge 裁决）
 - 📝 **完整记录**：交易盈亏 + 辩论历史 JSONL 持久化，支持并发读写
 
 ## 目录
@@ -157,15 +158,15 @@ LLM 根据市场状态动态调整：
 
 | 市场状态 | LLM 建议间隔 | 效果 |
 |----------|:----------:|------|
-| 关键支撑/阻力位附近 | 60-120s | 高频盯盘 |
-| 高波动、突破中 | 120-300s | 快速响应 |
-| 横盘、无方向 | 600-1800s | 降低成本 |
-| 周末、低流动性 | 1800-10800s | 省到极致 |
+| 已持仓、突破确认中 | 300-600s | 适度盯盘 |
+| 正常行情、无仓位 | 600-1800s | 控费优先 |
+| 横盘、无方向 | 1800-3600s | 降低成本 |
+| 周末、低流动性 | 3600-10800s | 省到极致 |
 | LLM 不填 | 使用 `TRADING_INTERVAL` 默认值 | 默认行为 |
 
 ### 边界保护
 
-程序内置钳制：`[60s, 10800s]`（1 分钟 ~ 3 小时），防止 LLM 建议过于极端。
+程序内置钳制：`[MIN_INTERVAL, MAX_INTERVAL]`，默认 `[300s, 10800s]`（5 分钟 ~ 3 小时），可通过环境变量调整。LLM 提示词也已引导优先使用较长间隔——只有已持仓或确认突破时才建议 300-600s。
 
 ### 零配置
 
@@ -662,10 +663,12 @@ TradeExecutor 启动时自动查询链上状态：
 
 ### 决策流程
 
-1. 三个 Debater **并行**接收同一份市场数据（`asyncio.gather`，45s 超时保护）
-2. 每个 Debater 从自身角色出发提供 150-250 字论证
+1. **Phase 1 — 缓存预热**：Hold Agent 先跑，其 prefill 阶段将行情数据写入 DeepSeek KV-cache
+2. **Phase 2 — 并行命中**：Bull + Bear 并发跑，两份请求的前缀（行情数据）命中缓存，仅对 ~50 token 的角色指令计费
 3. Judge **综合多周期趋势**裁决（1h/4h 趋势权重 > 5m/15m，分歧时不默认 HOLD）
 4. Judge 输出结构化 TradingSignal → 风控 → 执行
+
+> **前缀缓存**：三个 Agent 接收完全相同的行情数据。将其置于 prompt 最前面（system message），DeepSeek V3 的后端自动复用第一个请求的 KV-cache。Phase 2 的两个 Agent 输入 token 费用降低 ~95%，整个 Debate 输入 token 省 ~63%。见[费用优化](#费用优化)。
 
 ### Judge 决策框架
 
@@ -798,6 +801,13 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 | DeepSeek V3 | ~¥40 |
 | Kimi + DeepSeek 备份 | ~¥330（仅 Kimi 可用时） |
 
+**Debate 模式**（4 次 LLM 调用/周期，含前缀缓存优化）：
+
+| 配置 | 月成本 | vs Single |
+|------|--------|-----------|
+| DeepSeek V3 | ~¥60 | 1.5x（缓存省 63% 输入 token） |
+| Kimi K3 | ~¥450 | 1.4x |
+
 **省钱三板斧**：
 
 | 策略 | .env 配置 | 效果 |
@@ -805,8 +815,18 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 | 用 DeepSeek 主力 | `PRIMARY_LLM=deepseek` | 月成本 ¥330→¥40 |
 | 关推理 | `REASONING_EFFORT=off` | 输出费用再降 75% |
 | 加大间隔 | `TRADING_INTERVAL=900` | 成本再降 1/3 |
+| 调高最低间隔 | `MIN_INTERVAL=600` | 防止 LLM 频繁唤醒（默认 300s） |
 
 **极限省钱方案**：`PRIMARY_LLM=deepseek + REASONING_EFFORT=off + TRADING_INTERVAL=900`，月成本约 **¥10**。
+
+### Q: Debate 模式怎么省 token？
+
+三个辩论 Agent 接收相同的行情数据（~1500 tokens）。系统已做两项优化：
+
+1. **前缀缓存**：行情数据放在 prompt 最前面，DeepSeek V3 自动复用 KV-cache。Hold 先跑预热缓存，Bull + Bear 并发命中——后两个 Agent 只对 ~50 token 角色指令计费。
+2. **Judge 精简输入**：Judge 只收辩论摘要（不含原始行情），节省 ~450 token/周期。
+
+整体效果：Debate 的 4 次调用等效 ~2.5 次 Single 调用的输入 token 量。
 
 ### Q: 如何切换主/备模型？
 
