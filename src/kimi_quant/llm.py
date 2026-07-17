@@ -21,62 +21,44 @@ logger = logging.getLogger(__name__)
 # ─── LLM Factory with Fallback ────────────────────────────────────────────
 
 
-def _model_kwargs_for(provider: str) -> dict[str, Any]:
-    """Build model-specific extra kwargs based on REASONING_EFFORT config.
-
-    Translates the unified REASONING_EFFORT setting into each provider's
-    native API format.
-
-    Kimi K3: top-level reasoning_effort (currently only "max" supported).
-    DeepSeek: thinking.type (enabled/disabled) for V3 reasoning mode.
-    """
-    effort = config.reasoning_effort.lower()
-
-    if provider == "kimi":
-        # Kimi K3: only "max" is supported currently
-        if effort == "max":
-            return {"reasoning_effort": "max"}
-        # Other values: omit the param (K3 always reasons by default)
-        return {}
-
-    elif provider == "deepseek":
-        if effort == "off":
-            return {"thinking": {"type": "disabled"}}
-        # "max", "high", etc. → enable thinking
-        return {"thinking": {"type": "enabled"}}
-
-    return {}
-
-
 def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
     """Build available LLM instances keyed by provider name.
 
     Only includes models whose API key is configured.
-    Each model gets provider-specific model_kwargs for reasoning control.
+    Handles provider-specific reasoning/thinking parameters.
     """
     registry: dict[str, ChatOpenAI] = {}
+    effort = config.reasoning_effort.lower()
 
     # Kimi / Moonshot
     if config.moonshot_api_key:
-        registry["kimi"] = ChatOpenAI(
+        kimi_kwargs: dict[str, Any] = dict(
             api_key=config.moonshot_api_key,
             base_url=config.moonshot_base_url,
             model=config.kimi_model,
             temperature=temp,
             max_tokens=tokens,
-            model_kwargs=_model_kwargs_for("kimi"),
         )
+        # Kimi K3: reasoning_effort is a direct API param (only "max" supported)
+        if effort == "max":
+            kimi_kwargs["reasoning_effort"] = "max"
+        registry["kimi"] = ChatOpenAI(**kimi_kwargs)
 
     # DeepSeek
     if config.deepseek_api_key:
-        registry["deepseek"] = ChatOpenAI(
+        ds_kwargs: dict[str, Any] = dict(
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
             model=config.deepseek_model,
             temperature=temp,
             max_tokens=tokens,
-            model_kwargs=_model_kwargs_for("deepseek"),
         )
+        # DeepSeek: thinking control goes in model_kwargs
+        if effort == "off":
+            ds_kwargs["model_kwargs"] = {"thinking": {"type": "disabled"}}
+        else:
+            ds_kwargs["model_kwargs"] = {"thinking": {"type": "enabled"}}
+        registry["deepseek"] = ChatOpenAI(**ds_kwargs)
 
     return registry
 
