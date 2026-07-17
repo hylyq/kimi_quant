@@ -760,7 +760,14 @@ kimi_quant/
 
 ### Q: 阿里云服务器无法连接 Hyperliquid API？
 
-阿里云出口会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`）。本项目已内置 `curl_cffi` 解决方案，自动伪装成 Chrome 浏览器的 TLS 指纹绕过检测。
+阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置两层防护：
+
+**第一层 — TLS 指纹伪装（curl_cffi）**：自动伪装成 Chrome 120 浏览器的 JA3 TLS 指纹，绕过指纹静态检测。
+
+**第二层 — 重试+限流保护**：阿里云不仅检测指纹，还会对并发请求频率敏感。如果同一时刻发起过多 TLS 握手（例如多线程并行请求），即使指纹正确也会被临时封锁。代码已内置：
+- **指数退避重试**：遇到 `Connection reset by peer` 等瞬时错误时自动重试（最多 3 次，间隔 1.5s → 3s → 6s + 随机抖动）
+- **并发限制**：并行 API 请求上限从 5 降到 2，避免触发频率封锁
+- **交错提交**：每个并行任务间隔 150ms 提交，避免 TLS 握手瞬时爆量
 
 服务器上运行前确保 `curl_cffi` 已安装：
 ```bash
@@ -770,6 +777,7 @@ uv sync   # 自动安装 curl_cffi
 ```
 DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 ```
+正常运行时如果偶尔看到 `retrying in X.Xs` 的 WARNING 日志，说明触发了临时封锁并正在自动恢复——**不需要人工干预**。只有当同一次调用 4 次重试全部失败时才会报 ERROR。
 
 ### Q: API 费用多少钱？怎么省钱？
 
