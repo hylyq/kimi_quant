@@ -21,6 +21,21 @@ from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
+# Pre-patch for curl_cffi (bypasses TLS fingerprint blocking).
+# Must happen before Exchange/Info are constructed (__init__ calls API).
+_cf_requests_exec = None
+try:
+    from curl_cffi import requests as _cf_requests_exec  # noqa: F811
+
+    import hyperliquid.api as _hl_api
+    import hyperliquid.exchange as _hl_exchange
+    import hyperliquid.info as _hl_info
+    _hl_api.requests = _cf_requests_exec
+    _hl_exchange.requests = _cf_requests_exec
+    _hl_info.requests = _cf_requests_exec
+except ImportError:
+    pass
+
 from kimi_quant.config import config
 from kimi_quant.llm import TradingSignal
 
@@ -192,9 +207,10 @@ class TradeExecutor:
             self.info = Info(base_url=base_url, skip_ws=True)
             self.address = account.address
             logger.info(
-                "TradeExecutor initialized (address=%s, testnet=%s)",
+                "TradeExecutor initialized (address=%s, testnet=%s, curl_cffi=%s)",
                 self.address,
                 config.hl_testnet,
+                _cf_requests_exec is not None,
             )
 
             # Recover state from chain

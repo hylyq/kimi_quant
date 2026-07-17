@@ -16,6 +16,12 @@ from typing import Any
 
 from hyperliquid.info import Info
 
+# Import curl_cffi if available (bypasses TLS fingerprint blocking on some servers)
+try:
+    from curl_cffi import requests as _cf_requests
+except ImportError:
+    _cf_requests = None
+
 from kimi_quant.config import config
 
 logger = logging.getLogger(__name__)
@@ -249,11 +255,18 @@ class DataProvider:
             self.base_url = config.hl_base_url
             self.use_testnet = False
 
+        # Patch Hyperliquid SDK to use curl_cffi (Chrome TLS fingerprint).
+        # Must happen BEFORE Info() is constructed because __init__ calls API.
+        if _cf_requests is not None:
+            import hyperliquid.api as _hl_api
+            import hyperliquid.info as _hl_info
+            _hl_api.requests = _cf_requests
+            _hl_info.requests = _cf_requests
+
         self._info_local = Info(base_url=self.base_url, skip_ws=True)
         self.coin = config.trading_pair
 
         # Mainnet for candle data (testnet candles are empty).
-        # If unreachable (e.g. GFW), fall back to local API.
         try:
             self._info_mainnet = Info(
                 base_url="https://api.hyperliquid.xyz", skip_ws=True
@@ -268,9 +281,10 @@ class DataProvider:
         self._candle_cache: dict[str, tuple[float, list[dict]]] = {}
 
         logger.info(
-            "DataProvider initialized (testnet=%s, coin=%s)",
+            "DataProvider initialized (testnet=%s, coin=%s, curl_cffi=%s)",
             config.hl_testnet,
             self.coin,
+            _cf_requests is not None,
         )
 
     # ─── Market Snapshot ─────────────────────────────────────────────────
