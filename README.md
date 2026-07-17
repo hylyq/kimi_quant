@@ -180,20 +180,30 @@ Sleeping 900.0s until next cycle...
 
 ## 消息推送（微信 / 飞书）
 
-通过 larky 的 Redis Pub/Sub 架构，kimi_quant 只需往 Redis 发消息，larky 的 WeChatService 负责投递到微信。无需管理 Bot 生命周期。
+通过 larky 的 `WeChatClient.notify()` 将消息发布到 Redis Pub/Sub，由 larky 的 `WeChatService`（独立进程 `python -m larky`）投递到微信。多程序共享同一套基础设施，无需各自管理 Bot 登录。
 
 ### 架构
 
 ```
-kimi_quant ──Redis Pub──▶ WeChatService (larky) ──▶ 微信
-   (本程序)    wechat:outgoing    (独立进程，已运行)
+kimi_quant ──WeChatClient──▶
+                            │
+cryptoguard ──WeChatClient──▶── wechat:outgoing ──▶ WeChatService ──▶ 微信
+                            │     (Redis Pub/Sub)     (larky 独立进程)
+其他程序   ──WeChatClient──▶
 ```
+
+### 依赖
+
+- `larky`（可编辑安装，已在 `pyproject.toml` 中）
+- `redis`（larky 的传递依赖，已显式声明确保安装）
+- `WeChatService` 独立运行（`python -m larky`），各程序共享
 
 ### 推送事件
 
 | 事件 | 消息 |
 |------|------|
 | 🚀 启动 | 模式、模型、间隔 |
+| ❌ 启动失败 | 错误详情 |
 | 📈 开仓 | 方向、仓位、入场价、SL/TP、置信度 |
 | 🟢/🔴 平仓 | 盈亏金额、百分比、平仓原因 |
 | 🛡️ 风控拒绝 | 拒绝原因（置信度不足/熔断/止损太近等） |
@@ -204,9 +214,15 @@ kimi_quant ──Redis Pub──▶ WeChatService (larky) ──▶ 微信
 ### 自动检测
 
 ```
-Redis 连通    → 微信推送（通过 larky WeChatService）
-有飞书 APP_ID → 飞书推送
+larky 可导入 → WeChatClient 发送（需 WeChatService 运行中）
+有飞书 APP_ID → 飞书推送（降级方案）
 都没有        → 静默运行
+
+Redis 配置（可选，默认 localhost:6379）：
+  REDIS_HOST=localhost
+  REDIS_PORT=6379
+  REDIS_DB=0
+```
 ```
 
 程序启动时自动 ping Redis，连通即走微信通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
@@ -857,7 +873,15 @@ Layer 2 (休眠):  sleep 中断 → 记日志，下轮继续
 
 ### Q: 怎么收到交易通知？
 
-如果服务器上已运行 larky（飞书机器人），程序自动检测并推送开仓/平仓/熔断等事件到飞书。本地开发或无 larky 时自动静默。详见 [消息推送](#消息推送飞书)。
+前提条件：
+1. 服务器上运行着 `python -m larky`（WeChatService，独立进程）
+2. `redis` 包已安装（`uv sync` 自动处理）
+
+满足条件后程序自动通过 `WeChatClient.notify()` 推送。无需额外配置。启动日志会显示：
+```
+Notification: larky WeChatClient available (WeChat via Redis)
+```
+如果 Redis 不在 `localhost:6379`，设置 `REDIS_HOST` / `REDIS_PORT` 环境变量。
 
 ### Q: 程序怎么自动运行？需要 cron 吗？
 
