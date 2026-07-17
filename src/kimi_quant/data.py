@@ -19,6 +19,15 @@ from hyperliquid.info import Info
 # Import curl_cffi if available (bypasses TLS fingerprint blocking on some servers)
 try:
     from curl_cffi import requests as _cf_requests
+
+    # Override Session() to always impersonate Chrome's TLS fingerprint.
+    # The SDK calls requests.Session() with no args — we inject impersonation.
+    _OriginalSession = _cf_requests.Session
+
+    def _make_session(**kw):
+        return _OriginalSession(impersonate="chrome120", timeout=30, **kw)
+
+    _cf_requests.Session = _make_session  # type: ignore[assignment]
 except ImportError:
     _cf_requests = None
 
