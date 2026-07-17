@@ -51,6 +51,42 @@ class TradingSignal(BaseModel):
     )
 
 
+def build_market_prompt(market_data: dict[str, Any]) -> str:
+    """Build a structured prompt from market data (shared by single & debate modes)."""
+    from kimi_quant.config import config as _config
+
+    market = market_data.get("market")
+    order_book = market_data.get("order_book")
+    account = market_data.get("account")
+
+    prompt_parts = ["# Market Data Snapshot\n"]
+
+    if market:
+        prompt_parts.append(market.to_summary())
+    else:
+        prompt_parts.append("Market data unavailable.")
+
+    prompt_parts.append("\n# Order Book Depth\n")
+    if order_book:
+        prompt_parts.append(order_book.to_summary(levels=5))
+    else:
+        prompt_parts.append("Order book data unavailable.")
+
+    prompt_parts.append("\n# Account Status\n")
+    if account:
+        prompt_parts.append(account.to_summary())
+    else:
+        prompt_parts.append("Dry-run mode — no real position.")
+
+    prompt_parts.append(
+        f"\n# Instructions\n"
+        f"Max position size: {_config.max_position_size} BTC.\n"
+        f"Analyze the data above and produce a trading signal.\n"
+    )
+
+    return "\n".join(prompt_parts)
+
+
 class KimiLLM:
     """LangChain wrapper for Kimi K3 via Moonshot API."""
 
@@ -107,36 +143,7 @@ No additional text outside the JSON."""
 
     def build_prompt(self, market_data: dict[str, Any]) -> str:
         """Build a structured prompt from market data."""
-        market = market_data.get("market")
-        order_book = market_data.get("order_book")
-        account = market_data.get("account")
-
-        prompt_parts = ["# Market Data Snapshot\n"]
-
-        if market:
-            prompt_parts.append(market.to_summary())
-        else:
-            prompt_parts.append("Market data unavailable.")
-
-        prompt_parts.append("\n# Order Book Depth\n")
-        if order_book:
-            prompt_parts.append(order_book.to_summary(levels=5))
-        else:
-            prompt_parts.append("Order book data unavailable.")
-
-        prompt_parts.append("\n# Account Status\n")
-        if account:
-            prompt_parts.append(account.to_summary())
-        else:
-            prompt_parts.append("Dry-run mode — no real position.")
-
-        prompt_parts.append(
-            f"\n# Instructions\n"
-            f"Max position size: {config.max_position_size} BTC.\n"
-            f"Analyze the data above and produce a trading signal.\n"
-        )
-
-        return "\n".join(prompt_parts)
+        return build_market_prompt(market_data)
 
     def analyze(self, market_data: dict[str, Any]) -> TradingSignal | None:
         """Analyze market data and return a trading signal.

@@ -65,6 +65,9 @@ class Config:
     )
 
     # --- Strategy ---
+    strategy_mode: str = field(
+        default_factory=lambda: os.getenv("STRATEGY_MODE", "single")
+    )  # "single" | "debate"
     trading_interval_seconds: int = field(
         default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "300"))
     )

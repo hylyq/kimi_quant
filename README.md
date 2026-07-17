@@ -2,12 +2,28 @@
 
 **BTC 永续合约量化交易程序** — 基于 Kimi K3 大模型的智能交易决策系统。
 
+## 策略模式
+
+### Single-Agent (单 Agent 模式)
+```
+市场数据 → Kimi K3 分析 → TradingSignal → 风控 → 执行
+```
+快速，1 次 LLM 调用。适合高频轮询。
+
+### Multi-Agent Debate (多 Agent 辩论模式)
+```
+              ┌── 🐂 Bull Agent (论证做多) ──┐
+市场数据 ───┼── 🐻 Bear Agent (论证做空) ──┼── ⚖️ Judge ──→ TradingSignal ──→ 风控 ──→ 执行
+              └── 😐 Hold Agent (论证观望) ──┘
+```
+4 次 LLM 调用（3 debate + 1 judge）。通过对抗辩论减少单一模型偏见，决策更稳健。
+
 ## 架构概览
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  DataProvider │───▶│   KimiLLM    │───▶│  RiskManager │───▶│TradeExecutor │
-│  (Hyperliquid)│    │  (Kimi K3)   │    │  (风控校验)   │    │  (下单执行)   │
+│  DataProvider │───▶│   策略引擎    │───▶│  RiskManager │───▶│TradeExecutor │
+│  (Hyperliquid)│    │ single/debate│    │  (风控校验)   │    │  (下单执行)   │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
       ▲                                                          │
       │                    交易循环 (每 N 秒)                      │
@@ -17,7 +33,7 @@
 ### 数据流
 
 1. **DataProvider** — 从 Hyperliquid 获取 BTC 市场快照（价格、订单簿、资金费率、持仓）
-2. **KimiLLM** — 将市场数据构建为结构化 Prompt，发送给 Kimi K3 获取交易信号
+2. **策略引擎** — Single：Kimi K3 单次分析；Debate：三 Agent 辩论 + 裁判裁决
 3. **RiskManager** — 校验信号：置信度阈值、仓位限制、方向检查、止损要求
 4. **TradeExecutor** — 执行交易（市价/限价单），同时下止损单
 
@@ -26,7 +42,8 @@
 | 组件 | 技术 |
 |------|------|
 | 大模型 | Kimi K3 (Moonshot API, OpenAI 兼容) |
-| LLM 框架 | LangChain + langchain-openai |
+| LLM 框架 | LangChain + LangGraph |
+| Multi-Agent | LangGraph StateGraph orchestration |
 | 交易所 | Hyperliquid (Perpetual DEX) |
 | 数据验证 | Pydantic 结构化输出 |
 | 交易执行 | hyperliquid-python-sdk |
@@ -62,6 +79,9 @@ cp .env.example .env
 # 必填：Kimi API Key
 MOONSHOT_API_KEY=sk-your-key-here
 
+# 策略模式：single（单Agent）或 debate（多Agent辩论）
+STRATEGY_MODE=single
+
 # 可选：Hyperliquid 私钥（仅实盘需要）
 HYPERLIQUID_PRIVATE_KEY=your_private_key_hex
 
@@ -79,15 +99,42 @@ TRADING_INTERVAL=300      # 交易间隔 (秒)
 ### 运行
 
 ```bash
-# 单次分析（测试用，不执行交易）
+# 单次分析 — single 模式
 uv run kimi-quant --once
+
+# 单次分析 — debate 模式（3 Agent 辩论）
+uv run kimi-quant --once --mode debate
 
 # 启动交易循环
 uv run kimi-quant
 
-# 自定义间隔（60秒）
-uv run kimi-quant --interval 60
+# 以 debate 模式启动交易循环
+uv run kimi-quant --mode debate --interval 300
 ```
+
+## Debate 模式详解
+
+### Agent 分工
+
+| Agent | 角色 | 职责 |
+|-------|------|------|
+| 🐂 Bull | 激进多头分析师 | 寻找做多证据：支撑位、bid wall、负资金费率 |
+| 🐻 Bear | 怀疑派空头分析师 | 寻找做空证据：阻力位、ask wall、正资金费率 |
+| 😐 Hold | 谨慎风控官 | 寻找观望理由：信号矛盾、波动过大、无明确方向 |
+| ⚖️ Judge | 首席交易官 | 权衡三方论据，做出最终决策，输出 TradingSignal |
+
+### 决策流程
+
+1. 三个 Debater **并行**接收同一份市场数据（通过 `asyncio.gather`）
+2. 每个 Debater 从自身角色出发提供 150-250 字的论证
+3. Judge 收到三方论据 + 原始市场数据，综合裁决
+4. Judge 输出结构化 TradingSignal（含置信度、仓位、止损止盈）
+
+### 为什么 Debate 更稳健？
+
+- **减少单一偏见**：单个模型容易被某个信号误导，三方辩论暴露多空分歧
+- **对抗验证**：Bear 和 Bull 互相平衡，Hold 防止 FOMO
+- **可追溯**：每次决策可回溯三方原始论据，便于事后复盘
 
 ## LLM 输出格式
 
@@ -106,16 +153,6 @@ Kimi K3 的响应通过 LangChain 结构化输出解析为：
 }
 ```
 
-## 策略逻辑
-
-LLM 系统提示词要求分析以下维度：
-
-1. **趋势分析** — 短期动量方向
-2. **订单簿分析** — 买卖墙位置、盘口失衡度
-3. **资金费率** — 多头/空头拥挤信号
-4. **升贴水** — 标记价格 vs 预言机价格偏离
-5. **风险意识** — 不确定时优先 HOLD
-
 ## 风控规则
 
 | 检查项 | 规则 |
@@ -129,11 +166,12 @@ LLM 系统提示词要求分析以下维度：
 
 ```
 kimi_quant/
-├── kimi_quant/
+├── src/kimi_quant/
 │   ├── __init__.py
 │   ├── config.py      # 配置管理
 │   ├── data.py        # 市场数据 (Hyperliquid)
-│   ├── llm.py         # Kimi K3 集成 (LangChain)
+│   ├── llm.py         # 单 Agent 策略 + 共享工具
+│   ├── debate.py      # Multi-Agent 辩论策略 (LangGraph)
 │   ├── risk.py        # 风控管理
 │   ├── executor.py    # 交易执行
 │   └── main.py        # 主程序入口

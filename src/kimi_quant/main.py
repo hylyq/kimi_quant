@@ -2,6 +2,10 @@
 
 Orchestrates the trading loop: fetch data → analyze with LLM → validate risk →
 execute trades → log results.
+
+Supports two strategy modes:
+- "single": single-agent analysis (KimiLLM)
+- "debate": multi-agent debate (Bull vs Bear vs Hold → Judge)
 """
 
 import argparse
@@ -10,6 +14,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from kimi_quant.config import config
 from kimi_quant.data import DataProvider
@@ -40,18 +45,18 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 
-def run_once(
+# ─── Single-Agent Strategy ──────────────────────────────────────────────────
+
+
+def run_once_single(
     llm: KimiLLM,
     data: DataProvider,
     risk: RiskManager,
     executor: TradeExecutor,
 ) -> dict:
-    """Run a single analysis-execution cycle.
-
-    Returns a dict summarizing what happened.
-    """
+    """Single-agent analysis → risk check → execute."""
     logger.info("=" * 50)
-    logger.info("Starting trading cycle")
+    logger.info("Starting trading cycle [mode: single-agent]")
 
     # 1. Fetch market data
     logger.info("Fetching market data...")
@@ -69,14 +74,86 @@ def run_once(
         )
 
     # 2. Get LLM analysis
-    logger.info("Requesting LLM analysis...")
+    logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
 
     if signal_result is None:
         logger.warning("LLM returned no signal, skipping cycle")
         return {"status": "skipped", "reason": "LLM returned None"}
 
-    # 3. Risk validation
+    # 3-4. Validate & execute
+    return _validate_and_execute(signal_result, report, risk, executor)
+
+
+# ─── Multi-Agent Debate Strategy ────────────────────────────────────────────
+
+
+def run_once_debate(
+    data: DataProvider,
+    risk: RiskManager,
+    executor: TradeExecutor,
+) -> dict:
+    """Multi-agent debate → risk check → execute."""
+    from kimi_quant.debate import DebateStrategy
+
+    logger.info("=" * 50)
+    logger.info("Starting trading cycle [mode: multi-agent debate]")
+
+    # 1. Fetch market data
+    logger.info("Fetching market data...")
+    report = data.get_full_report(address=executor.address)
+
+    market = report.get("market")
+    if market:
+        logger.info(
+            "BTC mid=%.1f | spread=%.1f(%.4f%%) | funding=%.4f%% | 24h=%.2f%%",
+            market.mid_price,
+            market.spread,
+            market.spread_pct,
+            market.funding_rate * 100,
+            market.day_change_pct,
+        )
+
+    # 2. Run debate
+    logger.info("Launching multi-agent debate...")
+    strategy = DebateStrategy()
+    signal_result, transcript = strategy.analyze_sync(report)
+
+    if signal_result is None:
+        logger.warning("Debate produced no signal, skipping cycle")
+        return {
+            "status": "skipped",
+            "reason": "Debate returned no signal",
+            "transcript": transcript,
+        }
+
+    # Log the debate summary
+    logger.info("Debate transcript (Bull): %s", transcript["bull"][:120])
+    logger.info("Debate transcript (Bear): %s", transcript["bear"][:120])
+    logger.info("Debate transcript (Hold): %s", transcript["hold"][:120])
+
+    # 3-4. Validate & execute
+    result = _validate_and_execute(signal_result, report, risk, executor)
+    result["transcript"] = {
+        "bull": transcript["bull"],
+        "bear": transcript["bear"],
+        "hold": transcript["hold"],
+    }
+    return result
+
+
+# ─── Shared: Validate & Execute ──────────────────────────────────────────────
+
+
+def _validate_and_execute(
+    signal_result: Any,
+    report: dict,
+    risk: RiskManager,
+    executor: TradeExecutor,
+) -> dict:
+    """Risk validation + trade execution — shared by all strategies."""
+
+    # Risk validation
     current_size = 0.0
     current_side = "none"
     account = report.get("account")
@@ -94,7 +171,7 @@ def run_once(
             "reason": risk_check.reason,
         }
 
-    # 4. Execute trade
+    # Execute trade
     result = executor.execute(signal_result)
     logger.info("Execution result: %s", result)
 
@@ -107,24 +184,29 @@ def run_once(
     }
 
 
+# ─── Main Loop ───────────────────────────────────────────────────────────────
+
+
 def run_loop():
     """Main trading loop — runs at configured intervals."""
+    mode = config.strategy_mode
     logger.info("=" * 50)
     logger.info("Kimi Quant — BTC Perpetual Contract Trading")
-    logger.info("Model: %s | Interval: %ds | Dry Run: %s",
-                config.kimi_model,
-                config.trading_interval_seconds,
-                config.dry_run)
+    logger.info("Model: %s | Mode: %s | Interval: %ds | Dry Run: %s",
+                config.kimi_model, mode,
+                config.trading_interval_seconds, config.dry_run)
     logger.info("=" * 50)
 
     # Validate configuration
     config.validate()
 
     # Initialize components
-    llm = KimiLLM()
     data = DataProvider()
     risk = RiskManager()
     executor = TradeExecutor()
+
+    # Single-agent mode needs the LLM instance
+    llm = KimiLLM() if mode == "single" else None
 
     cycle_count = 0
     signals_history: list[dict] = []
@@ -134,9 +216,15 @@ def run_loop():
         start_time = time.monotonic()
 
         try:
-            result = run_once(llm, data, risk, executor)
+            if mode == "debate":
+                result = run_once_debate(data, risk, executor)
+            else:
+                assert llm is not None
+                result = run_once_single(llm, data, risk, executor)
+
             result["cycle"] = cycle_count
             result["timestamp"] = datetime.now(timezone.utc).isoformat()
+            result["mode"] = mode
             signals_history.append(result)
 
             # Log summary
@@ -144,8 +232,8 @@ def run_loop():
             sig = result.get("signal", "N/A")
             conf = result.get("confidence", 0)
             logger.info(
-                "Cycle %d complete: status=%s signal=%s confidence=%.2f",
-                cycle_count, status, sig, conf,
+                "Cycle %d complete: mode=%s status=%s signal=%s confidence=%.2f",
+                cycle_count, mode, status, sig, conf,
             )
 
         except Exception as e:
@@ -163,7 +251,6 @@ def run_loop():
             logger.info(
                 "Sleeping %.1fs until next cycle...", sleep_time
             )
-            # Sleep in short intervals to respond to shutdown promptly
             while sleep_time > 0 and not _shutdown_requested:
                 time.sleep(min(1, sleep_time))
                 sleep_time -= 1
@@ -188,21 +275,31 @@ def main():
         default=None,
         help="Trading interval in seconds (overrides env/config)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["single", "debate"],
+        default=None,
+        help="Strategy mode: single-agent or multi-agent debate",
+    )
     args = parser.parse_args()
 
     if args.interval:
         config.trading_interval_seconds = args.interval
+    if args.mode:
+        config.strategy_mode = args.mode
 
     if args.once:
-        # Single-shot mode
         config.validate()
-        llm = KimiLLM()
         data = DataProvider()
         risk = RiskManager()
         executor = TradeExecutor()
-        result = run_once(llm, data, risk, executor)
 
-        # Pretty-print result
+        if config.strategy_mode == "debate":
+            result = run_once_debate(data, risk, executor)
+        else:
+            llm = KimiLLM()
+            result = run_once_single(llm, data, risk, executor)
+
         import json as _json
         print(_json.dumps(result, indent=2, default=str))
     else:
