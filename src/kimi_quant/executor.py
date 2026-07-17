@@ -291,6 +291,25 @@ class TradeExecutor:
             logger.error("Failed to cancel cloid=%s: %s", cloid, e)
             return {"action": "cancel", "executed": False, "error": str(e)}
 
+    def cancel_by_cloids(self, cloids: list[str]) -> dict:
+        """Cancel multiple orders by their client-assigned IDs (cloïds).
+
+        More reliable than bulk_cancel by oid — cloïds are under your control
+        so there's no risk of cancelling the wrong order.
+        """
+        if self.dry_run:
+            logger.info("DRY RUN: Cancel %d orders by cloid", len(cloids))
+            return {"action": "cancel_bulk", "executed": True, "dry_run": True}
+
+        try:
+            requests = [{"coin": self.coin, "cloid": c} for c in cloids]
+            result = self.exchange.bulk_cancel_by_cloid(requests)
+            logger.info("Cancelled %d orders by cloid", len(cloids))
+            return {"action": "cancel_bulk", "executed": True, "result": result}
+        except Exception as e:
+            logger.error("Failed to cancel by cloids: %s", e)
+            return {"action": "cancel_bulk", "executed": False, "error": str(e)}
+
     def cancel_all_orders(self) -> dict:
         """Cancel ALL open orders for the trading pair.
 
@@ -386,6 +405,45 @@ class TradeExecutor:
             },
             reduce_only=True,
         )
+
+    def modify_orders(self, modifications: list[dict]) -> dict:
+        """Modify multiple orders in a single atomic request.
+
+        Each modification is a dict:
+          {oid: int, order: {coin, is_buy, sz, limit_px, order_type, reduce_only}}
+
+        Useful when you need to simultaneously move both SL and TP,
+        or modify multiple positions at once.
+        """
+        if not modifications:
+            return {"action": "modify_bulk", "executed": False,
+                    "reason": "Empty modification list"}
+
+        if self.dry_run:
+            logger.info("DRY RUN: Modify %d orders", len(modifications))
+            return {"action": "modify_bulk", "executed": True, "dry_run": True}
+
+        try:
+            requests = [
+                {
+                    "oid": m["oid"],
+                    "order": {
+                        "coin": self.coin,
+                        "is_buy": m["order"]["is_buy"],
+                        "sz": m["order"]["sz"],
+                        "limit_px": m["order"]["limit_px"],
+                        "order_type": m["order"]["order_type"],
+                        "reduce_only": m["order"].get("reduce_only", False),
+                    },
+                }
+                for m in modifications
+            ]
+            result = self.exchange.bulk_modify_orders_new(requests)
+            logger.info("Modified %d orders in bulk", len(modifications))
+            return {"action": "modify_bulk", "executed": True, "result": result}
+        except Exception as e:
+            logger.error("Failed to bulk modify orders: %s", e)
+            return {"action": "modify_bulk", "executed": False, "error": str(e)}
 
     def _handle_modify_sl(self, signal: TradingSignal) -> dict:
         """Move stop loss to a new price.
