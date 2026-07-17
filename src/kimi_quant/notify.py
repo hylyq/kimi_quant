@@ -1,8 +1,8 @@
 """Notification via larky's WeChatClient (proven method) or LarkBot (Feishu).
 
-Uses the same WeChatClient.notify() path that cryptoguard uses — raw Redis
-Pub/Sub was theoretically equivalent but didn't work in practice on the
-production server.
+Uses the same WeChatClient.notify() path that cryptoguard uses. A fresh
+WeChatClient is created per-send to avoid cross-thread event-loop issues
+with redis.asyncio connection pools.
 
 Usage:
     from kimi_quant.notify import notify
@@ -19,27 +19,15 @@ logger = logging.getLogger(__name__)
 
 # ─── Detection ────────────────────────────────────────────────────────────
 
-_wechat_client: Any = None  # larky.WeChatClient
 _channel: str | None = None  # "larky" | "lark" | None
-_event_loop: asyncio.AbstractEventLoop | None = None
-_loop_thread: threading.Thread | None = None
 
 # 1) Try larky WeChatClient (same approach as cryptoguard — proven working)
 try:
-    from larky import WeChatClient as _WeChatClient
-
-    _wechat_client = _WeChatClient(
-        source="kimi-quant",
-        redis_host=os.getenv("REDIS_HOST", "localhost"),
-        redis_port=int(os.getenv("REDIS_PORT", "6379")),
-        redis_db=int(os.getenv("REDIS_DB", "0")),
-    )
+    from larky import WeChatClient as _WeChatClient  # noqa: F401
     _channel = "larky"
-    logger.info("Notification: larky WeChatClient initialized (WeChat via Redis)")
+    logger.info("Notification: larky WeChatClient available (WeChat via Redis)")
 except ImportError:
     logger.info("Notification: larky not available")
-except Exception as e:
-    logger.warning("Notification: larky WeChatClient init failed: %s", e)
 
 # 2) Fallback: Feishu via LarkBot
 if _channel is None:
@@ -51,23 +39,6 @@ if _channel is None:
             logger.info("Notification: Feishu detected")
     except ImportError:
         pass
-
-
-# ─── Async Event Loop Thread ──────────────────────────────────────────────
-
-
-def _get_or_create_loop() -> asyncio.AbstractEventLoop:
-    """Get or create a persistent event loop in a daemon thread."""
-    global _event_loop, _loop_thread
-    if _event_loop is None or _event_loop.is_closed():
-        _event_loop = asyncio.new_event_loop()
-        _loop_thread = threading.Thread(
-            target=_event_loop.run_forever,
-            name="notify-loop",
-            daemon=True,
-        )
-        _loop_thread.start()
-    return _event_loop
 
 
 # ─── Feishu Background ────────────────────────────────────────────────────
@@ -130,14 +101,20 @@ class Notifier:
             self._send_lark(text)
 
     def _send_larky(self, text: str, priority: str) -> None:
-        """Send via larky WeChatClient.notify() — same path as cryptoguard."""
+        """Send via larky WeChatClient.notify() — same path as cryptoguard.
+
+        Creates a fresh WeChatClient per send. This avoids cross-thread
+        event-loop issues with redis.asyncio connection pools. The overhead
+        (one new Redis connection per notification) is negligible."""
         try:
-            loop = _get_or_create_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                _wechat_client.notify(text, priority=priority),
-                loop,
+            wc = _WeChatClient(
+                source="kimi-quant",
+                redis_host=os.getenv("REDIS_HOST", "localhost"),
+                redis_port=int(os.getenv("REDIS_PORT", "6379")),
+                redis_db=int(os.getenv("REDIS_DB", "0")),
             )
-            future.result(timeout=5)
+            asyncio.run(wc.notify(text, priority=priority))
+            logger.debug("larky notify sent: %s", text[:60])
         except Exception as e:
             logger.error("larky notify failed: %s", e)
 
