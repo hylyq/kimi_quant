@@ -10,6 +10,7 @@ Provides structured market data for the LLM to analyze:
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -582,12 +583,65 @@ class DataProvider:
     # ─── Full Report ─────────────────────────────────────────────────────
 
     def get_full_report(self, address: str | None = None) -> dict[str, Any]:
-        """Get a complete market report with all components."""
-        snapshot = self.get_market_snapshot()
-        order_book = self.get_order_book_depth()
-        timeframes = self.get_multi_timeframe_analysis()
-        funding_trend = self.get_funding_trend()
-        account = self.get_account_snapshot(address) if address else None
+        """Get a complete market report. Independent HTTP calls run in parallel."""
+        snapshot = None
+        order_book = None
+        timeframes: list[TimeframeSummary] = []
+        funding_trend = None
+        account = None
+
+        # Define fetch tasks — snapshot and order book are fast, candles are slow
+        def _fetch_snapshot():
+            return self.get_market_snapshot()
+
+        def _fetch_order_book():
+            return self.get_order_book_depth()
+
+        def _fetch_timeframes():
+            return self.get_multi_timeframe_analysis()
+
+        def _fetch_funding():
+            return self.get_funding_trend()
+
+        def _fetch_account():
+            return self.get_account_snapshot(address) if address else None
+
+        # Run all 5 independent fetches in parallel (4 thread pool)
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {
+                pool.submit(_fetch_snapshot): "snapshot",
+                pool.submit(_fetch_order_book): "order_book",
+                pool.submit(_fetch_timeframes): "timeframes",
+                pool.submit(_fetch_funding): "funding",
+                pool.submit(_fetch_account): "account",
+            }
+
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    result = future.result(timeout=30)
+                    if key == "snapshot":
+                        snapshot = result
+                    elif key == "order_book":
+                        order_book = result
+                    elif key == "timeframes":
+                        timeframes = result
+                    elif key == "funding":
+                        funding_trend = result
+                    elif key == "account":
+                        account = result
+                except Exception as e:
+                    logger.error("Parallel fetch [%s] failed: %s", key, e)
+
+        # Fallback: if any failed, do sequential fetch
+        if snapshot is None:
+            snapshot = self.get_market_snapshot()
+        if order_book is None:
+            order_book = self.get_order_book_depth()
+        if not timeframes:
+            timeframes = self.get_multi_timeframe_analysis()
+        if funding_trend is None:
+            funding_trend = self.get_funding_trend()
 
         analysis = MarketAnalysis(
             snapshot=snapshot,
@@ -599,7 +653,6 @@ class DataProvider:
 
         return {
             "analysis": analysis,
-            # Backward-compatible keys for existing code
             "market": snapshot,
             "order_book": order_book,
             "account": account,

@@ -162,27 +162,36 @@ Your job is to:
 
 1. **Weigh the Evidence**: Which analyst presented the most data-backed, \
 convincing case? Look for specific data references, not rhetoric.
-2. **Identify the Weakest**: Which arguments are based on thin evidence \
-or wishful thinking?
-3. **Synthesize**: Combine insights from all three. Sometimes the best trade \
-incorporates elements from multiple perspectives.
-4. **Decide**: Make a final call — LONG, SHORT, CLOSE, or HOLD.
+2. **Check Multi-Timeframe Confluence**: The market data includes 5m/15m/1h/4h \
+trends. Higher timeframes (1h, 4h) carry MORE weight than lower ones (5m, 15m). \
+When they align → higher confidence. When they diverge → follow the higher \
+timeframe with tighter risk management, do NOT default to HOLD.
+3. **Identify the Weakest**: Which arguments are based on thin evidence?
+4. **Decide**: Make a final call — LONG, SHORT, CLOSE, HOLD, or MODIFY_SL.
+
+**CRITICAL — Multi-Timeframe Decision Framework:**
+- 1h AND 4h both up + Bull argument strong → LONG, confidence 0.75+
+- 1h AND 4h both down + Bear argument strong → SHORT, confidence 0.75+
+- 4h up but 1h down → Still prefer LONG (higher TF dominates), but reduce \
+size and set tighter stop. Confidence 0.65-0.75.
+- 4h down but 5m/15m up → Still prefer SHORT, smaller size. Confidence 0.65-0.75.
+- ALL timeframes sideways → HOLD is acceptable, but consider if breakout is near.
+- Only default to HOLD when ALL arguments are weak AND no timeframe has a clear trend.
 
 **Decision Guidelines:**
-- If one analyst clearly has the strongest data-backed case → follow them
-- If arguments are evenly matched → HOLD (uncertainty is a signal)
-- If both Bull and Bear make weak cases → HOLD
-- Be decisive when the evidence is clear, conservative when it's not
-- Confidence 0.7+ only when the evidence is compelling
+- Higher timeframe trend is your anchor — don't fight it
+- Divergence = smaller size + tighter stop, NOT automatic HOLD
+- HOLD is for genuine uncertainty, not for avoiding decisions
+- Be decisive when evidence is clear, adaptive when it's mixed
+- Confidence below 0.65 → skip the trade
 
 Output a JSON trading signal matching the TradingSignal schema:
 - action: "LONG" | "SHORT" | "CLOSE" | "HOLD" | "MODIFY_SL"
-  (MODIFY_SL = move stop loss to breakeven or trail price)
 - confidence: 0.0-1.0
 - reasoning: your synthesis of the debate
 - size: position size in BTC (null for CLOSE/HOLD/MODIFY_SL)
 - entry_price: suggested entry (null = market order)
-- stop_loss: mandatory for directional trades
+- stop_loss: mandatory for directional trades (min 0.5% distance)
 - take_profit: realistic target
 - modify_sl_to: new stop loss price (only for MODIFY_SL action)
 - key_factors: 2-4 factors that drove the decision
@@ -342,11 +351,13 @@ class DebateStrategy:
     # Config key passed to graph.ainvoke to identify the trading session
     THREAD_ID = "btc-perpetual-trading"
 
-    def __init__(self, checkpointer_handle: "CheckpointerHandle | None" = None):
+    def __init__(self, checkpointer_handle: "CheckpointerHandle | None" = None,
+                 debate_timeout: int = 45):
         self.bull = SingleTurnAgent("Bull", BULL_SYSTEM_PROMPT)
         self.bear = SingleTurnAgent("Bear", BEAR_SYSTEM_PROMPT)
         self.hold = SingleTurnAgent("Hold", HOLD_SYSTEM_PROMPT)
         self.judge = JudgeAgent()
+        self.debate_timeout = debate_timeout  # seconds per agent
 
         if checkpointer_handle is None:
             checkpointer_handle = create_checkpointer()
@@ -354,7 +365,8 @@ class DebateStrategy:
         self._checkpointer_handle = checkpointer_handle
         self.checkpointer = checkpointer_handle.saver
         self.graph = self._build_graph()
-        logger.info("DebateStrategy initialized with 4 agents + checkpointer")
+        logger.info("DebateStrategy initialized: 4 agents, timeout=%ds",
+                     debate_timeout)
 
     def close(self) -> None:
         """Release checkpointer resources."""
@@ -377,21 +389,34 @@ class DebateStrategy:
         return builder.compile(checkpointer=self.checkpointer)
 
     async def _debate_node(self, state: DebateState) -> DebateState:
-        """Run all three debaters in parallel."""
+        """Run all three debaters in parallel with timeout."""
         prompt = state["market_prompt"]
-        logger.info("Debate [%s]: launching 3 agents in parallel...",
-                     state.get("cycle_id", "?"))
+        cycle_id = state.get("cycle_id", "?")
+        logger.info("Debate [%s]: launching 3 agents (timeout=%ds)...",
+                     cycle_id, self.debate_timeout)
         start = datetime.now(timezone.utc)
 
+        async def _run_with_timeout(agent, name: str) -> str:
+            try:
+                return await asyncio.wait_for(
+                    agent.arun(prompt), timeout=self.debate_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Agent %s timed out after %ds", name, self.debate_timeout)
+                return (
+                    f"[{name} TIMEOUT after {self.debate_timeout}s — "
+                    f"could not complete analysis in time. "
+                    f"Proceed with available arguments from other agents.]"
+                )
+
         bull_arg, bear_arg, hold_arg = await asyncio.gather(
-            self.bull.arun(prompt),
-            self.bear.arun(prompt),
-            self.hold.arun(prompt),
+            _run_with_timeout(self.bull, "Bull"),
+            _run_with_timeout(self.bear, "Bear"),
+            _run_with_timeout(self.hold, "Hold"),
         )
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        logger.info("Debate [%s] complete in %.1fs",
-                     state.get("cycle_id", "?"), elapsed)
+        logger.info("Debate [%s] complete in %.1fs", cycle_id, elapsed)
 
         return {
             **state,

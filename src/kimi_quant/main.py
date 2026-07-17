@@ -158,28 +158,64 @@ def _validate_and_execute(
 ) -> dict:
     """Risk validation + trade execution — shared by all strategies."""
 
-    # Sync tracker with on-chain state:
-    # If on-chain shows no position but tracker thinks we have one,
-    # the position was closed (SL/TP filled or manual close) → record trade.
     account = report.get("account")
+    market = report.get("market")
+    mid_price = market.mid_price if market else 0.0
+
+    # ── Phase 1: Sync chain state ──
     current_size = 0.0
     current_side = "none"
+    chain_entry = 0.0
+    account_balance = None
+
     if account:
         current_size = account.position_size
         current_side = account.position_side
-        if current_side == "none" and executor.tracker.has_position():
-            logger.warning(
-                "Tracker has position but on-chain shows none — "
-                "SL/TP likely filled. Recording trade close."
-            )
+        chain_entry = account.entry_price
+        account_balance = account.balance
+
+    # Use the smart sync: handles resting→active, active→gone, recovery
+    executor.sync_with_chain(current_side, current_size, chain_entry)
+
+    # If sync detected a close event, record it
+    was_active = executor.tracker.has_position() is False and (
+        current_side != "none"  # was active before sync cleared it
+    )
+    if not executor.tracker.has_position() and not executor.tracker.has_resting_order():
+        # Check if trade_logger has a pending trade that was just closed by SL/TP
+        if trade_logger.has_pending and current_side == "none":
             _record_close_from_chain(executor, trade_logger, report)
-            executor.tracker.clear()
+            # Circuit breaker: record loss
+            pending_trade = trade_logger._pending  # already moved to _closed
+            # Actually, close_from_chain already calls close_trade, so check the
+            # last closed trade from stats
+            stats = trade_logger.get_stats()
+            if stats.total_trades > 0:
+                last_trades = trade_logger.get_all_trades()
+                if last_trades:
+                    last = last_trades[-1]
+                    if last.is_win:
+                        risk.record_win(last.net_pnl)
+                    else:
+                        risk.record_loss(last.net_pnl)
 
     logger.info("Position: %s", executor.tracker.to_summary())
 
-    risk_check = risk.validate(signal_result, current_size, current_side)
+    # Set initial balance for drawdown tracking on first cycle
+    if risk.initial_balance is None and account_balance and account_balance > 0:
+        risk.initial_balance = account_balance
+        logger.info("Initial balance set: $%.2f", account_balance)
+
+    # Tick circuit breaker cooldown
+    risk.tick_cooldown()
+
+    # ── Phase 2: Risk validation ──
+    risk_check = risk.validate(
+        signal_result, current_size, current_side,
+        mid_price=mid_price, account_balance=account_balance,
+    )
     if not risk_check.passed:
-        logger.warning("Risk check failed, skipping execution")
+        logger.warning("Risk check failed: %s", risk_check.reason)
         return {
             "status": "rejected",
             "signal": signal_result.action,
@@ -187,31 +223,35 @@ def _validate_and_execute(
             "reason": risk_check.reason,
         }
 
-    # Pre-execution: record trade open intent
+    # ── Phase 3: Record trade open intent ──
     if signal_result.action in ("LONG", "SHORT") and not executor.dry_run:
         trade_logger.open_trade(
             side="long" if signal_result.action == "LONG" else "short",
             size=signal_result.size or config.max_position_size,
-            entry_price=signal_result.entry_price or 0,
+            entry_price=signal_result.entry_price or mid_price,
         )
 
+    # ── Phase 4: Execute ──
     result = executor.execute(signal_result)
     logger.info("Execution result: %s | Position: %s",
                 result, executor.tracker.to_summary())
 
-    # Post-execution: record trade close
+    # ── Phase 5: Post-execution recording ──
     if signal_result.action == "CLOSE" and result.get("executed"):
         exit_price = _get_exit_price(report)
-        trade_logger.close_trade(exit_price, reason="signal")
+        trade = trade_logger.close_trade(exit_price, reason="signal")
+        if trade:
+            if trade.is_win:
+                risk.record_win(trade.net_pnl)
+            else:
+                risk.record_loss(trade.net_pnl)
 
-    # If position was opened but entry price unknown (market order),
-    # update from the chain data
+    # If position was opened with market order, update entry from chain
     if signal_result.action in ("LONG", "SHORT") and result.get("executed"):
         if account and account.entry_price > 0:
             pending = trade_logger._pending
             if pending and pending.entry_price == 0:
                 pending.entry_price = account.entry_price
-                logger.info("Updated trade entry price from chain: $%.1f", account.entry_price)
 
     return {
         "status": "executed" if result.get("executed") else "failed",
@@ -237,7 +277,7 @@ def _record_close_from_chain(
     market = report.get("market")
     exit_price = market.mid_price if market else 0.0
 
-    # Try to determine if it was SL or TP based on price vs entry
+    # Determine reason from tracker state (before clear happened)
     entry = executor.tracker.entry_price
     side = executor.tracker.side
     if entry > 0 and exit_price > 0:
@@ -271,6 +311,9 @@ def run_loop():
     executor = TradeExecutor()
     trade_logger = TradeLogger()
 
+    # Set initial balance for drawdown tracking (first report will have account)
+    # We'll set it on the first cycle when account data is available
+
     # Log startup stats
     stats = trade_logger.get_stats()
     if stats.total_trades > 0:
@@ -278,6 +321,19 @@ def run_loop():
             "Loaded trade history: %d trades | Win Rate: %.1f%% | Net P&L: $%.2f",
             stats.total_trades, stats.win_rate, stats.net_pnl,
         )
+        # Seed circuit breaker from history
+        recent = trade_logger.get_all_trades()[-10:]
+        consecutive = 0
+        for t in reversed(recent):
+            if not t.is_win:
+                consecutive += 1
+            else:
+                break
+        risk.consecutive_losses = consecutive
+        risk.total_realized_pnl = stats.net_pnl
+        if consecutive > 0:
+            logger.info("Seeded circuit breaker: %d consecutive losses from history",
+                        consecutive)
 
     # Debate mode: create strategy ONCE with persistent checkpointer
     strategy = None

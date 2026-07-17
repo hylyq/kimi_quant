@@ -32,10 +32,10 @@
 
 ### 数据流
 
-1. **DataProvider** — 从 Hyperliquid 获取 BTC 市场快照（价格、订单簿、资金费率、持仓）
-2. **策略引擎** — Single：Kimi K3 单次分析；Debate：三 Agent 辩论 + 裁判裁决（LangGraph）
-3. **RiskManager** — 四层风控校验（置信度、仓位、方向、止损）
-4. **TradeExecutor** — 执行交易并管理完整订单生命周期
+1. **DataProvider** — 并行获取多周期 K 线（5m/15m/1h/4h）+ 订单簿 + 资金费率趋势
+2. **策略引擎** — Single：Kimi K3 单次分析；Debate：三 Agent 辩论 + 裁判裁决（LangGraph，45s 超时）
+3. **RiskManager** — 六层风控校验（熔断、置信度、仓位、止损距离、方向、降级）
+4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + 完整订单管理
 
 ### 技术栈
 
@@ -179,10 +179,17 @@ Hyperliquid Python SDK 的 **15 个交易相关方法全部封装**：
 
 ### 决策流程
 
-1. 三个 Debater **并行**接收同一份市场数据（`asyncio.gather`）
+1. 三个 Debater **并行**接收同一份市场数据（`asyncio.gather`，45s 超时保护）
 2. 每个 Debater 从自身角色出发提供 150-250 字论证
-3. Judge 收到三方论据 + 原始市场数据，综合裁决
+3. Judge **综合多周期趋势**裁决（1h/4h 趋势权重 > 5m/15m，分歧时不默认 HOLD）
 4. Judge 输出结构化 TradingSignal → 风控 → 执行
+
+### 启动恢复
+
+TradeExecutor 启动时自动查询链上状态：
+- 恢复已有持仓（`user_state` → positions）
+- 恢复挂单 ID（`open_orders` → SL/TP oid）
+- 崩溃重启后可立即管理现有仓位（平仓、移止损）
 
 ### LangGraph Checkpointing
 
@@ -204,13 +211,27 @@ DebateState (每个 cycle 自动保存):
 
 ## 风控规则
 
-| 检查项 | 规则 |
-|--------|------|
-| 置信度 | >= `MIN_CONFIDENCE` (默认 0.7) 才执行 |
-| 仓位上限 | 不超过 `MAX_POSITION_SIZE` |
-| 重复交易 | 已有同向仓位时拒绝 |
-| 止损 | 方向性交易必须有止损价格 |
-| MODIFY_SL | 需要已持仓 + 新止损价 |
+### 多层校验
+
+| 层级 | 检查项 | 规则 |
+|------|--------|------|
+| 1 | 熔断机制 | 连续 4 笔亏损 → 暂停 6 个 cycle；日回撤 > 5% 冻结 |
+| 2 | 置信度 | >= `MIN_CONFIDENCE` (默认 0.7) 才执行 |
+| 3 | 仓位上限 | 不超过 `MAX_POSITION_SIZE` + 动态风险敞口检查（单笔风险 ≤ 1% 账户） |
+| 4 | 止损距离 | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝） |
+| 5 | 方向 | 已有同向仓位拒绝 / MODIFY_SL 需已持仓 |
+| 6 | 熔断退出 | CLOSE 和 MODIFY_SL 始终允许（降风险操作） |
+
+### 仓位状态追踪
+
+```
+PositionTracker 三态模型:
+  none ──(下单)──▶ resting ──(链上确认)──▶ active
+                      │                        │
+                      │ (超时 3 cycle)          │ (SL/TP 触发)
+                      ▼                        ▼
+                   cancel_resting()           clear()
+```
 
 ## 项目结构
 
