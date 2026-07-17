@@ -72,7 +72,7 @@ class Config:
         default_factory=lambda: float(os.getenv("JUDGE_TEMPERATURE", "0.05"))
     )
     trading_interval_seconds: int = field(
-        default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "300"))
+        default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "600"))
     )
     dry_run: bool = field(
         default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true"

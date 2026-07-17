@@ -606,6 +606,28 @@ kimi_quant/
 
 ## 常见问题
 
+### Q: API 费用多少钱？
+
+Kimi K3 定价（[官网](https://platform.moonshot.cn)）：输入 ¥20/1M tokens，输出 ¥100/1M tokens。
+
+| 模式 | 每周期 | 每天 (5min) | 每月 |
+|------|--------|-------------|------|
+| Single | ~¥0.08 | ~¥22 | ~¥660 |
+| Debate | ~¥0.17 | ~¥50 | ~¥1,500 |
+
+**成本大头是输出**：¥100/1M output vs ¥20/1M input。Debate 72% 费用来自输出（4 次 LLM 各自生成论证/裁决）。
+
+**省钱策略**：
+
+| 策略 | 效果 |
+|------|------|
+| 加大间隔 `TRADING_INTERVAL=600` | 日成本减半 |
+| 默认用 Single 模式 | 费用是 Debate 的 1/4 |
+| `TRADING_INTERVAL=900` + Single | 月成本 ~¥220 |
+| Debate 仅在市场高波动/信号矛盾时手动触发 | 按需付费 |
+
+推荐起步配置：`STRATEGY_MODE=single TRADING_INTERVAL=600`，月成本约 ¥330。
+
 ### Q: 我只有 OKX Web3 钱包，能用吗？
 
 能。OKX Web3 钱包本质是自托管钱包，导出私钥后与 MetaMask/Rabby 完全一样使用。见[阶段 2.1](#21-获取钱包私钥)。
