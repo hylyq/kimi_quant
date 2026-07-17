@@ -62,7 +62,7 @@
 
 | 组件 | 技术 |
 |------|------|
-| 大模型 | Kimi K3 (Moonshot API, OpenAI 兼容) |
+| 大模型 | Kimi K3 (主) + DeepSeek V3 (自动降级备份) |
 | LLM 编排 | LangChain + LangGraph StateGraph |
 | 状态持久化 | LangGraph MemorySaver + JSONL 文件（fcntl 锁） |
 | 交易所 | Hyperliquid (Perpetual DEX) |
@@ -357,6 +357,10 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `LLM_TEMPERATURE` | `0.1` | LLM 温度 (0-2) |
 | `LLM_MAX_TOKENS` | `2048` | 最大**输出** token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
+| **DeepSeek (可选)** | | 自动降级备份 |
+| `DEEPSEEK_API_KEY` | — | DeepSeek API Key（留空则仅用 Kimi） |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek API 端点 |
+| `DEEPSEEK_MODEL` | `deepseek-v3.1` | DeepSeek 模型 |
 | **Hyperliquid** | | |
 | `HYPERLIQUID_PRIVATE_KEY` | — | 钱包私钥（实盘必填） |
 | `HYPERLIQUID_TESTNET` | `true` | `true`=测试网, `false`=主网 |
@@ -675,6 +679,10 @@ uv run kimi-quant --history
 # 查看最新交易
 tail -5 data/trades.jsonl | python -m json.tool
 ```
+
+### Q: Kimi API 挂了怎么办？
+
+配置 `DEEPSEEK_API_KEY` 即可启用自动降级。Kimi 调用失败时自动切换到 DeepSeek V3，无需人工干预。日志会标注使用的是哪个模型。未配置 DeepSeek 时仅用 Kimi。
 
 ### Q: 辩论历史存在哪里？重启后能恢复吗？
 

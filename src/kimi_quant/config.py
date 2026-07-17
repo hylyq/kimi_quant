@@ -17,7 +17,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 class Config:
     """Application configuration."""
 
-    # --- Kimi / Moonshot API ---
+    # --- Kimi / Moonshot API (Primary) ---
     moonshot_api_key: str = field(
         default_factory=lambda: os.getenv("MOONSHOT_API_KEY", "")
     )
@@ -29,6 +29,21 @@ class Config:
     kimi_model: str = field(
         default_factory=lambda: os.getenv("KIMI_MODEL", "kimi-k3")
     )
+
+    # --- DeepSeek API (Fallback) ---
+    deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "")
+    )
+    deepseek_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
+        )
+    )
+    deepseek_model: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-v3.1")
+    )
+
+    # --- LLM Parameters ---
     llm_temperature: float = field(
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1"))
     )

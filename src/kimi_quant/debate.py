@@ -48,7 +48,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
@@ -139,18 +138,15 @@ class SingleTurnAgent:
     """A simple LLM agent that responds with a single message (no tool calling).
 
     Used for the debaters — each gets one turn to produce their output.
+    Automatically falls back to DeepSeek if Kimi fails.
     """
 
     def __init__(self, name: str, system_prompt: str):
+        from kimi_quant.llm import create_llm
+
         self.name = name
         self.system_prompt = system_prompt
-        self.llm = ChatOpenAI(
-            api_key=config.moonshot_api_key,
-            base_url=config.moonshot_base_url,
-            model=config.kimi_model,
-            temperature=config.llm_temperature,
-            max_tokens=config.llm_max_tokens,
-        )
+        self.llm = create_llm()
 
     async def arun(self, user_prompt: str) -> str:
         """Run the agent asynchronously and return its text response."""
@@ -170,18 +166,15 @@ class SingleTurnAgent:
 
 
 class JudgeAgent:
-    """The judge agent uses LangChain structured output to produce a TradingSignal."""
+    """The judge agent uses structured output with automatic Kimi→DeepSeek fallback."""
 
     def __init__(self):
-        self.llm = ChatOpenAI(
-            api_key=config.moonshot_api_key,
-            base_url=config.moonshot_base_url,
-            model=config.kimi_model,
+        from kimi_quant.llm import create_structured_llm
+
+        self.structured_llm = create_structured_llm(
+            TradingSignal,
             temperature=config.judge_temperature,
             max_tokens=4096,  # Judge needs more room for synthesizing 3 arguments
-        )
-        self.structured_llm = self.llm.with_structured_output(
-            TradingSignal, method="json_schema"
         )
 
     async def ajudge(

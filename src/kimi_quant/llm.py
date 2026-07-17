@@ -1,6 +1,9 @@
-"""Kimi K3 LLM integration via LangChain.
+"""LLM integration with automatic fallback.
 
-Uses OpenAI-compatible ChatOpenAI with the Moonshot API endpoint.
+Primary: Kimi K3 via Moonshot API.
+Fallback: DeepSeek V3 via DeepSeek API (auto-activated when Kimi fails).
+
+Both use OpenAI-compatible ChatOpenAI.
 """
 
 import json
@@ -13,6 +16,104 @@ from pydantic import BaseModel, Field
 from kimi_quant.config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ─── LLM Factory with Fallback ────────────────────────────────────────────
+
+
+def create_llm(
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> ChatOpenAI:
+    """Create a ChatOpenAI instance with automatic DeepSeek fallback.
+
+    Returns a ChatOpenAI that tries Kimi (primary) first, then falls back
+    to DeepSeek on failure. Uses LangChain's native with_fallbacks().
+
+    Args:
+        temperature: Override default temperature.
+        max_tokens: Override default max_tokens.
+
+    Returns:
+        A ChatOpenAI wrapped with fallback to DeepSeek.
+    """
+    temp = temperature if temperature is not None else config.llm_temperature
+    tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
+
+    primary = ChatOpenAI(
+        api_key=config.moonshot_api_key,
+        base_url=config.moonshot_base_url,
+        model=config.kimi_model,
+        temperature=temp,
+        max_tokens=tokens,
+    )
+
+    if not config.deepseek_api_key:
+        logger.info("LLM: Kimi only (no DeepSeek fallback configured)")
+        return primary
+
+    fallback = ChatOpenAI(
+        api_key=config.deepseek_api_key,
+        base_url=config.deepseek_base_url,
+        model=config.deepseek_model,
+        temperature=temp,
+        max_tokens=tokens,
+    )
+
+    logger.info(
+        "LLM: Kimi(%s) primary + DeepSeek(%s) fallback",
+        config.kimi_model, config.deepseek_model,
+    )
+    return primary.with_fallbacks([fallback])
+
+
+def create_structured_llm(
+    schema: type[BaseModel],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+):
+    """Create a structured-output LLM with automatic DeepSeek fallback.
+
+    Returns a Runnable that outputs Pydantic models via json_schema.
+
+    Args:
+        schema: Pydantic model class for structured output.
+        temperature: Override default temperature.
+        max_tokens: Override default max_tokens.
+
+    Returns:
+        A Runnable[dict, schema] with fallback.
+    """
+    temp = temperature if temperature is not None else config.llm_temperature
+    tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
+
+    primary = ChatOpenAI(
+        api_key=config.moonshot_api_key,
+        base_url=config.moonshot_base_url,
+        model=config.kimi_model,
+        temperature=temp,
+        max_tokens=tokens,
+    )
+    primary_structured = primary.with_structured_output(schema, method="json_schema")
+
+    if not config.deepseek_api_key:
+        logger.info("LLM(structured): Kimi only (no DeepSeek fallback configured)")
+        return primary_structured
+
+    fallback = ChatOpenAI(
+        api_key=config.deepseek_api_key,
+        base_url=config.deepseek_base_url,
+        model=config.deepseek_model,
+        temperature=temp,
+        max_tokens=tokens,
+    )
+    fallback_structured = fallback.with_structured_output(schema, method="json_schema")
+
+    logger.info(
+        "LLM(structured): Kimi(%s) primary + DeepSeek(%s) fallback",
+        config.kimi_model, config.deepseek_model,
+    )
+    return primary_structured.with_fallbacks([fallback_structured])
 
 
 class TradingSignal(BaseModel):
@@ -105,7 +206,7 @@ def build_market_prompt(market_data: dict[str, Any]) -> str:
 
 
 class KimiLLM:
-    """LangChain wrapper for Kimi K3 via Moonshot API."""
+    """Single-agent LLM strategy with automatic Kimi→DeepSeek fallback."""
 
     # System prompt that defines the trading analyst persona
     SYSTEM_PROMPT = """\
@@ -132,24 +233,10 @@ Output JSON only (no markdown):
 """
 
     def __init__(self):
-        self.llm = ChatOpenAI(
-            api_key=config.moonshot_api_key,
-            base_url=config.moonshot_base_url,
-            model=config.kimi_model,
-            temperature=config.llm_temperature,
-            max_tokens=config.llm_max_tokens,
-        )
+        self.llm = create_llm()
+        self.structured_llm = create_structured_llm(TradingSignal)
 
-        # Use LangChain's structured output for reliable JSON parsing
-        self.structured_llm = self.llm.with_structured_output(
-            TradingSignal, method="json_schema"
-        )
-
-        logger.info(
-            "KimiLLM initialized (model=%s, base_url=%s)",
-            config.kimi_model,
-            config.moonshot_base_url,
-        )
+        logger.info("KimiLLM initialized (primary=%s)", config.kimi_model)
 
     @staticmethod
     def build_prompt(market_data: dict[str, Any]) -> str:
@@ -173,7 +260,7 @@ Output JSON only (no markdown):
                 ("user", prompt),
             ]
 
-            logger.info("Requesting trading analysis from Kimi K3...")
+            logger.info("Requesting trading analysis...")
             signal: TradingSignal = self.structured_llm.invoke(messages)
 
             logger.info(
