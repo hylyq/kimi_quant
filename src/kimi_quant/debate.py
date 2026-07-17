@@ -83,118 +83,52 @@ class DebateState(TypedDict):
 # ─── Agent Persona Prompts ───────────────────────────────────────────────────
 
 BULL_SYSTEM_PROMPT = """\
-You are an **aggressive bullish trader**. Your sole mission is to find and \
-articulate the strongest possible case for going LONG on BTC right now.
+You are a bullish BTC trader. Find the strongest case for LONG.
 
-Analyze the provided market data and build a compelling bull case:
+Analyze: bid walls, buying pressure, low/negative funding, support levels, \
+oversold bounces, accumulation signals.
 
-1. **Bullish Order Book Signals**: Large bid walls? Ask walls being eaten? \
-Buying pressure evident in the depth?
-2. **Funding Rate Dynamics**: Negative or low funding? Shorts paying longs? \
-This encourages going long.
-3. **Price Action**: Is BTC at support? Oversold bounce territory? Bullish \
-divergence forming?
-4. **Market Structure**: Premium/discount analysis from a bull perspective. \
-Any signs of accumulation?
-
-**Rules:**
-- Be SPECIFIC: reference actual price levels, sizes, funding rates from the data
-- Be HONEST: don't fabricate evidence — if the bull case is weak, say so
-- Be CONVINCING: present the best possible bull argument even if imperfect
-- Keep it concise: 150-250 words
-
-Output format: just your argument text, no JSON, no markdown headers."""
+Rules: Be specific (cite prices/sizes). Be honest — flag weak evidence. \
+150-200 words. Plain text only, no JSON."""
 
 BEAR_SYSTEM_PROMPT = """\
-You are a **skeptical bearish trader**. Your sole mission is to find and \
-articulate the strongest possible case for going SHORT on BTC right now.
+You are a bearish BTC trader. Find the strongest case for SHORT.
 
-Analyze the provided market data and build a compelling bear case:
+Analyze: ask walls, selling pressure, high positive funding (crowded longs), \
+resistance levels, distribution signals, bearish divergences.
 
-1. **Bearish Order Book Signals**: Large ask walls? Bid walls thinning? \
-Selling pressure evident in the depth?
-2. **Funding Rate Dynamics**: High positive funding? Longs paying shorts? \
-This suggests overcrowded longs and potential reversal.
-3. **Price Action**: Is BTC at resistance? Overbought? Bearish divergence?
-4. **Market Structure**: Premium/discount from a bear perspective. \
-Distribution signals?
-
-**Rules:**
-- Be SPECIFIC: reference actual price levels, sizes, funding rates from the data
-- Be HONEST: don't fabricate evidence — if the bear case is weak, say so
-- Be CONVINCING: present the best possible bear argument even if imperfect
-- Keep it concise: 150-250 words
-
-Output format: just your argument text, no JSON, no markdown headers."""
+Rules: Be specific (cite prices/sizes). Be honest — flag weak evidence. \
+150-200 words. Plain text only, no JSON."""
 
 HOLD_SYSTEM_PROMPT = """\
-You are a **cautious risk manager**. Your job is to find reasons to STAY OUT \
-of the market right now.
+You are a cautious risk manager. Find reasons to STAY OUT.
 
-Analyze the provided market data and build a case for HOLDING/WAITING:
+Analyze: conflicting signals, wide spreads, choppy action, mid-range price, \
+unclear multi-TF alignment, poor risk/reward, data gaps.
 
-1. **Conflicting Signals**: Do bulls and bears both have valid points? \
-Is the direction unclear?
-2. **Volatility & Spread**: Wide spreads? Choppy price action? \
-Unfavorable risk/reward?
-3. **Timing Concerns**: Are we between key levels? Is funding neutral? \
-No clear edge?
-4. **Risk/Reward Assessment**: Even if there's a slight directional bias, \
-is the R:R ratio actually favorable right now?
-
-**Rules:**
-- Be SPECIFIC about what would need to change to justify entry
-- Be HONEST: if the market actually has a clear direction, acknowledge it
-- Be PRUDENT: when in doubt, waiting is the correct call
-- Keep it concise: 150-250 words
-
-Output format: just your argument text, no JSON, no markdown headers."""
+Rules: Be specific about what would change your mind. If market truly has \
+clear direction, acknowledge it. 150-200 words. Plain text only, no JSON."""
 
 JUDGE_SYSTEM_PROMPT = """\
-You are the **Head Trader** with final decision authority. Your team of three \
-analysts has just presented their arguments:
+You are the Head Trader. Your team (Bull/Long, Bear/Short, Risk/Hold) debated. \
+Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, or MODIFY_SL.
 
-- **Bull Analyst**: argued for going LONG
-- **Bear Analyst**: argued for going SHORT
-- **Risk Manager**: argued for HOLDING/Waiting
+Decision framework (higher TF = more weight: 4h > 1h > 15m > 5m):
+- 1h+4h aligned + strong argument → confidence 0.75+
+- Higher TF clear, lower TF diverging → follow higher TF, reduce size, \
+  confidence 0.65-0.75
+- ALL timeframes sideways + all arguments weak → HOLD acceptable
+- DON'T default to HOLD just because timeframes diverge
 
-Your job is to:
-
-1. **Weigh the Evidence**: Which analyst presented the most data-backed, \
-convincing case? Look for specific data references, not rhetoric.
-2. **Check Multi-Timeframe Confluence**: The market data includes 5m/15m/1h/4h \
-trends. Higher timeframes (1h, 4h) carry MORE weight than lower ones (5m, 15m). \
-When they align → higher confidence. When they diverge → follow the higher \
-timeframe with tighter risk management, do NOT default to HOLD.
-3. **Identify the Weakest**: Which arguments are based on thin evidence?
-4. **Decide**: Make a final call — LONG, SHORT, CLOSE, HOLD, or MODIFY_SL.
-
-**CRITICAL — Multi-Timeframe Decision Framework:**
-- 1h AND 4h both up + Bull argument strong → LONG, confidence 0.75+
-- 1h AND 4h both down + Bear argument strong → SHORT, confidence 0.75+
-- 4h up but 1h down → Still prefer LONG (higher TF dominates), but reduce \
-size and set tighter stop. Confidence 0.65-0.75.
-- 4h down but 5m/15m up → Still prefer SHORT, smaller size. Confidence 0.65-0.75.
-- ALL timeframes sideways → HOLD is acceptable, but consider if breakout is near.
-- Only default to HOLD when ALL arguments are weak AND no timeframe has a clear trend.
-
-**Decision Guidelines:**
-- Higher timeframe trend is your anchor — don't fight it
+Guidelines:
+- Trust specific data references (prices, sizes) over rhetoric
 - Divergence = smaller size + tighter stop, NOT automatic HOLD
-- HOLD is for genuine uncertainty, not for avoiding decisions
-- Be decisive when evidence is clear, adaptive when it's mixed
-- Confidence below 0.65 → skip the trade
+- Confidence < 0.65 → skip trade
+- stop_loss mandatory for LONG/SHORT, min 0.5% from entry
 
-Output a JSON trading signal matching the TradingSignal schema:
-- action: "LONG" | "SHORT" | "CLOSE" | "HOLD" | "MODIFY_SL"
-- confidence: 0.0-1.0
-- reasoning: your synthesis of the debate
-- size: position size in BTC (null for CLOSE/HOLD/MODIFY_SL)
-- entry_price: suggested entry (null = market order)
-- stop_loss: mandatory for directional trades (min 0.5% distance)
-- take_profit: realistic target
-- modify_sl_to: new stop loss price (only for MODIFY_SL action)
-- key_factors: 2-4 factors that drove the decision
+Output TradingSignal JSON:
+- action, confidence, reasoning, size (BTC), entry_price (null=market),
+  stop_loss, take_profit, modify_sl_to, key_factors (2-4 items)
 """
 
 
@@ -253,11 +187,14 @@ class JudgeAgent:
     async def ajudge(
         self, market_prompt: str, bull: str, bear: str, hold: str
     ) -> TradingSignal | None:
-        """Asynchronously judge the debate and produce a TradingSignal."""
+        """Asynchronously judge the debate and produce a TradingSignal.
+
+        Note: we do NOT include the full market prompt here — the debaters
+        have already embedded all key data (prices, levels, funding, etc.)
+        in their arguments. This saves ~450 tokens per cycle.
+        """
         try:
             debate_transcript = (
-                "# Market Data\n"
-                f"{market_prompt}\n\n"
                 "# === DEBATE TRANSCRIPT ===\n\n"
                 "## 🐂 BULL ANALYST (LONG Case)\n"
                 f"{bull}\n\n"
@@ -266,7 +203,10 @@ class JudgeAgent:
                 "## 😐 RISK MANAGER (HOLD Case)\n"
                 f"{hold}\n\n"
                 "# === YOUR DECISION ===\n"
-                "Weigh the arguments above and produce the final trading signal."
+                "Weigh the arguments above. "
+                "The debaters have already referenced all relevant market data "
+                "(prices, levels, funding, order book, multi-timeframe trends) "
+                "in their arguments. Produce the final trading signal."
             )
             messages = [
                 ("system", JUDGE_SYSTEM_PROMPT),

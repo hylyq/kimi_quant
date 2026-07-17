@@ -45,19 +45,15 @@ class MarketSnapshot:
     premium: float  # mark - oracle
 
     def to_summary(self) -> str:
-        """Render as a human-readable summary for the LLM prompt."""
+        """Render as a compact summary for the LLM prompt."""
         return (
-            f"Coin: {self.coin}\n"
-            f"Mid Price: ${self.mid_price:.2f}\n"
-            f"Mark Price: ${self.mark_price:.2f}\n"
-            f"Oracle Price: ${self.oracle_price:.2f}\n"
-            f"Premium (Mark-Oracle): ${self.premium:.2f}\n"
-            f"Bid: ${self.bid_price:.2f} (size: {self.bid_size:.4f})\n"
-            f"Ask: ${self.ask_price:.2f} (size: {self.ask_size:.4f})\n"
-            f"Spread: ${self.spread:.2f} ({self.spread_pct:.4f}%)\n"
-            f"Funding Rate: {self.funding_rate * 100:.4f}%\n"
-            f"Open Interest: ${self.open_interest:,.0f}\n"
-            f"24h Change: {self.day_change_pct:.2f}%\n"
+            f"BTC Mid=${self.mid_price:.1f} Mark=${self.mark_price:.1f} "
+            f"Oracle=${self.oracle_price:.1f} Premium=${self.premium:.1f}\n"
+            f"Bid=${self.bid_price:.1f}(sz={self.bid_size:.4f}) "
+            f"Ask=${self.ask_price:.1f}(sz={self.ask_size:.4f}) "
+            f"Spread=${self.spread:.1f}({self.spread_pct:.3f}%)\n"
+            f"Funding={self.funding_rate*100:.4f}% OI=${self.open_interest:,.0f} "
+            f"24h={self.day_change_pct:+.2f}%"
         )
 
 
@@ -72,18 +68,15 @@ class OrderBookDepth:
     imbalance: float  # positive = bid-heavy, negative = ask-heavy
 
     def to_summary(self, levels: int = 5) -> str:
-        lines = [f"Order Book (top {levels} levels):"]
-        lines.append("Bids:")
-        for b in self.bids[:levels]:
-            lines.append(f"  ${b['price']:.1f} — {b['size']:.4f}")
-        lines.append("Asks:")
-        for a in self.asks[:levels]:
-            lines.append(f"  ${a['price']:.1f} — {a['size']:.4f}")
+        lines = [f"OrderBook top{levels}:"]
+        bids_str = " ".join(f"${b['price']:.0f}x{b['size']:.3f}" for b in self.bids[:levels])
+        asks_str = " ".join(f"${a['price']:.0f}x{a['size']:.3f}" for a in self.asks[:levels])
+        lines.append(f"Bids: {bids_str}")
+        lines.append(f"Asks: {asks_str}")
         lines.append(
-            f"Bid/Ask Total: {self.bid_total:.2f} / {self.ask_total:.2f}"
+            f"Depth: {self.bid_total:.2f}B/{self.ask_total:.2f}A "
+            f"Imb={self.imbalance:.3f}({'bid+' if self.imbalance > 0 else 'ask+'})"
         )
-        lines.append(f"Imbalance: {self.imbalance:.4f} "
-                      f"({'bid-heavy' if self.imbalance > 0 else 'ask-heavy'})")
         return "\n".join(lines)
 
 
@@ -100,14 +93,11 @@ class AccountSnapshot:
     leverage: int
 
     def to_summary(self) -> str:
+        side = self.position_side.upper() if self.position_side != 'none' else 'NONE'
         return (
-            f"Balance: ${self.balance:.2f}\n"
-            f"Position: {self.position_size:.4f} {config.trading_pair} "
-            f"({'LONG' if self.position_side == 'long' else 'SHORT' if self.position_side == 'short' else 'NONE'})\n"
-            f"Entry Price: ${self.entry_price:.2f}\n"
-            f"Unrealized PnL: ${self.unrealized_pnl:.2f}\n"
-            f"Margin Used: ${self.margin_used:.2f}\n"
-            f"Leverage: {self.leverage}x\n"
+            f"Balance=${self.balance:.0f} Pos={self.position_size:.4f}{config.trading_pair}({side}) "
+            f"Entry=${self.entry_price:.1f} uPNL=${self.unrealized_pnl:.1f} "
+            f"Margin=${self.margin_used:.0f} Lev={self.leverage}x"
         )
 
 
@@ -147,17 +137,15 @@ class TimeframeSummary:
     support: float | None = None
 
     def to_summary(self) -> str:
-        """Compact one-paragraph summary per timeframe."""
+        """Compact one-line summary per timeframe."""
         base = (
-            f"  [{self.interval}] {self.num_candles} candles ({self.duration_hours:.1f}h): "
-            f"Trend: {self.trend.upper()} {self.change_pct:+.2f}% | "
-            f"Range: ${self.period_low:.0f}–${self.period_high:.0f} | "
-            f"ATR: ${self.atr:.1f} ({self.atr_pct:.2f}%) | "
-            f"Current candle range: {self.current_range_pct:.2f}% | "
-            f"Volume: {self.avg_volume:.1f}/candle ({self.volume_trend})"
+            f"[{self.interval}] {self.trend.upper()} {self.change_pct:+.2f}% "
+            f"${self.period_low:.0f}-${self.period_high:.0f} "
+            f"ATR=${self.atr:.0f}({self.atr_pct:.2f}%) "
+            f"Vol:{self.avg_volume:.0f}({self.volume_trend})"
         )
         if self.support and self.resistance:
-            base += f" | Support: ${self.support:.0f} Resistance: ${self.resistance:.0f}"
+            base += f" S/R=${self.support:.0f}/${self.resistance:.0f}"
         return base
 
 
@@ -173,10 +161,8 @@ class FundingTrend:
 
     def to_summary(self) -> str:
         return (
-            f"Funding: current={self.current*100:.4f}% | "
-            f"1h avg={self.avg_1h*100:.4f}% | "
-            f"8h avg={self.avg_8h*100:.4f}% | "
-            f"Trend: {self.trend} → {self.interpretation}"
+            f"Funding: now={self.current*100:.4f}% 1h={self.avg_1h*100:.4f}% "
+            f"8h={self.avg_8h*100:.4f}% {self.trend} | {self.interpretation}"
         )
 
 
@@ -225,12 +211,10 @@ class MarketAnalysis:
 
         parts.append(
             f"\n# Instructions\n"
-            f"Max position size: {config.max_position_size} BTC.\n"
-            f"Use the multi-timeframe analysis to assess trend strength "
-            f"and consistency across timeframes. "
-            f"Higher-timeframe trends (1h, 4h) carry more weight. "
-            f"Look for confluence: when all timeframes agree, confidence "
-            f"should be higher.\n"
+            f"Max size={config.max_position_size}BTC. "
+            f"Higher TF (4h>1h>15m>5m) carry more weight. "
+            f"Confluence → higher confidence. Divergence → follow higher TF, "
+            f"reduce size, tighten SL. Stop loss min 0.5% from entry.\n"
         )
 
         if self.performance_context:
