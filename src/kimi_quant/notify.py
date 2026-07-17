@@ -1,75 +1,120 @@
-"""Optional notification integration with larky (Feishu/Lark bot).
+"""Optional notification integration via larky (WeChat or Feishu).
 
-Auto-detects larky availability at startup. If larky is installed and
-configured (APP_ID + APP_SECRET env vars), notifications are sent via
-a background asyncio thread. Otherwise, all calls are silent no-ops.
+Auto-detects available channels at startup. Preference order:
+  1. WeChat (if saved account exists on disk)
+  2. Feishu/Lark (if APP_ID + APP_SECRET env vars set)
+  3. Silent no-op if nothing is available
 
 Usage (anywhere in kimi_quant):
     from kimi_quant.notify import notify
     notify.send("Trade opened: LONG 0.01 BTC @ $87000")
-    notify.send("Circuit breaker activated: 4 consecutive losses")
 """
 
+import json
 import logging
+import os
 import queue
 import threading
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 # ─── Detection ────────────────────────────────────────────────────────────
 
-_larky_available = False
+_channel: str | None = None  # "wechat" | "lark" | None
 _bot_thread: threading.Thread | None = None
 _queue: queue.Queue[str | None] = queue.Queue()
 _started = False
 
 try:
-    import os
+    from larky import LarkBot, WeChatBot  # type: ignore[import-untyped]
 
-    from larky import LarkBot  # type: ignore[import-untyped]
-
-    if os.getenv("APP_ID") and os.getenv("APP_SECRET"):
-        _larky_available = True
+    # Check WeChat first (user preference): saved account on disk
+    _wechat_state = os.path.expanduser("~/.openclaw/openclaw-weixin")
+    _wechat_index = Path(_wechat_state) / "accounts.json"
+    if _wechat_index.exists():
+        _channel = "wechat"
+        logger.info("Notification: WeChat detected")
+    elif os.getenv("APP_ID") and os.getenv("APP_SECRET"):
+        _channel = "lark"
+        logger.info("Notification: Feishu detected")
 except ImportError:
     pass
 
 
-# ─── Background Bot Runner ────────────────────────────────────────────────
+# ─── Background Bot Runners ───────────────────────────────────────────────
 
 
-def _run_bot_loop() -> None:
-    """Run the LarkBot in a dedicated asyncio event loop (background thread).
-
-    Reads messages from the thread-safe queue and sends them via Lark API.
-    """
+def _run_wechat_loop() -> None:
+    """Run WeChatBot in a dedicated asyncio event loop (background thread)."""
     import asyncio
 
-    async def _bot_worker(bot: LarkBot) -> None:
-        """Continuously pull messages from the queue and send them."""
+    async def _worker(bot: WeChatBot) -> None:
         try:
-            await bot.start()
-            logger.info("Notification bot started")
+            # Load saved account and init session (no polling needed)
+            account_ids = bot._list_account_ids()
+            if not account_ids:
+                logger.error("WeChat: no saved accounts found")
+                return
+            bot._account = bot._load_account(account_ids[0])
+            if not bot._account:
+                logger.error("WeChat: failed to load account")
+                return
+            await bot._init_session()
+            logger.info("WeChat notification bot started")
             while True:
                 text = _queue.get()
-                if text is None:  # shutdown signal
+                if text is None:
                     break
                 try:
-                    await bot.send_text(text)
+                    await bot.notify(text)
                 except Exception as e:
-                    logger.error("Failed to send notification: %s", e)
+                    logger.error("WeChat send failed: %s", e)
         except Exception as e:
-            logger.error("Notification bot failed to start: %s", e)
+            logger.error("WeChat bot error: %s", e)
         finally:
             try:
                 await bot.close()
             except Exception:
                 pass
-            logger.info("Notification bot stopped")
+            logger.info("WeChat notification bot stopped")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    bot = WeChatBot.from_env()
+    loop.run_until_complete(_worker(bot))
+    loop.close()
+
+
+def _run_lark_loop() -> None:
+    """Run LarkBot in a dedicated asyncio event loop (background thread)."""
+    import asyncio
+
+    async def _worker(bot: LarkBot) -> None:
+        try:
+            await bot.start()
+            logger.info("Feishu notification bot started")
+            while True:
+                text = _queue.get()
+                if text is None:
+                    break
+                try:
+                    await bot.send_text(text)
+                except Exception as e:
+                    logger.error("Feishu send failed: %s", e)
+        except Exception as e:
+            logger.error("Feishu bot error: %s", e)
+        finally:
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            logger.info("Feishu notification bot stopped")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     bot = LarkBot.from_env()
-    loop.run_until_complete(_bot_worker(bot))
+    loop.run_until_complete(_worker(bot))
     loop.close()
 
 
@@ -77,28 +122,22 @@ def _run_bot_loop() -> None:
 
 
 class Notifier:
-    """Singleton notifier — call send() to push a message.
-
-    Automatically starts the background bot thread on first use.
-    """
+    """Singleton notifier. Auto-detects WeChat > Feishu > silent."""
 
     def send(self, text: str) -> None:
-        """Send a notification. No-op if larky is unavailable.
-
-        Args:
-            text: Plain text message to send.
-        """
-        if not _larky_available:
+        """Send a notification. No-op if no channel available."""
+        if not _channel:
             return
 
         global _started, _bot_thread
         if not _started:
+            runner = _run_wechat_loop if _channel == "wechat" else _run_lark_loop
             _bot_thread = threading.Thread(
-                target=_run_bot_loop, name="larky-notify", daemon=True
+                target=runner, name="notify-bot", daemon=True
             )
             _bot_thread.start()
             _started = True
-            logger.info("Notification system enabled (larky detected)")
+            logger.info("Notification system enabled (%s)", _channel)
 
         try:
             _queue.put_nowait(text)
@@ -106,15 +145,16 @@ class Notifier:
             logger.warning("Notification queue full — message dropped")
 
     def is_available(self) -> bool:
-        """Check whether notifications are active."""
-        return _larky_available
+        return _channel is not None
+
+    @property
+    def channel(self) -> str | None:
+        return _channel
 
     def shutdown(self) -> None:
-        """Gracefully stop the background bot thread."""
-        if _larky_available and _bot_thread and _bot_thread.is_alive():
-            _queue.put(None)  # shutdown signal
+        if _channel and _bot_thread and _bot_thread.is_alive():
+            _queue.put(None)
             _bot_thread.join(timeout=10)
 
 
-# Module-level singleton
 notify = Notifier()

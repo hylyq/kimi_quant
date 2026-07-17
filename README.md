@@ -177,9 +177,9 @@ LLM adjusted interval: 600s → 900s    ← 横盘拉长
 Sleeping 900.0s until next cycle...
 ```
 
-## 消息推送（飞书）
+## 消息推送（微信 / 飞书）
 
-自动检测环境中是否有 larky（飞书机器人 SDK）。有则推送实时交易通知到手机，没有则静默运行。
+自动检测 larky（消息推送 SDK）。优先微信，其次飞书，都没有则静默运行。
 
 ### 推送事件
 
@@ -193,14 +193,15 @@ Sleeping 900.0s until next cycle...
 | ⚠️ 异常 | 首个错误 + 每 10 轮（防刷屏） |
 | ⏹️ 停止 | 总周期、交易数、胜率、盈亏 |
 
-### 零配置
+### 自动检测
 
-```bash
-# 有 larky → 自动推送
-# 无 larky → 静默运行，完全不受影响
+```
+服务器有微信登录态 → 微信推送
+服务器有飞书 APP_ID  → 飞书推送
+都没有              → 静默运行
 ```
 
-程序启动时自动检测 larky 包和 `APP_ID`/`APP_SECRET` 环境变量。推送在独立后台线程运行，主交易循环毫秒级响应，不受飞书 API 延迟影响。
+程序启动时自动检测，无需任何配置。推送在独立后台线程运行，主交易循环毫秒级响应，不受消息 API 延迟影响。
 
 ## 快速开始
 
@@ -736,7 +737,7 @@ kimi_quant/
 │   ├── risk.py          # 六层风控校验 + 熔断状态机
 │   ├── executor.py      # 15/15 SDK 全覆盖 + PositionTracker 三态模型
 │   ├── analytics.py     # TradeLogger — 盈亏分析 + LLM 自省反馈
-│   ├── notify.py        # 飞书消息推送（可选，自动检测）
+│   ├── notify.py        # 微信/飞书消息推送（可选，自动检测）
 │   └── main.py          # CLI 入口 + 交易循环
 ├── data/
 │   ├── debate.jsonl   # 辩论历史记录 (JSONL, fcntl 文件锁)
