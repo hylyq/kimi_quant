@@ -9,8 +9,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env file if present
-load_dotenv(Path(__file__).parent.parent / ".env")
+# Load .env file from project root (src/kimi_quant/ → src/ → ../)
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 
 @dataclass
