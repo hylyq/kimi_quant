@@ -21,50 +21,92 @@ logger = logging.getLogger(__name__)
 # ─── LLM Factory with Fallback ────────────────────────────────────────────
 
 
+def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
+    """Build available LLM instances keyed by provider name.
+
+    Only includes models whose API key is configured.
+    """
+    registry: dict[str, ChatOpenAI] = {}
+
+    # Kimi / Moonshot
+    if config.moonshot_api_key:
+        registry["kimi"] = ChatOpenAI(
+            api_key=config.moonshot_api_key,
+            base_url=config.moonshot_base_url,
+            model=config.kimi_model,
+            temperature=temp,
+            max_tokens=tokens,
+        )
+
+    # DeepSeek
+    if config.deepseek_api_key:
+        registry["deepseek"] = ChatOpenAI(
+            api_key=config.deepseek_api_key,
+            base_url=config.deepseek_base_url,
+            model=config.deepseek_model,
+            temperature=temp,
+            max_tokens=tokens,
+        )
+
+    return registry
+
+
+def _resolve_chain(
+    registry: dict[str, ChatOpenAI],
+    primary_name: str,
+) -> ChatOpenAI:
+    """Build a primary→fallback chain from the model registry.
+
+    Args:
+        registry: Available models keyed by name.
+        primary_name: Which model to try first.
+
+    Returns:
+        A ChatOpenAI (possibly with_fallbacks) ready to use.
+    """
+    if primary_name not in registry:
+        # Configured primary not available — use first available
+        available = list(registry.keys())
+        logger.warning(
+            "Primary '%s' not available (missing API key?), using '%s'",
+            primary_name, available[0],
+        )
+        primary_name = available[0]
+
+    primary = registry[primary_name]
+    fallbacks = [llm for name, llm in registry.items() if name != primary_name]
+
+    if not fallbacks:
+        logger.info("LLM: %s(%s) only (no fallback configured)",
+                     primary_name, primary.model_name)
+        return primary
+
+    fb_names = ", ".join(f"{n}({llm.model_name})" for n, llm in registry.items() if n != primary_name)
+    logger.info("LLM: %s(%s) primary → fallback: %s",
+                primary_name, primary.model_name, fb_names)
+    return primary.with_fallbacks(fallbacks)
+
+
 def create_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> ChatOpenAI:
-    """Create a ChatOpenAI instance with automatic DeepSeek fallback.
+    """Create a ChatOpenAI with automatic fallback chain.
 
-    Returns a ChatOpenAI that tries Kimi (primary) first, then falls back
-    to DeepSeek on failure. Uses LangChain's native with_fallbacks().
+    Primary model is determined by PRIMARY_LLM env var (default: "kimi").
+    All other available models become automatic fallbacks.
 
     Args:
         temperature: Override default temperature.
         max_tokens: Override default max_tokens.
 
     Returns:
-        A ChatOpenAI wrapped with fallback to DeepSeek.
+        A ChatOpenAI wrapped with fallback chain.
     """
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
-
-    primary = ChatOpenAI(
-        api_key=config.moonshot_api_key,
-        base_url=config.moonshot_base_url,
-        model=config.kimi_model,
-        temperature=temp,
-        max_tokens=tokens,
-    )
-
-    if not config.deepseek_api_key:
-        logger.info("LLM: Kimi only (no DeepSeek fallback configured)")
-        return primary
-
-    fallback = ChatOpenAI(
-        api_key=config.deepseek_api_key,
-        base_url=config.deepseek_base_url,
-        model=config.deepseek_model,
-        temperature=temp,
-        max_tokens=tokens,
-    )
-
-    logger.info(
-        "LLM: Kimi(%s) primary + DeepSeek(%s) fallback",
-        config.kimi_model, config.deepseek_model,
-    )
-    return primary.with_fallbacks([fallback])
+    registry = _build_model_registry(temp, tokens)
+    return _resolve_chain(registry, config.primary_llm)
 
 
 def create_structured_llm(
@@ -72,9 +114,10 @@ def create_structured_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
 ):
-    """Create a structured-output LLM with automatic DeepSeek fallback.
+    """Create a structured-output LLM with automatic fallback chain.
 
-    Returns a Runnable that outputs Pydantic models via json_schema.
+    Primary model is determined by PRIMARY_LLM env var (default: "kimi").
+    Each model gets with_structured_output(schema) applied, then chained.
 
     Args:
         schema: Pydantic model class for structured output.
@@ -82,38 +125,18 @@ def create_structured_llm(
         max_tokens: Override default max_tokens.
 
     Returns:
-        A Runnable[dict, schema] with fallback.
+        A Runnable[dict, schema] with fallback chain.
     """
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
+    registry = _build_model_registry(temp, tokens)
 
-    primary = ChatOpenAI(
-        api_key=config.moonshot_api_key,
-        base_url=config.moonshot_base_url,
-        model=config.kimi_model,
-        temperature=temp,
-        max_tokens=tokens,
-    )
-    primary_structured = primary.with_structured_output(schema, method="json_schema")
-
-    if not config.deepseek_api_key:
-        logger.info("LLM(structured): Kimi only (no DeepSeek fallback configured)")
-        return primary_structured
-
-    fallback = ChatOpenAI(
-        api_key=config.deepseek_api_key,
-        base_url=config.deepseek_base_url,
-        model=config.deepseek_model,
-        temperature=temp,
-        max_tokens=tokens,
-    )
-    fallback_structured = fallback.with_structured_output(schema, method="json_schema")
-
-    logger.info(
-        "LLM(structured): Kimi(%s) primary + DeepSeek(%s) fallback",
-        config.kimi_model, config.deepseek_model,
-    )
-    return primary_structured.with_fallbacks([fallback_structured])
+    # Apply structured output to each model
+    structured_registry = {
+        name: llm.with_structured_output(schema, method="json_schema")
+        for name, llm in registry.items()
+    }
+    return _resolve_chain(structured_registry, config.primary_llm)
 
 
 class TradingSignal(BaseModel):

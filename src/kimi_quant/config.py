@@ -44,6 +44,9 @@ class Config:
     )
 
     # --- LLM Parameters ---
+    primary_llm: str = field(
+        default_factory=lambda: os.getenv("PRIMARY_LLM", "kimi")
+    )  # "kimi" or "deepseek" — which model to try first
     llm_temperature: float = field(
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1"))
     )
