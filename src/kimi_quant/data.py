@@ -266,26 +266,31 @@ class DataProvider:
     # ─── Market Snapshot ─────────────────────────────────────────────────
 
     def get_market_snapshot(self) -> MarketSnapshot:
-        """Fetch current market snapshot."""
-        info = self._info_local
-        meta = info.meta()
-        all_mids = info.all_mids()
+        """Fetch current market snapshot.
 
-        coin_meta = None
-        for asset in meta["universe"]:
+        Always uses mainnet for market data (testnet returns zeros for
+        mark/oracle/OI). Uses meta_and_asset_ctxs() for full field coverage.
+        """
+        info = self._info_mainnet
+        meta, asset_ctxs = info.meta_and_asset_ctxs()
+
+        # Find BTC in both universe (for name lookup) and asset contexts
+        coin_ctx = None
+        for i, asset in enumerate(meta["universe"]):
             if asset["name"] == self.coin:
-                coin_meta = asset
+                coin_ctx = asset_ctxs[i]
                 break
 
-        if coin_meta is None:
+        if coin_ctx is None:
             raise ValueError(f"Coin {self.coin} not found in universe")
 
-        mid_price = float(all_mids.get(self.coin, 0))
-        mark_price = float(coin_meta.get("markPx", 0))
-        oracle_price = float(coin_meta.get("oraclePx", 0))
-        funding_rate = float(coin_meta.get("funding", 0))
-        open_interest = float(coin_meta.get("openInterest", 0))
-        prev_day_px = float(coin_meta.get("prevDayPx", 0))
+        mid_price = float(coin_ctx.get("midPx", 0))
+        mark_price = float(coin_ctx.get("markPx", 0))
+        oracle_price = float(coin_ctx.get("oraclePx", 0))
+        funding_rate = float(coin_ctx.get("funding", 0))
+        open_interest = float(coin_ctx.get("openInterest", 0))
+        prev_day_px = float(coin_ctx.get("prevDayPx", 0))
+        premium = float(coin_ctx.get("premium", 0))
 
         l2 = info.l2_snapshot(self.coin)
         bid_price = float(l2["levels"][0][0]["px"]) if l2["levels"][0] else 0
@@ -300,7 +305,6 @@ class DataProvider:
             if prev_day_px
             else 0
         )
-        premium = mark_price - oracle_price
 
         return MarketSnapshot(
             coin=self.coin,
@@ -321,8 +325,11 @@ class DataProvider:
         )
 
     def get_order_book_depth(self, levels: int = 10) -> OrderBookDepth:
-        """Fetch order book with aggregated depth."""
-        info = self._info_local
+        """Fetch order book with aggregated depth.
+
+        Always uses mainnet (testnet order books are too thin to analyze).
+        """
+        info = self._info_mainnet
         l2 = info.l2_snapshot(self.coin)
 
         bids = []
