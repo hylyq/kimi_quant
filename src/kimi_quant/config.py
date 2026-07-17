@@ -47,6 +47,9 @@ class Config:
     primary_llm: str = field(
         default_factory=lambda: os.getenv("PRIMARY_LLM", "kimi")
     )  # "kimi" or "deepseek" — which model to try first
+    reasoning_effort: str = field(
+        default_factory=lambda: os.getenv("REASONING_EFFORT", "max")
+    )  # "max" | "high" | "medium" | "low" | "minimal" | "off"
     llm_temperature: float = field(
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1"))
     )

@@ -21,10 +21,38 @@ logger = logging.getLogger(__name__)
 # ─── LLM Factory with Fallback ────────────────────────────────────────────
 
 
+def _model_kwargs_for(provider: str) -> dict[str, Any]:
+    """Build model-specific extra kwargs based on REASONING_EFFORT config.
+
+    Translates the unified REASONING_EFFORT setting into each provider's
+    native API format.
+
+    Kimi K3: top-level reasoning_effort (currently only "max" supported).
+    DeepSeek: thinking.type (enabled/disabled) for V3 reasoning mode.
+    """
+    effort = config.reasoning_effort.lower()
+
+    if provider == "kimi":
+        # Kimi K3: only "max" is supported currently
+        if effort == "max":
+            return {"reasoning_effort": "max"}
+        # Other values: omit the param (K3 always reasons by default)
+        return {}
+
+    elif provider == "deepseek":
+        if effort == "off":
+            return {"thinking": {"type": "disabled"}}
+        # "max", "high", etc. → enable thinking
+        return {"thinking": {"type": "enabled"}}
+
+    return {}
+
+
 def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
     """Build available LLM instances keyed by provider name.
 
     Only includes models whose API key is configured.
+    Each model gets provider-specific model_kwargs for reasoning control.
     """
     registry: dict[str, ChatOpenAI] = {}
 
@@ -36,6 +64,7 @@ def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
             model=config.kimi_model,
             temperature=temp,
             max_tokens=tokens,
+            model_kwargs=_model_kwargs_for("kimi"),
         )
 
     # DeepSeek
@@ -46,26 +75,26 @@ def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
             model=config.deepseek_model,
             temperature=temp,
             max_tokens=tokens,
+            model_kwargs=_model_kwargs_for("deepseek"),
         )
 
     return registry
 
 
 def _resolve_chain(
-    registry: dict[str, ChatOpenAI],
+    registry: dict[str, Any],
     primary_name: str,
-) -> ChatOpenAI:
+) -> Any:
     """Build a primary→fallback chain from the model registry.
 
     Args:
-        registry: Available models keyed by name.
+        registry: Available runnables keyed by provider name.
         primary_name: Which model to try first.
 
     Returns:
-        A ChatOpenAI (possibly with_fallbacks) ready to use.
+        A Runnable (possibly with_fallbacks) ready to use.
     """
     if primary_name not in registry:
-        # Configured primary not available — use first available
         available = list(registry.keys())
         logger.warning(
             "Primary '%s' not available (missing API key?), using '%s'",
@@ -77,13 +106,11 @@ def _resolve_chain(
     fallbacks = [llm for name, llm in registry.items() if name != primary_name]
 
     if not fallbacks:
-        logger.info("LLM: %s(%s) only (no fallback configured)",
-                     primary_name, primary.model_name)
+        logger.info("LLM: %s only (no fallback configured)", primary_name)
         return primary
 
-    fb_names = ", ".join(f"{n}({llm.model_name})" for n, llm in registry.items() if n != primary_name)
-    logger.info("LLM: %s(%s) primary → fallback: %s",
-                primary_name, primary.model_name, fb_names)
+    fb_names = ", ".join(n for n in registry if n != primary_name)
+    logger.info("LLM: %s primary → fallback: %s", primary_name, fb_names)
     return primary.with_fallbacks(fallbacks)
 
 
