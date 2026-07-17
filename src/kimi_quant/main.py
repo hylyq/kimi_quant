@@ -148,12 +148,24 @@ def _validate_and_execute(
     executor: TradeExecutor,
 ) -> dict:
     """Risk validation + trade execution — shared by all strategies."""
+
+    # Sync tracker with on-chain state:
+    # If on-chain shows no position but tracker thinks we have one,
+    # the position was closed (SL/TP filled or manual close) → clear tracker.
+    account = report.get("account")
     current_size = 0.0
     current_side = "none"
-    account = report.get("account")
     if account:
         current_size = account.position_size
         current_side = account.position_side
+        if current_side == "none" and executor.tracker.has_position():
+            logger.warning(
+                "Tracker has position but on-chain shows none — "
+                "SL/TP likely filled. Clearing tracker."
+            )
+            executor.tracker.clear()
+
+    logger.info("Position: %s", executor.tracker.to_summary())
 
     risk_check = risk.validate(signal_result, current_size, current_side)
     if not risk_check.passed:
@@ -166,7 +178,8 @@ def _validate_and_execute(
         }
 
     result = executor.execute(signal_result)
-    logger.info("Execution result: %s", result)
+    logger.info("Execution result: %s | Position: %s",
+                result, executor.tracker.to_summary())
 
     return {
         "status": "executed" if result.get("executed") else "failed",

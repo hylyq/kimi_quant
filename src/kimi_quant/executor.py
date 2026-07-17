@@ -8,9 +8,11 @@ Wraps the full Hyperliquid SDK's order capabilities:
   - Order modification (move SL to breakeven, etc.)
   - Schedule cancel (dead man's switch)
   - Isolated margin management
+  - Order state tracking (oids preserved across cycles)
 """
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from eth_account import Account
@@ -23,21 +25,118 @@ from kimi_quant.llm import TradingSignal
 logger = logging.getLogger(__name__)
 
 
+# ─── Order State Tracking ────────────────────────────────────────────────
+
+
+@dataclass
+class PositionTracker:
+    """Tracks the current position and related order IDs across cycles.
+
+    This is the bridge between LLM decisions and actual order modification:
+      - After _open_position(), oids are parsed from the response and stored
+      - When the LLM issues MODIFY_SL, _handle_modify_sl() uses the stored oid
+      - On CLOSE or fill events, the tracker is cleared
+    """
+
+    coin: str = ""
+    side: str = "none"  # "long" | "short" | "none"
+    size: float = 0.0
+    entry_price: float = 0.0
+
+    # Order IDs from the last open — needed for modification
+    entry_oid: int | None = None
+    sl_oid: int | None = None
+    tp_oid: int | None = None
+
+    def has_position(self) -> bool:
+        return self.side != "none" and self.size > 0
+
+    def clear(self) -> None:
+        """Reset tracker after position is closed."""
+        self.side = "none"
+        self.size = 0.0
+        self.entry_price = 0.0
+        self.entry_oid = None
+        self.sl_oid = None
+        self.tp_oid = None
+
+    def update_from_open(
+        self,
+        side: str,
+        size: float,
+        entry_price: float | None,
+        oids: dict[str, int | None],
+    ) -> None:
+        """Record a new position and its associated order IDs."""
+        self.coin = config.trading_pair
+        self.side = side
+        self.size = size
+        self.entry_price = entry_price or 0.0
+        self.entry_oid = oids.get("entry")
+        self.sl_oid = oids.get("sl")
+        self.tp_oid = oids.get("tp")
+
+    def to_summary(self) -> str:
+        if not self.has_position():
+            return "No position"
+        return (
+            f"{self.side.upper()} {self.size:.4f} {self.coin} "
+            f"@ ${self.entry_price:.1f} "
+            f"(entry_oid={self.entry_oid}, sl_oid={self.sl_oid}, tp_oid={self.tp_oid})"
+        )
+
+
+def _parse_oids_from_result(result: Any, num_orders: int) -> dict[str, int | None]:
+    """Extract order IDs from a bulk_orders or order response.
+
+    The Hyperliquid API returns statuses with oids in order:
+      statuses[0] → entry order, statuses[1] → SL, statuses[2] → TP
+    """
+    oids: dict[str, int | None] = {"entry": None, "sl": None, "tp": None}
+    keys = ["entry", "sl", "tp"]
+
+    try:
+        statuses = None
+        if isinstance(result, dict):
+            statuses = (
+                result.get("response", {})
+                .get("data", {})
+                .get("statuses", [])
+            )
+        elif isinstance(result, list):
+            statuses = result
+
+        if statuses:
+            for i in range(min(len(statuses), num_orders, len(keys))):
+                s = statuses[i]
+                if isinstance(s, dict):
+                    # "resting" = limit/trigger order placed, "filled" = market order
+                    resting = s.get("resting", {})
+                    filled = s.get("filled", {})
+                    oid = resting.get("oid") or filled.get("oid")
+                    oids[keys[i]] = int(oid) if oid is not None else None
+    except Exception as e:
+        logger.warning("Failed to parse oids from result: %s", e)
+
+    logger.info("Parsed oids: %s", oids)
+    return oids
+
+
+# ─── Trade Executor ──────────────────────────────────────────────────────
+
+
 class TradeExecutor:
     """Executes trades on Hyperliquid based on validated signals.
 
-    Supports the full order lifecycle:
-      1. Open position (market or limit)
-      2. Attach STOP LOSS + TAKE PROFIT (atomic via bulk_orders)
-      3. Modify existing orders (e.g., move SL to breakeven)
-      4. Close position (market or limit)
-      5. Schedule cancel (dead man's switch)
-      6. Margin management
+    Maintains a PositionTracker to bridge LLM decisions and order
+    modification — the tracker stores order IDs from _open_position()
+    so that subsequent MODIFY_SL signals can target the right order.
     """
 
     def __init__(self):
         self.dry_run = config.dry_run
         self.coin = config.trading_pair
+        self.tracker = PositionTracker()
 
         if not self.dry_run:
             if not config.hl_private_key:
@@ -64,44 +163,57 @@ class TradeExecutor:
     # ─── Main entry point ────────────────────────────────────────────────
 
     def execute(self, signal: TradingSignal) -> dict:
-        """Execute a trading signal."""
+        """Execute a trading signal.
+
+        Returns a dict with execution results including the updated
+        PositionTracker summary.
+        """
+        result: dict = {}
+
         if signal.action == "HOLD":
             logger.info("HOLD — no action taken")
-            return {"action": "HOLD", "executed": False,
-                    "reason": signal.reasoning}
+            result = {"action": "HOLD", "executed": False,
+                      "reason": signal.reasoning}
 
-        if signal.action == "CLOSE":
-            return self._close_position()
+        elif signal.action == "CLOSE":
+            result = self._close_position()
 
-        if signal.action == "MODIFY_SL":
-            return self._handle_modify_sl(signal)
+        elif signal.action == "MODIFY_SL":
+            result = self._handle_modify_sl(signal)
 
-        if signal.action in ("LONG", "SHORT"):
-            return self._open_position(signal, is_buy=(signal.action == "LONG"))
+        elif signal.action in ("LONG", "SHORT"):
+            result = self._open_position(
+                signal, is_buy=(signal.action == "LONG")
+            )
 
-        return {"action": signal.action, "executed": False,
-                "reason": f"Unknown action: {signal.action}"}
+        else:
+            result = {"action": signal.action, "executed": False,
+                      "reason": f"Unknown action: {signal.action}"}
+
+        # Attach current tracker state to every result
+        result["position"] = self.tracker.to_summary()
+        return result
 
     # ─── Open Position ───────────────────────────────────────────────────
 
     def _open_position(self, signal: TradingSignal, is_buy: bool) -> dict:
         """Open a position with stop loss and take profit.
 
-        Uses bulk_orders for atomic execution:
-          order_0: open position (market or limit)
-          order_1: stop loss trigger
-          order_2: take profit trigger
+        Uses bulk_orders for atomic execution, then parses and stores
+        the returned order IDs in the tracker — enabling later MODIFY_SL.
         """
         size = signal.size or config.max_position_size
-        side = "BUY" if is_buy else "SELL"
+        side = "long" if is_buy else "short"
+        side_label = "BUY" if is_buy else "SELL"
 
         if self.dry_run:
             logger.info(
                 "DRY RUN: %s %.4f %s | SL=$%.1f TP=$%.1f",
-                side, size, self.coin,
+                side_label, size, self.coin,
                 signal.stop_loss or 0,
                 signal.take_profit or 0,
             )
+            self.tracker.update_from_open(side, size, signal.entry_price, {})
             return {
                 "action": signal.action,
                 "executed": True,
@@ -118,20 +230,18 @@ class TradeExecutor:
             # 1. Set leverage
             self.exchange.update_leverage(config.max_leverage, self.coin)
 
-            # 2. Build the orders list
+            # 2. Build orders & execute
             orders = self._build_entry_orders(signal, is_buy, size)
+            num_orders = len(orders)
 
-            # 3. Execute atomically with bulk_orders
-            # grouping="positionTpsl" links SL/TP to the position
-            if len(orders) > 1:
+            if num_orders > 1:
                 result = self.exchange.bulk_orders(
                     orders, grouping="positionTpsl"
                 )
                 logger.info(
-                    "Bulk order placed (%d orders): open + SL + TP", len(orders)
+                    "Bulk order placed (%d orders): open + SL + TP", num_orders
                 )
             else:
-                # Single order (no SL/TP)
                 result = self.exchange.order(
                     name=orders[0]["coin"],
                     is_buy=orders[0]["is_buy"],
@@ -141,7 +251,10 @@ class TradeExecutor:
                 )
                 logger.info("Single order placed (no SL/TP)")
 
-            logger.info("Result: %s", result)
+            # 3. Parse order IDs from response and update tracker
+            oids = _parse_oids_from_result(result, num_orders)
+            self.tracker.update_from_open(side, size, signal.entry_price, oids)
+            logger.info("Position tracker updated: %s", self.tracker.to_summary())
 
             return {
                 "action": signal.action,
@@ -149,6 +262,7 @@ class TradeExecutor:
                 "dry_run": False,
                 "side": side,
                 "size": size,
+                "oids": oids,
                 "result": result,
                 "reasoning": signal.reasoning,
             }
@@ -165,35 +279,30 @@ class TradeExecutor:
     def _build_entry_orders(
         self, signal: TradingSignal, is_buy: bool, size: float
     ) -> list[dict]:
-        """Build the order request list for atomic open + SL + TP.
-
-        Returns a list of order dicts for bulk_orders.
-        """
+        """Build the order request list for atomic open + SL + TP."""
         orders: list[dict] = []
 
         # Order 0: Open position
         if signal.entry_price:
-            open_order = {
+            orders.append({
                 "coin": self.coin,
                 "is_buy": is_buy,
                 "sz": size,
                 "limit_px": signal.entry_price,
                 "order_type": {"limit": {"tif": "Gtc"}},
                 "reduce_only": False,
-            }
+            })
         else:
-            # Market orders use limit_px with a generous price
-            open_order = {
+            orders.append({
                 "coin": self.coin,
                 "is_buy": is_buy,
                 "sz": size,
                 "limit_px": signal.entry_price or 0,
                 "order_type": {"limit": {"tif": "Ioc"}},
                 "reduce_only": False,
-            }
-        orders.append(open_order)
+            })
 
-        # Order 1: Stop Loss (trigger, market execution)
+        # Order 1: Stop Loss
         if signal.stop_loss:
             orders.append({
                 "coin": self.coin,
@@ -210,7 +319,7 @@ class TradeExecutor:
                 "reduce_only": True,
             })
 
-        # Order 2: Take Profit (trigger, market execution)
+        # Order 2: Take Profit
         if signal.take_profit:
             orders.append({
                 "coin": self.coin,
@@ -239,14 +348,16 @@ class TradeExecutor:
     # ─── Close Position ──────────────────────────────────────────────────
 
     def _close_position(self) -> dict:
-        """Close the current position (market close)."""
+        """Close the current position and clear the tracker."""
         if self.dry_run:
             logger.info("DRY RUN: Would close %s position", self.coin)
+            self.tracker.clear()
             return {"action": "CLOSE", "executed": True, "dry_run": True}
 
         try:
             result = self.exchange.market_close(self.coin)
             logger.info("Position closed: %s", result)
+            self.tracker.clear()
             return {
                 "action": "CLOSE",
                 "executed": True,
@@ -268,17 +379,19 @@ class TradeExecutor:
         try:
             result = self.exchange.cancel(self.coin, oid)
             logger.info("Order #%d cancelled", oid)
+            if oid == self.tracker.entry_oid:
+                self.tracker.entry_oid = None
+            elif oid == self.tracker.sl_oid:
+                self.tracker.sl_oid = None
+            elif oid == self.tracker.tp_oid:
+                self.tracker.tp_oid = None
             return {"action": "cancel", "executed": True, "result": result}
         except Exception as e:
             logger.error("Failed to cancel order #%d: %s", oid, e)
             return {"action": "cancel", "executed": False, "error": str(e)}
 
     def cancel_by_cloid(self, cloid: str) -> dict:
-        """Cancel an order by client-assigned order ID (cloid).
-
-        Prefer this over cancel_order() when you set a cloid at order
-        creation — it's more reliable since you control the ID.
-        """
+        """Cancel an order by client-assigned order ID (cloid)."""
         if self.dry_run:
             logger.info("DRY RUN: Cancel order cloid=%s", cloid)
             return {"action": "cancel", "executed": True, "dry_run": True}
@@ -292,11 +405,7 @@ class TradeExecutor:
             return {"action": "cancel", "executed": False, "error": str(e)}
 
     def cancel_by_cloids(self, cloids: list[str]) -> dict:
-        """Cancel multiple orders by their client-assigned IDs (cloïds).
-
-        More reliable than bulk_cancel by oid — cloïds are under your control
-        so there's no risk of cancelling the wrong order.
-        """
+        """Cancel multiple orders by their client-assigned IDs."""
         if self.dry_run:
             logger.info("DRY RUN: Cancel %d orders by cloid", len(cloids))
             return {"action": "cancel_bulk", "executed": True, "dry_run": True}
@@ -311,18 +420,16 @@ class TradeExecutor:
             return {"action": "cancel_bulk", "executed": False, "error": str(e)}
 
     def cancel_all_orders(self) -> dict:
-        """Cancel ALL open orders for the trading pair.
-
-        Useful on shutdown or before opening a new position to ensure
-        no stale orders remain.
-        """
+        """Cancel ALL open orders for the trading pair."""
         if self.dry_run:
             logger.info("DRY RUN: Cancel all %s orders", self.coin)
+            self.tracker.clear()
             return {"action": "cancel_all", "executed": True, "dry_run": True}
 
         try:
             orders = self.exchange.bulk_cancel(self.coin)
             logger.info("Cancelled %d orders", len(orders) if orders else 0)
+            self.tracker.clear()
             return {"action": "cancel_all", "executed": True, "result": orders}
         except Exception as e:
             logger.error("Failed to cancel all orders: %s", e)
@@ -339,11 +446,7 @@ class TradeExecutor:
         order_type: dict,
         reduce_only: bool = False,
     ) -> dict:
-        """Modify any existing order — limit, trigger, or otherwise.
-
-        This is the general-purpose wrapper. For common operations,
-        use the specialized helpers below.
-        """
+        """Modify any existing order — limit, trigger, or otherwise."""
         if self.dry_run:
             logger.info("DRY RUN: Modify order #%d", oid)
             return {"action": "modify_order", "executed": True, "dry_run": True}
@@ -367,11 +470,7 @@ class TradeExecutor:
     def modify_stop_loss(
         self, oid: int, new_price: float, is_buy: bool, size: float
     ) -> dict:
-        """Move an existing stop loss to a new price.
-
-        Convenience wrapper around modify_order() for the common
-        case of trailing a stop or moving to breakeven.
-        """
+        """Move an existing stop loss to a new price."""
         return self.modify_order(
             oid=oid,
             is_buy=is_buy,
@@ -407,14 +506,7 @@ class TradeExecutor:
         )
 
     def modify_orders(self, modifications: list[dict]) -> dict:
-        """Modify multiple orders in a single atomic request.
-
-        Each modification is a dict:
-          {oid: int, order: {coin, is_buy, sz, limit_px, order_type, reduce_only}}
-
-        Useful when you need to simultaneously move both SL and TP,
-        or modify multiple positions at once.
-        """
+        """Modify multiple orders in a single atomic request."""
         if not modifications:
             return {"action": "modify_bulk", "executed": False,
                     "reason": "Empty modification list"}
@@ -445,43 +537,54 @@ class TradeExecutor:
             logger.error("Failed to bulk modify orders: %s", e)
             return {"action": "modify_bulk", "executed": False, "error": str(e)}
 
+    # ─── LLM-triggered Stop Loss Modification ────────────────────────────
+
     def _handle_modify_sl(self, signal: TradingSignal) -> dict:
-        """Move stop loss to a new price.
+        """Move stop loss to a new price — driven by LLM MODIFY_SL signal.
 
-        Used when the LLM wants to trail the stop or move to breakeven.
-        Requires the current stop loss order ID — in a real implementation
-        this would be tracked from the last _open_position result.
-
-        For now, this is a best-effort operation that logs the intent.
+        Uses the tracked sl_oid from the last _open_position() call.
+        This is the bridge: LLM says MODIFY_SL → we know which order to touch.
         """
         new_sl = signal.modify_sl_to or signal.stop_loss
         if new_sl is None:
             return {"action": "MODIFY_SL", "executed": False,
                     "reason": "No new stop loss price provided"}
 
-        logger.info(
-            "MODIFY_SL: move stop loss to $%.1f (reason: %s)",
-            new_sl, signal.reasoning[:80],
-        )
+        if not self.tracker.has_position():
+            return {"action": "MODIFY_SL", "executed": False,
+                    "reason": "No active position to modify"}
+
+        sl_oid = self.tracker.sl_oid
 
         if self.dry_run:
             return {
                 "action": "MODIFY_SL",
                 "executed": True,
                 "dry_run": True,
+                "sl_oid": sl_oid,
                 "new_sl": new_sl,
                 "reasoning": signal.reasoning,
             }
 
-        return {
-            "action": "MODIFY_SL",
-            "executed": False,
-            "reason": (
-                "MODIFY_SL requires the existing stop loss order ID. "
-                "Track oid from _open_position result and call modify_stop_loss()."
-            ),
-            "new_sl": new_sl,
-        }
+        if sl_oid is None:
+            return {"action": "MODIFY_SL", "executed": False,
+                    "reason": (
+                        "No tracked SL order ID. "
+                        "The position may have been opened without a stop loss, "
+                        "or the SL order was already filled/cancelled."
+                    )}
+
+        logger.info(
+            "MODIFY_SL: moving SL #%d to $%.1f (reason: %s)",
+            sl_oid, new_sl, signal.reasoning[:80],
+        )
+
+        return self.modify_stop_loss(
+            oid=sl_oid,
+            new_price=new_sl,
+            is_buy=(self.tracker.side == "short"),  # SL is opposite direction
+            size=self.tracker.size,
+        )
 
     # ─── Margin Management ───────────────────────────────────────────────
 
@@ -504,7 +607,7 @@ class TradeExecutor:
     # ─── Dead Man's Switch ───────────────────────────────────────────────
 
     def schedule_cancel(self, timeout_seconds: int = 300) -> dict:
-        """Schedule auto-cancel of all orders after timeout (dead man's switch).
+        """Schedule auto-cancel of all orders after timeout.
 
         If the bot crashes, all open orders are automatically cancelled
         after `timeout_seconds`. Call this periodically to reset the timer.
