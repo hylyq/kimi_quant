@@ -1,6 +1,12 @@
 # Kimi Quant 🚀
 
-**BTC 永续合约量化交易程序** — 基于 Kimi K3 大模型的智能交易决策系统，运行于 Hyperliquid 去中心化交易所。
+**BTC 永续合约量化交易程序** — 基于大模型的智能交易决策系统，运行于 Hyperliquid 去中心化交易所。
+
+- 🧠 **双模型容灾**：Kimi K3 + DeepSeek V3，一键切换主备，自动降级
+- 🛡️ **六层风控**：熔断、置信度、仓位、止损距离、方向、降级保护
+- 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
+- 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + Judge 裁决）
+- 📝 **完整记录**：交易盈亏 + 辩论历史 JSONL 持久化，支持并发读写
 
 ## 目录
 
@@ -69,6 +75,65 @@
 | 结构化输出 | Pydantic + LangChain json_schema |
 | 交易执行 | hyperliquid-python-sdk (15/15 全覆盖) |
 
+## LLM 模型配置
+
+### 双模型容灾架构
+
+```
+每个 LLM 调用 ──▶ 主模型 ──成功──▶ 返回
+                    │
+                    │ 失败 (超时/429/5xx/余额)
+                    ▼
+                 备用模型 ──成功──▶ 返回
+                    │
+                    │ 也失败
+                    ▼
+               raise → 上层处理
+```
+
+- 主备切换对策略代码完全透明，无需改动任何业务逻辑
+- 启动日志会明确显示当前链路：`LLM: kimi primary → fallback: deepseek`
+
+### 模型选择
+
+```bash
+# .env
+
+# 方案 1: Kimi 主 → DeepSeek 备 (默认，推荐)
+PRIMARY_LLM=kimi
+MOONSHOT_API_KEY=sk-your-kimi-key
+DEEPSEEK_API_KEY=sk-your-deepseek-key
+
+# 方案 2: DeepSeek 主 → Kimi 备 (省钱，费用约 Kimi 的 1/10)
+PRIMARY_LLM=deepseek
+
+# 方案 3: 仅 Kimi (不配 DeepSeek key 即可)
+# 方案 4: 仅 DeepSeek (不配 Kimi key 即可)
+```
+
+### 推理强度控制
+
+一个 `REASONING_EFFORT` 变量，自动转换为各模型的原生 API 格式：
+
+```bash
+REASONING_EFFORT=max      # 最强推理 (默认)
+REASONING_EFFORT=high     # 高推理
+REASONING_EFFORT=medium   # 中等
+REASONING_EFFORT=low      # 低推理
+REASONING_EFFORT=minimal  # 最小推理
+REASONING_EFFORT=off      # 关闭推理，大幅节省 token
+```
+
+底层转换：
+
+| 配置 | Kimi K3 | DeepSeek V3 |
+|------|---------|-------------|
+| `max` | `reasoning_effort: "max"` | `thinking: enabled` |
+| `high` ~ `minimal` | 不传参（K3 仅支持 max） | `thinking: enabled` |
+| `off` | 不传参 | `thinking: disabled` |
+
+**费用影响**：推理 token 占输出 80%。`REASONING_EFFORT=off` 每次调用可节省约 **75% 输出费用**。适合高频轮询或低成本模式。
+
 ## 快速开始
 
 ### 环境要求
@@ -91,7 +156,8 @@ cp .env.example .env
 编辑 `.env`，最少只需要填一个 API Key：
 
 ```bash
-MOONSHOT_API_KEY=sk-your-key-here    # 必填：Kimi API Key
+MOONSHOT_API_KEY=sk-your-key-here    # 必填（Kimi 或 DeepSeek 至少一个）
+# DEEPSEEK_API_KEY=sk-...           # 可选，配置后自动作为降级备份
 ```
 
 其他配置保持默认即可（dry-run 模式，不涉及真实资金）。
@@ -102,11 +168,15 @@ MOONSHOT_API_KEY=sk-your-key-here    # 必填：Kimi API Key
 # 单次分析（验证环境正常）
 uv run kimi-quant --once
 
-# 连续交易循环（dry-run，每 5 分钟一次）
+# 连续交易循环（dry-run，默认 10 分钟间隔）
 uv run kimi-quant
 
 # 使用辩论模式
-uv run kimi-quant --mode debate --interval 300
+uv run kimi-quant --mode debate
+
+# 启动日志会显示模型链路
+# LLM: kimi only (no fallback configured)
+# LLM: kimi primary → fallback: deepseek
 
 # 查看盈亏统计
 uv run kimi-quant --stats
@@ -351,16 +421,20 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 |------|--------|------|
 | **必填** | | |
 | `MOONSHOT_API_KEY` | — | Kimi API Key ([获取地址](https://platform.moonshot.cn)) |
-| **Kimi/LLM** | | |
+| **Kimi (Moonshot)** | | |
+| `MOONSHOT_API_KEY` | — | Kimi API Key |
 | `MOONSHOT_BASE_URL` | `https://api.moonshot.cn/v1` | API 端点 |
 | `KIMI_MODEL` | `kimi-k3` | 模型名称 |
+| **DeepSeek (可选备份)** | | 自动降级 |
+| `DEEPSEEK_API_KEY` | — | DeepSeek API Key（留空仅用 Kimi） |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | API 端点 |
+| `DEEPSEEK_MODEL` | `deepseek-v3.1` | 模型名称 |
+| **LLM 参数** | | |
+| `PRIMARY_LLM` | `kimi` | 主模型：`kimi` 或 `deepseek` |
+| `REASONING_EFFORT` | `max` | 推理强度：`max`/`high`/`medium`/`low`/`minimal`/`off` |
 | `LLM_TEMPERATURE` | `0.1` | LLM 温度 (0-2) |
-| `LLM_MAX_TOKENS` | `2048` | 最大**输出** token（不影响 1M 上下文输入） |
+| `LLM_MAX_TOKENS` | `2048` | 最大输出 token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
-| **DeepSeek (可选)** | | 自动降级备份 |
-| `DEEPSEEK_API_KEY` | — | DeepSeek API Key（留空则仅用 Kimi） |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek API 端点 |
-| `DEEPSEEK_MODEL` | `deepseek-v3.1` | DeepSeek 模型 |
 | **Hyperliquid** | | |
 | `HYPERLIQUID_PRIVATE_KEY` | — | 钱包私钥（实盘必填） |
 | `HYPERLIQUID_TESTNET` | `true` | `true`=测试网, `false`=主网 |
@@ -372,7 +446,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `MAX_LEVERAGE` | `3` | 最大杠杆倍数 |
 | **策略** | | |
 | `STRATEGY_MODE` | `single` | `single` 或 `debate` |
-| `TRADING_INTERVAL` | `300` | 交易间隔（秒） |
+| `TRADING_INTERVAL` | `600` | 交易间隔（秒），10 分钟 |
 | `DRY_RUN` | `true` | 模拟模式开关 |
 | **日志** | | |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
@@ -592,7 +666,7 @@ kimi_quant/
 │   ├── __init__.py      # 包定义
 │   ├── config.py        # 配置管理（env + .env）
 │   ├── data.py          # 市场数据（Hyperliquid Info API + K线缓存 + ATR）
-│   ├── llm.py           # TradingSignal + Kimi K3 单 Agent
+│   ├── llm.py           # TradingSignal + 双模型容灾 (Kimi/DeepSeek)
 │   ├── debate.py        # Multi-Agent 辩论 + LangGraph Checkpointing
 │   ├── risk.py          # 六层风控校验 + 熔断状态机
 │   ├── executor.py      # 15/15 SDK 全覆盖 + PositionTracker 三态模型
@@ -610,27 +684,56 @@ kimi_quant/
 
 ## 常见问题
 
-### Q: API 费用多少钱？
+### Q: API 费用多少钱？怎么省钱？
 
-Kimi K3 定价（[官网](https://platform.moonshot.cn)）：输入 ¥20/1M tokens，输出 ¥100/1M tokens。
+**定价对比**（每 1M tokens）：
 
-| 模式 | 每周期 | 每天 (5min) | 每月 |
-|------|--------|-------------|------|
-| Single | ~¥0.08 | ~¥22 | ~¥660 |
-| Debate | ~¥0.17 | ~¥50 | ~¥1,500 |
+| 模型 | 输入 | 输出 | vs Kimi |
+|------|------|------|---------|
+| Kimi K3 | ¥20 | ¥100 | — |
+| DeepSeek V3 | ¥2 | ¥8 | **便宜 90%+** |
 
-**成本大头是输出**：¥100/1M output vs ¥20/1M input。Debate 72% 费用来自输出（4 次 LLM 各自生成论证/裁决）。
+**月成本估算**（10 分钟间隔，Single 模式）：
 
-**省钱策略**：
+| 配置 | 月成本 |
+|------|--------|
+| Kimi K3 | ~¥330 |
+| DeepSeek V3 | ~¥40 |
+| Kimi + DeepSeek 备份 | ~¥330（仅 Kimi 可用时） |
 
-| 策略 | 效果 |
-|------|------|
-| 加大间隔 `TRADING_INTERVAL=600` | 日成本减半 |
-| 默认用 Single 模式 | 费用是 Debate 的 1/4 |
-| `TRADING_INTERVAL=900` + Single | 月成本 ~¥220 |
-| Debate 仅在市场高波动/信号矛盾时手动触发 | 按需付费 |
+**省钱三板斧**：
 
-推荐起步配置：`STRATEGY_MODE=single TRADING_INTERVAL=600`，月成本约 ¥330。
+| 策略 | .env 配置 | 效果 |
+|------|----------|------|
+| 用 DeepSeek 主力 | `PRIMARY_LLM=deepseek` | 月成本 ¥330→¥40 |
+| 关推理 | `REASONING_EFFORT=off` | 输出费用再降 75% |
+| 加大间隔 | `TRADING_INTERVAL=900` | 成本再降 1/3 |
+
+**极限省钱方案**：`PRIMARY_LLM=deepseek + REASONING_EFFORT=off + TRADING_INTERVAL=900`，月成本约 **¥10**。
+
+### Q: 如何切换主/备模型？
+
+一个环境变量：
+
+```bash
+PRIMARY_LLM=kimi      # Kimi 主力，DeepSeek 备份（默认）
+PRIMARY_LLM=deepseek  # DeepSeek 主力，Kimi 备份（省钱）
+```
+
+只需配好两个模型的 API Key，主模型挂了自动切备机。不需改任何代码。见 [LLM 模型配置](#llm-模型配置)。
+
+### Q: Kimi API 挂了怎么办？
+
+配置 `DEEPSEEK_API_KEY` 即可。Kimi 调用失败时自动切换到 DeepSeek V3，无需人工干预。日志会显示 `LLM: kimi primary → fallback: deepseek`。未配置则仅用 Kimi。
+
+### Q: 推理强度 (REASONING_EFFORT) 怎么调？
+
+```bash
+REASONING_EFFORT=max      # 最强分析（默认，推荐交易用）
+REASONING_EFFORT=off      # 关闭推理，最快最省
+```
+
+推理 token 通常占输出 80%。设为 `off` 可节省约 75% 输出费用。日常监控或低成本模式推荐 `off`，关键交易建议 `max`。详见 [推理强度控制](#推理强度控制)。
 
 ### Q: 我只有 OKX Web3 钱包，能用吗？
 
@@ -679,10 +782,6 @@ uv run kimi-quant --history
 # 查看最新交易
 tail -5 data/trades.jsonl | python -m json.tool
 ```
-
-### Q: Kimi API 挂了怎么办？
-
-配置 `DEEPSEEK_API_KEY` 即可启用自动降级。Kimi 调用失败时自动切换到 DeepSeek V3，无需人工干预。日志会标注使用的是哪个模型。未配置 DeepSeek 时仅用 Kimi。
 
 ### Q: 辩论历史存在哪里？重启后能恢复吗？
 
