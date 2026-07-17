@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from kimi_quant.analytics import TradeLogger
 from kimi_quant.config import config
 from kimi_quant.data import DataProvider
 from kimi_quant.executor import TradeExecutor
@@ -53,6 +54,7 @@ def run_once_single(
     data: DataProvider,
     risk: RiskManager,
     executor: TradeExecutor,
+    trade_logger: TradeLogger,
 ) -> dict:
     """Single-agent analysis → risk check → execute."""
     logger.info("=" * 50)
@@ -72,6 +74,11 @@ def run_once_single(
             market.day_change_pct,
         )
 
+    # Inject performance context for LLM self-reflection
+    perf_ctx = trade_logger.get_llm_context()
+    if perf_ctx:
+        report["performance_context"] = perf_ctx
+
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
 
@@ -79,7 +86,7 @@ def run_once_single(
         logger.warning("LLM returned no signal, skipping cycle")
         return {"status": "skipped", "reason": "LLM returned None"}
 
-    return _validate_and_execute(signal_result, report, risk, executor)
+    return _validate_and_execute(signal_result, report, risk, executor, trade_logger)
 
 
 # ─── Multi-Agent Debate Strategy ────────────────────────────────────────────
@@ -90,13 +97,9 @@ def run_once_debate(
     data: DataProvider,
     risk: RiskManager,
     executor: TradeExecutor,
+    trade_logger: TradeLogger,
 ) -> dict:
-    """Multi-agent debate → risk check → execute.
-
-    The strategy object is persistent across cycles — its checkpointer
-    automatically saves each cycle's full state (market data, all three
-    arguments, judge verdict) to the database.
-    """
+    """Multi-agent debate → risk check → execute."""
     logger.info("=" * 50)
     logger.info("Starting trading cycle [mode: multi-agent debate]")
 
@@ -114,6 +117,11 @@ def run_once_debate(
             market.day_change_pct,
         )
 
+    # Inject performance context
+    perf_ctx = trade_logger.get_llm_context()
+    if perf_ctx:
+        report["performance_context"] = perf_ctx
+
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)
 
@@ -129,7 +137,7 @@ def run_once_debate(
     logger.info("Debate transcript (Bear): %s", transcript["bear"][:120])
     logger.info("Debate transcript (Hold): %s", transcript["hold"][:120])
 
-    result = _validate_and_execute(signal_result, report, risk, executor)
+    result = _validate_and_execute(signal_result, report, risk, executor, trade_logger)
     result["transcript"] = {
         "bull": transcript["bull"],
         "bear": transcript["bear"],
@@ -146,12 +154,13 @@ def _validate_and_execute(
     report: dict,
     risk: RiskManager,
     executor: TradeExecutor,
+    trade_logger: TradeLogger,
 ) -> dict:
     """Risk validation + trade execution — shared by all strategies."""
 
     # Sync tracker with on-chain state:
     # If on-chain shows no position but tracker thinks we have one,
-    # the position was closed (SL/TP filled or manual close) → clear tracker.
+    # the position was closed (SL/TP filled or manual close) → record trade.
     account = report.get("account")
     current_size = 0.0
     current_side = "none"
@@ -161,8 +170,9 @@ def _validate_and_execute(
         if current_side == "none" and executor.tracker.has_position():
             logger.warning(
                 "Tracker has position but on-chain shows none — "
-                "SL/TP likely filled. Clearing tracker."
+                "SL/TP likely filled. Recording trade close."
             )
+            _record_close_from_chain(executor, trade_logger, report)
             executor.tracker.clear()
 
     logger.info("Position: %s", executor.tracker.to_summary())
@@ -177,9 +187,31 @@ def _validate_and_execute(
             "reason": risk_check.reason,
         }
 
+    # Pre-execution: record trade open intent
+    if signal_result.action in ("LONG", "SHORT") and not executor.dry_run:
+        trade_logger.open_trade(
+            side="long" if signal_result.action == "LONG" else "short",
+            size=signal_result.size or config.max_position_size,
+            entry_price=signal_result.entry_price or 0,
+        )
+
     result = executor.execute(signal_result)
     logger.info("Execution result: %s | Position: %s",
                 result, executor.tracker.to_summary())
+
+    # Post-execution: record trade close
+    if signal_result.action == "CLOSE" and result.get("executed"):
+        exit_price = _get_exit_price(report)
+        trade_logger.close_trade(exit_price, reason="signal")
+
+    # If position was opened but entry price unknown (market order),
+    # update from the chain data
+    if signal_result.action in ("LONG", "SHORT") and result.get("executed"):
+        if account and account.entry_price > 0:
+            pending = trade_logger._pending
+            if pending and pending.entry_price == 0:
+                pending.entry_price = account.entry_price
+                logger.info("Updated trade entry price from chain: $%.1f", account.entry_price)
 
     return {
         "status": "executed" if result.get("executed") else "failed",
@@ -188,6 +220,35 @@ def _validate_and_execute(
         "reasoning": signal_result.reasoning,
         "execution": result,
     }
+
+
+def _get_exit_price(report: dict) -> float:
+    """Extract current mid price as exit price from the market report."""
+    market = report.get("market")
+    if market:
+        return market.mid_price
+    return 0.0
+
+
+def _record_close_from_chain(
+    executor: TradeExecutor, trade_logger: TradeLogger, report: dict
+) -> None:
+    """Record a trade close detected from on-chain state (SL/TP filled)."""
+    market = report.get("market")
+    exit_price = market.mid_price if market else 0.0
+
+    # Try to determine if it was SL or TP based on price vs entry
+    entry = executor.tracker.entry_price
+    side = executor.tracker.side
+    if entry > 0 and exit_price > 0:
+        if side == "long":
+            reason = "take_profit" if exit_price > entry else "stop_loss"
+        else:
+            reason = "take_profit" if exit_price < entry else "stop_loss"
+    else:
+        reason = "manual"
+
+    trade_logger.close_trade(exit_price, reason=reason)
 
 
 # ─── Main Loop ───────────────────────────────────────────────────────────────
@@ -208,6 +269,15 @@ def run_loop():
     data = DataProvider()
     risk = RiskManager()
     executor = TradeExecutor()
+    trade_logger = TradeLogger()
+
+    # Log startup stats
+    stats = trade_logger.get_stats()
+    if stats.total_trades > 0:
+        logger.info(
+            "Loaded trade history: %d trades | Win Rate: %.1f%% | Net P&L: $%.2f",
+            stats.total_trades, stats.win_rate, stats.net_pnl,
+        )
 
     # Debate mode: create strategy ONCE with persistent checkpointer
     strategy = None
@@ -236,10 +306,10 @@ def run_loop():
         try:
             if mode == "debate":
                 assert strategy is not None
-                result = run_once_debate(strategy, data, risk, executor)
+                result = run_once_debate(strategy, data, risk, executor, trade_logger)
             else:
                 assert llm is not None
-                result = run_once_single(llm, data, risk, executor)
+                result = run_once_single(llm, data, risk, executor, trade_logger)
 
             result["cycle"] = cycle_count
             result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -270,10 +340,57 @@ def run_loop():
                 sleep_time -= 1
 
     logger.info("Shutting down. Total cycles: %d", cycle_count)
+
+    # Final stats
+    stats = trade_logger.get_stats()
+    if stats.total_trades > 0:
+        logger.info(
+            "Session P&L: %d trades | Win Rate: %.1f%% | Net P&L: $%.2f",
+            stats.total_trades, stats.win_rate, stats.net_pnl,
+        )
+
     if strategy is not None:
         strategy.close()
         logger.info("Checkpointer closed. States persisted to debate.db")
     logger.info("Session complete.")
+
+
+def cmd_stats():
+    """Print trade P&L statistics."""
+    trade_logger = TradeLogger()
+    stats = trade_logger.get_stats()
+
+    if stats.total_trades == 0:
+        print("No trade history found.")
+        return
+
+    print(f"=== Trading Performance ===")
+    print(f"Total Trades:    {stats.total_trades}")
+    print(f"Wins:            {stats.wins}")
+    print(f"Losses:          {stats.losses}")
+    print(f"Win Rate:        {stats.win_rate:.1f}%")
+    print(f"")
+    print(f"Gross P&L:       ${stats.total_pnl:+.2f}")
+    print(f"Total Fees:      ${stats.total_fees:.2f}")
+    print(f"Net P&L:         ${stats.net_pnl:+.2f}")
+    print(f"")
+    print(f"Avg Win:         ${stats.avg_win:+.2f}")
+    print(f"Avg Loss:        ${stats.avg_loss:+.2f}")
+    print(f"Largest Win:     ${stats.largest_win:+.2f}")
+    print(f"Largest Loss:    ${stats.largest_loss:+.2f}")
+    print(f"Profit Factor:   {stats.profit_factor:.2f}")
+    print()
+
+    # Recent trades
+    trades = trade_logger.get_all_trades()
+    print("=== Recent Trades ===")
+    for t in trades[-10:]:
+        print(
+            f"{t.opened_at[:19]} | {t.side.upper():5s} | "
+            f"in: ${t.entry_price:>8.1f} → out: ${t.exit_price:>8.1f} | "
+            f"P&L: ${t.pnl:+7.2f} ({t.pnl_pct:+.2f}%) | "
+            f"{t.close_reason}"
+        )
 
 
 def cmd_history():
@@ -337,10 +454,19 @@ def main():
         action="store_true",
         help="Print persisted debate history and exit",
     )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print trade P&L statistics and exit",
+    )
     args = parser.parse_args()
 
     if args.history:
         cmd_history()
+        return
+
+    if args.stats:
+        cmd_stats()
         return
 
     if args.interval:
@@ -353,18 +479,19 @@ def main():
         data = DataProvider()
         risk = RiskManager()
         executor = TradeExecutor()
+        trade_logger = TradeLogger()
 
         if config.strategy_mode == "debate":
             from kimi_quant.debate import DebateStrategy, create_checkpointer
             handle = create_checkpointer()
             strategy = DebateStrategy(checkpointer_handle=handle)
             try:
-                result = run_once_debate(strategy, data, risk, executor)
+                result = run_once_debate(strategy, data, risk, executor, trade_logger)
             finally:
                 strategy.close()
         else:
             llm = KimiLLM()
-            result = run_once_single(llm, data, risk, executor)
+            result = run_once_single(llm, data, risk, executor, trade_logger)
 
         print(_json.dumps(result, indent=2, default=str))
     else:

@@ -96,6 +96,11 @@ def build_market_prompt(market_data: dict[str, Any]) -> str:
         f"Analyze the data above and produce a trading signal.\n"
     )
 
+    # Append performance context if available (LLM self-reflection)
+    perf_ctx = market_data.get("performance_context", "")
+    if perf_ctx:
+        prompt_parts.append(perf_ctx)
+
     return "\n".join(prompt_parts)
 
 
