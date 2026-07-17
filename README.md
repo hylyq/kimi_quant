@@ -102,6 +102,9 @@ uv run kimi-quant --mode debate --interval 300
 
 # 查看历史辩论记录
 uv run kimi-quant --history
+
+# 查看盈亏统计（可安全地与运行中的交易程序并发使用）
+uv run kimi-quant --stats
 ```
 
 ## TradingSignal（LLM 输出格式）

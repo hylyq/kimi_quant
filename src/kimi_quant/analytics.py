@@ -9,6 +9,7 @@ TradeLogger:
   - Provides a summary for LLM feedback (self-reflection loop)
 """
 
+import fcntl
 import json as _json
 import logging
 from dataclasses import dataclass, field
@@ -307,42 +308,51 @@ class TradeLogger:
     # ─── Persistence ─────────────────────────────────────────────────────
 
     def _append_to_file(self, trade: TradeRecord) -> None:
-        """Append a single trade as a JSON line."""
+        """Append a single trade as a JSON line. Uses exclusive lock."""
         try:
             Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
             with open(self.log_path, "a") as f:
-                f.write(_json.dumps(trade.to_dict(), default=str) + "\n")
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(_json.dumps(trade.to_dict(), default=str) + "\n")
+                    f.flush()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as e:
             logger.error("Failed to persist trade: %s", e)
 
     def _load(self) -> None:
-        """Load existing trades from the JSONL file."""
+        """Load existing trades from the JSONL file. Uses shared lock."""
         try:
             path = Path(self.log_path)
             if not path.exists():
                 return
             with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = _json.loads(line)
-                        trade = TradeRecord(
-                            opened_at=data["opened_at"],
-                            side=data["side"],
-                            size=data["size"],
-                            entry_price=data["entry_price"],
-                            closed_at=data.get("closed_at"),
-                            exit_price=data.get("exit_price", 0),
-                            close_reason=data.get("close_reason", ""),
-                            pnl=data.get("pnl", 0),
-                            pnl_pct=data.get("pnl_pct", 0),
-                            fees_est=data.get("fees_est", 0),
-                        )
-                        self._closed.append(trade)
-                    except Exception:
-                        pass
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = _json.loads(line)
+                            trade = TradeRecord(
+                                opened_at=data["opened_at"],
+                                side=data["side"],
+                                size=data["size"],
+                                entry_price=data["entry_price"],
+                                closed_at=data.get("closed_at"),
+                                exit_price=data.get("exit_price", 0),
+                                close_reason=data.get("close_reason", ""),
+                                pnl=data.get("pnl", 0),
+                                pnl_pct=data.get("pnl_pct", 0),
+                                fees_est=data.get("fees_est", 0),
+                            )
+                            self._closed.append(trade)
+                        except Exception:
+                            pass
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
             if self._closed:
                 logger.info("Loaded %d trades from %s", len(self._closed), path)
         except Exception as e:
