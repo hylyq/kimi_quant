@@ -118,7 +118,18 @@ class Notifier:
         Uses the same payload format as larky's WeChatClient.notify().
         WeChatService picks it up and delivers via WeChat.
         """
+        global _redis_client
         try:
+            # Retry connection if it was lost (e.g. Redis restart)
+            if _redis_client is None:
+                import redis as _redis
+                _redis_client = _redis.Redis(
+                    host=os.getenv("REDIS_HOST", "localhost"),
+                    port=int(os.getenv("REDIS_PORT", "6379")),
+                    db=int(os.getenv("REDIS_DB", "0")),
+                    socket_connect_timeout=2,
+                )
+
             payload = json.dumps(
                 {
                     "text": text,
@@ -131,6 +142,7 @@ class Notifier:
             _redis_client.publish(REDIS_CHANNEL, payload)
         except Exception as e:
             logger.error("Redis publish failed: %s", e)
+            _redis_client = None  # force reconnect next time
 
     def _send_lark(self, text: str) -> None:
         """Enqueue message for the Feishu background bot thread."""
