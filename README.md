@@ -179,7 +179,14 @@ Sleeping 900.0s until next cycle...
 
 ## 消息推送（微信 / 飞书）
 
-自动检测 larky（消息推送 SDK）。优先微信，其次飞书，都没有则静默运行。
+通过 larky 的 Redis Pub/Sub 架构，kimi_quant 只需往 Redis 发消息，larky 的 WeChatService 负责投递到微信。无需管理 Bot 生命周期。
+
+### 架构
+
+```
+kimi_quant ──Redis Pub──▶ WeChatService (larky) ──▶ 微信
+   (本程序)    wechat:outgoing    (独立进程，已运行)
+```
 
 ### 推送事件
 
@@ -196,12 +203,12 @@ Sleeping 900.0s until next cycle...
 ### 自动检测
 
 ```
-服务器有微信登录态 → 微信推送
-服务器有飞书 APP_ID  → 飞书推送
-都没有              → 静默运行
+Redis 连通    → 微信推送（通过 larky WeChatService）
+有飞书 APP_ID → 飞书推送
+都没有        → 静默运行
 ```
 
-程序启动时自动检测，无需任何配置。推送在独立后台线程运行，主交易循环毫秒级响应，不受消息 API 延迟影响。
+程序启动时自动 ping Redis，连通即走微信通道。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
 
 ## 快速开始
 
