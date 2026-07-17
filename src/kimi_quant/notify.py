@@ -1,61 +1,45 @@
-"""Notification via larky's Redis Pub/Sub (WeChat) or LarkBot (Feishu).
+"""Notification via larky's WeChatClient (proven method) or LarkBot (Feishu).
 
-Auto-detection at import time:
-  1. Redis + larky WeChatService → publish to wechat:outgoing channel
-  2. larky + Feishu APP_ID/APP_SECRET → LarkBot background thread
-  3. None → silent no-op
+Uses the same WeChatClient.notify() path that cryptoguard uses — raw Redis
+Pub/Sub was theoretically equivalent but didn't work in practice on the
+production server.
 
 Usage:
     from kimi_quant.notify import notify
     notify.send("Trade opened: LONG 0.01 BTC @ $87000")
 """
 
-import json
+import asyncio
 import logging
 import os
-import queue
 import threading
-from datetime import datetime, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Redis channel used by larky's WeChatService
-REDIS_CHANNEL = "wechat:outgoing"
-
 # ─── Detection ────────────────────────────────────────────────────────────
 
-_redis_client = None
-_channel: str | None = None  # "redis" | "lark" | None
-_bot_thread: threading.Thread | None = None
-_queue: queue.Queue[str | None] = queue.Queue()
-_started = False
+_wechat_client: Any = None  # larky.WeChatClient
+_channel: str | None = None  # "larky" | "lark" | None
+_event_loop: asyncio.AbstractEventLoop | None = None
+_loop_thread: threading.Thread | None = None
 
-# 1) Try Redis (WeChat via larky WeChatService)
-#    Detection is two-step:
-#      a. Can we import 'redis'?        → channel = "redis" (permanent)
-#      b. Can we ping Redis right now?   → _redis_client (may be None on startup,
-#         _send_redis() retries on every call)
+# 1) Try larky WeChatClient (same approach as cryptoguard — proven working)
 try:
-    import redis
+    from larky import WeChatClient as _WeChatClient
 
-    _channel = "redis"  # Redis package available — use it
-
-    try:
-        _r = redis.Redis(
-            host=os.getenv("REDIS_HOST", "localhost"),
-            port=int(os.getenv("REDIS_PORT", "6379")),
-            db=int(os.getenv("REDIS_DB", "0")),
-            socket_connect_timeout=2,
-        )
-        _r.ping()
-        _redis_client = _r
-        logger.info("Notification: Redis connected (WeChat via larky)")
-    except Exception:
-        logger.info(
-            "Notification: Redis not reachable at startup — will retry on first send"
-        )
+    _wechat_client = _WeChatClient(
+        source="kimi-quant",
+        redis_host=os.getenv("REDIS_HOST", "localhost"),
+        redis_port=int(os.getenv("REDIS_PORT", "6379")),
+        redis_db=int(os.getenv("REDIS_DB", "0")),
+    )
+    _channel = "larky"
+    logger.info("Notification: larky WeChatClient initialized (WeChat via Redis)")
 except ImportError:
-    pass
+    logger.info("Notification: larky not available")
+except Exception as e:
+    logger.warning("Notification: larky WeChatClient init failed: %s", e)
 
 # 2) Fallback: Feishu via LarkBot
 if _channel is None:
@@ -69,13 +53,36 @@ if _channel is None:
         pass
 
 
-# ─── Lark (Feishu) Background Thread ─────────────────────────────────────
+# ─── Async Event Loop Thread ──────────────────────────────────────────────
+
+
+def _get_or_create_loop() -> asyncio.AbstractEventLoop:
+    """Get or create a persistent event loop in a daemon thread."""
+    global _event_loop, _loop_thread
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+        _loop_thread = threading.Thread(
+            target=_event_loop.run_forever,
+            name="notify-loop",
+            daemon=True,
+        )
+        _loop_thread.start()
+    return _event_loop
+
+
+# ─── Feishu Background ────────────────────────────────────────────────────
+# (kept for LarkBot fallback — uses its own single-purpose thread)
+import queue as _queue_mod
+
+_queue: _queue_mod.Queue[str | None] = _queue_mod.Queue()
+_lark_started = False
+_lark_thread: threading.Thread | None = None
 
 
 def _run_lark_loop() -> None:
-    import asyncio
+    import asyncio as _asyncio
 
-    async def _worker(bot: LarkBot) -> None:
+    async def _worker(bot: Any) -> None:
         try:
             await bot.start()
             logger.info("Feishu notification bot started")
@@ -96,9 +103,10 @@ def _run_lark_loop() -> None:
                 pass
             logger.info("Feishu notification bot stopped")
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    bot = LarkBot.from_env()
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+    from larky import LarkBot as _LarkBot
+    bot = _LarkBot.from_env()
     loop.run_until_complete(_worker(bot))
     loop.close()
 
@@ -107,7 +115,7 @@ def _run_lark_loop() -> None:
 
 
 class Notifier:
-    """Singleton notifier. Auto-detects Redis > Feishu > silent."""
+    """Singleton notifier. Auto-detects larky WeChatClient > Feishu > silent."""
 
     def send(self, text: str, priority: str = "high") -> None:
         """Send a notification. No-op if no channel available.
@@ -115,58 +123,37 @@ class Notifier:
         Args:
             text: Plain text message.
             priority: "high" (queued if offline) or "normal" (fire-and-forget).
-                      Only meaningful for Redis/WeChat channel.
         """
-        if _channel == "redis":
-            self._send_redis(text, priority)
+        if _channel == "larky":
+            self._send_larky(text, priority)
         elif _channel == "lark":
             self._send_lark(text)
 
-    def _send_redis(self, text: str, priority: str) -> None:
-        """Publish directly to larky's Redis channel.
-
-        Uses the same payload format as larky's WeChatClient.notify().
-        WeChatService picks it up and delivers via WeChat.
-        """
-        global _redis_client
+    def _send_larky(self, text: str, priority: str) -> None:
+        """Send via larky WeChatClient.notify() — same path as cryptoguard."""
         try:
-            # Retry connection if it was lost (e.g. Redis restart)
-            if _redis_client is None:
-                import redis as _redis
-                _redis_client = _redis.Redis(
-                    host=os.getenv("REDIS_HOST", "localhost"),
-                    port=int(os.getenv("REDIS_PORT", "6379")),
-                    db=int(os.getenv("REDIS_DB", "0")),
-                    socket_connect_timeout=2,
-                )
-
-            payload = json.dumps(
-                {
-                    "text": text,
-                    "source": "kimi-quant",
-                    "priority": priority,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
+            loop = _get_or_create_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                _wechat_client.notify(text, priority=priority),
+                loop,
             )
-            _redis_client.publish(REDIS_CHANNEL, payload)
+            future.result(timeout=5)
         except Exception as e:
-            logger.error("Redis publish failed: %s", e)
-            _redis_client = None  # force reconnect next time
+            logger.error("larky notify failed: %s", e)
 
     def _send_lark(self, text: str) -> None:
         """Enqueue message for the Feishu background bot thread."""
-        global _started, _bot_thread
-        if not _started:
-            _bot_thread = threading.Thread(
+        global _lark_started, _lark_thread
+        if not _lark_started:
+            _lark_thread = threading.Thread(
                 target=_run_lark_loop, name="notify-lark", daemon=True
             )
-            _bot_thread.start()
-            _started = True
+            _lark_thread.start()
+            _lark_started = True
 
         try:
             _queue.put_nowait(text)
-        except queue.Full:
+        except _queue_mod.Full:
             logger.warning("Notification queue full — message dropped")
 
     def is_available(self) -> bool:
@@ -177,10 +164,14 @@ class Notifier:
         return _channel
 
     def shutdown(self) -> None:
-        if _channel == "lark" and _bot_thread and _bot_thread.is_alive():
+        global _event_loop
+        if _channel == "lark" and _lark_thread and _lark_thread.is_alive():
             _queue.put(None)
-            _bot_thread.join(timeout=10)
-        # Redis: nothing to shut down (connection pooled)
+            _lark_thread.join(timeout=10)
+        if _event_loop and _event_loop.is_running():
+            _event_loop.call_soon_threadsafe(_event_loop.stop)
+            if _loop_thread and _loop_thread.is_alive():
+                _loop_thread.join(timeout=5)
 
 
 notify = Notifier()
