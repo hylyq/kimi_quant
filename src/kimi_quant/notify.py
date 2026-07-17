@@ -141,14 +141,11 @@ class Notifier:
         return _channel
 
     def shutdown(self) -> None:
-        global _event_loop
         if _channel == "lark" and _lark_thread and _lark_thread.is_alive():
             _queue.put(None)
             _lark_thread.join(timeout=10)
-        if _event_loop and _event_loop.is_running():
-            _event_loop.call_soon_threadsafe(_event_loop.stop)
-            if _loop_thread and _loop_thread.is_alive():
-                _loop_thread.join(timeout=5)
+        # larky WeChatClient needs no cleanup — each send creates a fresh
+        # client via asyncio.run() which cleans up after itself.
 
 
 notify = Notifier()
