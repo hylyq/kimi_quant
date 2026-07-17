@@ -26,7 +26,7 @@ try:
     _OriginalSession = _cf_requests.Session
 
     def _make_session(**kw):
-        return _OriginalSession(impersonate="chrome120", timeout=30, **kw)
+        return _OriginalSession(impersonate="chrome131", timeout=30, **kw)
 
     _cf_requests.Session = _make_session  # type: ignore[assignment]
 except ImportError:
