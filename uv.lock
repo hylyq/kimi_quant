@@ -793,6 +793,7 @@ dependencies = [
     { name = "larky" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "redis" },
 ]
 
 [package.metadata]
@@ -807,6 +808,7 @@ requires-dist = [
     { name = "larky", editable = "../larky" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "redis", specifier = ">=5.0.0" },
 ]
 
 [[package]]
