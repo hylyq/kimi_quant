@@ -76,7 +76,7 @@ STRATEGY_MODE=single          # single | debate
 
 # 交易参数
 TRADING_PAIR=BTC
-MAX_POSITION_SIZE=0.01
+MAX_POSITION_SIZE=0.01         # 单位：BTC（0.01 = 0.01 BTC，非 USD 或百分比）
 MIN_CONFIDENCE=0.7
 MAX_LEVERAGE=3
 
