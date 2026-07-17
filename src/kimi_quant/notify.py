@@ -31,20 +31,30 @@ _queue: queue.Queue[str | None] = queue.Queue()
 _started = False
 
 # 1) Try Redis (WeChat via larky WeChatService)
+#    Detection is two-step:
+#      a. Can we import 'redis'?        → channel = "redis" (permanent)
+#      b. Can we ping Redis right now?   → _redis_client (may be None on startup,
+#         _send_redis() retries on every call)
 try:
     import redis
 
-    _r = redis.Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", "6379")),
-        db=int(os.getenv("REDIS_DB", "0")),
-        socket_connect_timeout=2,
-    )
-    _r.ping()
-    _redis_client = _r
-    _channel = "redis"
-    logger.info("Notification: Redis detected (WeChat via larky)")
-except Exception:
+    _channel = "redis"  # Redis package available — use it
+
+    try:
+        _r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            db=int(os.getenv("REDIS_DB", "0")),
+            socket_connect_timeout=2,
+        )
+        _r.ping()
+        _redis_client = _r
+        logger.info("Notification: Redis connected (WeChat via larky)")
+    except Exception:
+        logger.info(
+            "Notification: Redis not reachable at startup — will retry on first send"
+        )
+except ImportError:
     pass
 
 # 2) Fallback: Feishu via LarkBot
