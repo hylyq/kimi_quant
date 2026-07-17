@@ -344,13 +344,19 @@ class DataProvider:
             _hl_api.requests = _cf_requests
             _hl_info.requests = _cf_requests
 
-        self._info_local = Info(base_url=self.base_url, skip_ws=True)
+        self._info_local = retry_api_call(
+            lambda: Info(base_url=self.base_url, skip_ws=True),
+            description="Info(base_url) init",
+        )
         self.coin = config.trading_pair
 
         # Mainnet for candle data (testnet candles are empty).
         try:
-            self._info_mainnet = Info(
-                base_url="https://api.hyperliquid.xyz", skip_ws=True
+            self._info_mainnet = retry_api_call(
+                lambda: Info(
+                    base_url="https://api.hyperliquid.xyz", skip_ws=True
+                ),
+                description="Info(mainnet) init",
             )
         except Exception as e:
             logger.warning(
