@@ -571,6 +571,7 @@ uv run kimi-quant --mode debate --interval 300 # 组合参数
 # 数据查询（可安全地与运行中的程序并发）
 uv run kimi-quant --stats                      # 查看盈亏统计（真实+模拟）
 uv run kimi-quant --history                    # 查看辩论历史记录
+uv run kimi-quant --spot-to-perp 16            # 现货→合约账户划转
 uv run kimi-quant --arb-balance                # 查 Arbitrum 链上 USDC/ETH 余额
 uv run kimi-quant --deposit 100                # 入金 100 USDC 到 Hyperliquid
 ```

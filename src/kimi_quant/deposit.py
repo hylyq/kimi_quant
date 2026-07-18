@@ -215,3 +215,126 @@ def cmd_deposit(amount: float, force: bool = False) -> None:
     except ValueError as e:
         print(f"Error: {e}")
         raise SystemExit(1) from None
+
+
+# ─── Spot ↔ Perp Transfer ────────────────────────────────────────────────
+
+
+def get_spot_balance(address: str | None = None) -> dict[str, float]:
+    """Get Hyperliquid spot account balances.
+
+    Returns:
+        Dict mapping coin name to available balance.
+    """
+    import requests
+    acct = _get_account()
+    addr = address or acct.address
+    resp = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json={"type": "spotClearinghouseState", "user": addr},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    balances: dict[str, float] = {}
+    for b in data.get("balances", []):
+        coin = b["coin"]
+        total = float(b["total"])
+        if total > 0:
+            balances[coin] = total
+    return balances
+
+
+def get_perp_balance(address: str | None = None) -> float:
+    """Get Hyperliquid perp account value."""
+    import requests
+    acct = _get_account()
+    addr = address or acct.address
+    resp = requests.post(
+        "https://api.hyperliquid.xyz/info",
+        json={"type": "clearinghouseState", "user": addr},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return float(data.get("marginSummary", {}).get("accountValue", "0"))
+
+
+def spot_to_perp(amount: float) -> dict:
+    """Transfer USDC from spot to perp account.
+
+    Uses Hyperliquid's native L1 action — fast, no gas cost.
+    """
+    from hyperliquid.exchange import Exchange
+
+    if amount <= 0:
+        raise ValueError(f"Amount must be positive, got {amount}")
+
+    spot_balances = get_spot_balance()
+    spot_usdc = spot_balances.get("USDC", 0.0)
+    if spot_usdc < amount:
+        raise ValueError(
+            f"Insufficient spot USDC: {spot_usdc:.2f} < {amount:.2f}"
+        )
+
+    acct = _get_account()
+    base_url = (
+        "https://api.hyperliquid-testnet.xyz"
+        if config.hl_testnet
+        else "https://api.hyperliquid.xyz"
+    )
+    ex = Exchange(wallet=acct, base_url=base_url)
+
+    logger.info(
+        "Transferring %.2f USDC spot → perp (%s)...",
+        amount, acct.address,
+    )
+    result = ex.usd_class_transfer(amount, to_perp=True)
+    logger.info("Transfer result: %s", result)
+    return result
+
+
+def cmd_spot_to_perp(amount: float, force: bool = False) -> None:
+    """CLI handler for spot→perp transfer."""
+    try:
+        spot_balances = get_spot_balance()
+        perp_balance = get_perp_balance()
+
+        print(f"Hyperliquid balances for {_get_account().address}:")
+        print(f"  Spot:  ", end="")
+        if spot_balances:
+            for coin, bal in sorted(spot_balances.items()):
+                print(f"{bal:.2f} {coin}  ", end="")
+            print()
+        else:
+            print("(empty)")
+        print(f"  Perp:  {perp_balance:.2f} USDC")
+        print()
+
+        if amount <= 0:
+            print(f"Usage: uv run kimi-quant --spot-to-perp <amount>")
+            return
+
+        spot_usdc = spot_balances.get("USDC", 0.0)
+        if spot_usdc < amount:
+            print(f"Error: insufficient spot USDC ({spot_usdc:.2f})")
+            raise SystemExit(1)
+
+        if not force:
+            resp = input(
+                f"Transfer {amount:.2f} USDC from spot to perp? [y/N]: "
+            )
+            if resp.strip().lower() not in ("y", "yes"):
+                print("Cancelled.")
+                return
+
+        result = spot_to_perp(amount)
+        print(f"Done: {result}")
+
+        # Verify
+        new_perp = get_perp_balance()
+        print(f"Perp balance now: {new_perp:.2f} USDC")
+
+    except ValueError as e:
+        print(f"Error: {e}")
+        raise SystemExit(1) from None

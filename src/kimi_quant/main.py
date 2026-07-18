@@ -667,11 +667,23 @@ def main():
         help="Skip confirmation prompts (use with --deposit for scripting)",
     )
     parser.add_argument(
+        "--spot-to-perp",
+        type=float,
+        default=None,
+        metavar="AMOUNT",
+        help="Transfer USDC from spot to perp account and exit",
+    )
+    parser.add_argument(
         "--arb-balance",
         action="store_true",
         help="Check Arbitrum USDC/ETH balances and exit",
     )
     args = parser.parse_args()
+
+    if args.spot_to_perp is not None:
+        from kimi_quant.deposit import cmd_spot_to_perp
+        cmd_spot_to_perp(args.spot_to_perp, force=args.force)
+        return
 
     if args.arb_balance:
         from kimi_quant.deposit import check_balance, _get_account
