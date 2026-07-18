@@ -609,6 +609,24 @@ uv run kimi-quant --history                    # 查看辩论历史记录
 - `size`: `null` 时自动使用 `MAX_POSITION_SIZE`
 - `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格。LLM 可在 prompt 中看到当前 SL/TP 价格（通过 `to_orders_summary`），从而做出合理的移动决策
 
+### Cycle Status
+
+每个 cycle 结束时输出状态：
+
+| Status | 含义 |
+|--------|------|
+| `executed` | 下单/平仓/移止损成功 |
+| `hold` | LLM 决定观望，有意不操作 |
+| `rejected` | 风控拦截（置信度不足/保证金不够/止损太近等） |
+| `failed` | 执行异常（网络错误、API 超时等） |
+| `skipped` | LLM 未返回有效信号 |
+
+启动日志中会打印当前风控参数，方便确认配置是否正确加载：
+
+```
+Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
+```
+
 ## 风控规则
 
 ### 七层校验
