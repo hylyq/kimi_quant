@@ -654,7 +654,33 @@ def main():
         action="store_true",
         help="Print trade P&L statistics and exit",
     )
+    parser.add_argument(
+        "--deposit",
+        type=float,
+        default=None,
+        metavar="AMOUNT",
+        help="Deposit USDC from Arbitrum to Hyperliquid and exit",
+    )
+    parser.add_argument(
+        "--arb-balance",
+        action="store_true",
+        help="Check Arbitrum USDC/ETH balances and exit",
+    )
     args = parser.parse_args()
+
+    if args.arb_balance:
+        from kimi_quant.deposit import check_balance, _get_account
+        usdc, eth = check_balance()
+        acct = _get_account()
+        print(f"Arbitrum balances for {acct.address}:")
+        print(f"  USDC: {usdc:.2f}")
+        print(f"  ETH:  {eth:.6f}")
+        return
+
+    if args.deposit is not None:
+        from kimi_quant.deposit import cmd_deposit
+        cmd_deposit(args.deposit)
+        return
 
     if args.history:
         cmd_history()
