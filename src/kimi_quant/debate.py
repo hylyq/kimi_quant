@@ -132,22 +132,32 @@ Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, or MODIFY
 For multi-step actions, use the `actions` array: ["CLOSE", "SHORT"] to flip, \
 ["MODIFY_SL", "MODIFY_TP"] to adjust both stops.
 
-Decision framework (higher TF = more weight: 4h > 1h > 15m > 5m):
-- 1h+4h aligned + strong argument → confidence 0.75+
-- Higher TF clear, lower TF diverging → follow higher TF, reduce size, \
-  confidence 0.65-0.75
-- ALL timeframes sideways + all arguments weak → HOLD acceptable
-- DON'T default to HOLD just because timeframes diverge
+DECISION WORKFLOW — follow this order every cycle:
+
+Step 0 — ASSESS EXISTING STATE FIRST (before weighing the debate):
+  a. If there IS a position: is the original thesis still valid? If broken → CLOSE.
+     If working → consider MODIFY_SL to lock in profit or move to breakeven.
+  b. Check open orders: are SL/TP orders actually on the chain? If MISSING →
+     position is UNPROTECTED → MODIFY_SL/MODIFY_TP immediately, or CLOSE.
+     This takes priority over everything else.
+  c. Are there stale orders on chain? Clean them up if needed.
+  d. Are SL/TP levels appropriate for current ATR? Adjust if not.
+
+Step 1 — WEIGH THE DEBATE (only after completing Step 0):
+  Decision framework (higher TF = more weight: 4h > 1h > 15m > 5m):
+  - 1h+4h aligned + strong argument → confidence 0.75+
+  - Higher TF clear, lower TF diverging → follow higher TF, reduce size, \
+    confidence 0.65-0.75
+  - ALL timeframes sideways + all arguments weak → HOLD acceptable
+  - DON'T default to HOLD just because timeframes diverge
 
 Guidelines:
 - Trust specific data references (prices, sizes) over rhetoric
 - Divergence = smaller size + tighter stop, NOT automatic HOLD
 - Confidence < 0.65 → skip trade
 - stop_loss mandatory for LONG/SHORT, min 0.5% from entry
-- Open orders: verify that SL/TP orders reported by the tracker actually
-  appear on the chain open orders list. If SL/TP are missing, the position
-  is UNPROTECTED — use MODIFY_SL or MODIFY_TP to restore them, or CLOSE.
-  If chain shows stale/manual orders not in the tracker, clean them up.
+- If Step 0 found issues (missing SL/TP, stale orders), include the fix
+  actions BEFORE any new entry actions from the debate.
 
 Output TradingSignal JSON:
 - actions: ordered list of actions (preferred). Use for flip ["CLOSE", "SHORT"],

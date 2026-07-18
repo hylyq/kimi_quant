@@ -302,6 +302,10 @@ class MarketAnalysis:
 
         parts.append(
             f"\n# Instructions\n"
+            f"FIRST: assess existing position + open orders (Step 0 in system prompt). "
+            f"If you hold a position, decide: maintain/modify/close? "
+            f"If SL/TP are missing from chain, restore them before anything else. "
+            f"THEN: analyze market for new entries.\n"
             f"Max size={config.max_position_size}BTC. "
             f"Higher TF (4h>1h>15m>5m) carry more weight. "
             f"Confluence → higher confidence. Divergence → follow higher TF, "
