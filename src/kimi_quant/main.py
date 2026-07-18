@@ -298,8 +298,16 @@ def _validate_and_execute(
     # or approximated from mid_price. The next cycle's sync_with_chain()
     # will update it from actual chain fill data.
 
+    # Derive a human-readable status
+    if signal_result.action == "HOLD":
+        cycle_status = "hold"
+    elif result.get("executed"):
+        cycle_status = "executed"
+    else:
+        cycle_status = "failed"
+
     return {
-        "status": "executed" if result.get("executed") else "failed",
+        "status": cycle_status,
         "signal": signal_result.action,
         "confidence": signal_result.confidence,
         "reasoning": signal_result.reasoning,
