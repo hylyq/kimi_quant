@@ -21,11 +21,20 @@ logger = logging.getLogger(__name__)
 # ─── LLM Factory with Fallback ────────────────────────────────────────────
 
 
-def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
+def _build_model_registry(
+    temp: float, tokens: int, include_thinking: bool = True
+) -> dict[str, ChatOpenAI]:
     """Build available LLM instances keyed by provider name.
 
     Only includes models whose API key is configured.
     Handles provider-specific reasoning/thinking parameters.
+
+    Args:
+        temp: LLM temperature.
+        tokens: Max output tokens.
+        include_thinking: If False, skip thinking/reasoning params.
+            Structured output (json_schema) is incompatible with thinking
+            on DeepSeek, so the Judge disables it.
     """
     registry: dict[str, ChatOpenAI] = {}
     effort = config.reasoning_effort.lower()
@@ -40,7 +49,7 @@ def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
             max_tokens=tokens,
         )
         # Kimi K3: reasoning_effort is a direct API param (only "max" supported)
-        if effort == "max":
+        if include_thinking and effort == "max":
             kimi_kwargs["reasoning_effort"] = "max"
         registry["kimi"] = ChatOpenAI(**kimi_kwargs)
 
@@ -53,11 +62,14 @@ def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
             temperature=temp,
             max_tokens=tokens,
         )
-        # DeepSeek: thinking control via extra_body (OpenAI SDK passthrough)
-        if effort == "off":
-            ds_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        else:
-            ds_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        # DeepSeek: thinking control via extra_body (OpenAI SDK passthrough).
+        # Skip when structured output is active — json_schema + thinking
+        # is incompatible on DeepSeek (returns 400).
+        if include_thinking:
+            if effort == "off":
+                ds_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            else:
+                ds_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         registry["deepseek"] = ChatOpenAI(**ds_kwargs)
 
     return registry
@@ -138,7 +150,8 @@ def create_structured_llm(
     """
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
-    registry = _build_model_registry(temp, tokens)
+    # Structured output (json_schema) is incompatible with thinking on DeepSeek
+    registry = _build_model_registry(temp, tokens, include_thinking=False)
 
     # Apply structured output to each model
     structured_registry = {
