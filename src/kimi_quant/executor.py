@@ -12,6 +12,7 @@ Full life-cycle:
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -72,24 +73,38 @@ class PositionTracker:
     resting_cycles: int = 0
     max_resting_cycles: int = 3  # cancel limit order after this many unfilled cycles
 
+    # Thread safety: the main loop and the WebSocket monitor both access
+    # tracker state. All public mutations must hold this lock.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    # ─── Read-only helpers ───────────────────────────────────────────
+
     def has_position(self) -> bool:
         return self.state == "active"
 
     def has_resting_order(self) -> bool:
         return self.state == "resting"
 
+    def should_cancel_resting(self) -> bool:
+        return self.state == "resting" and self.resting_cycles >= self.max_resting_cycles
+
+    # ─── Mutations (thread-safe via _lock) ───────────────────────────
+
     def clear(self) -> None:
         """Reset tracker after position is closed."""
-        self.side = "none"
-        self.size = 0.0
-        self.entry_price = 0.0
-        self.state = "none"
-        self.entry_oid = None
-        self.sl_oid = None
-        self.tp_oid = None
-        self.sl_price = 0.0
-        self.tp_price = 0.0
-        self.resting_cycles = 0
+        with self._lock:
+            self.side = "none"
+            self.size = 0.0
+            self.entry_price = 0.0
+            self.state = "none"
+            self.entry_oid = None
+            self.sl_oid = None
+            self.tp_oid = None
+            self.sl_price = 0.0
+            self.tp_price = 0.0
+            self.resting_cycles = 0
 
     def update_from_open(
         self,
@@ -101,27 +116,29 @@ class PositionTracker:
         tp_price: float = 0.0,
     ) -> None:
         """Record a new position/order intent."""
-        self.coin = config.trading_pair
-        self.side = side
-        self.size = size
-        self.entry_price = entry_price or 0.0
-        self.entry_oid = oids.get("entry")
-        self.sl_oid = oids.get("sl")
-        self.tp_oid = oids.get("tp")
-        self.sl_price = sl_price
-        self.tp_price = tp_price
-        # Start as "resting" — will be promoted to "active" when chain confirms
-        self.state = "resting"
-        self.resting_cycles = 0
+        with self._lock:
+            self.coin = config.trading_pair
+            self.side = side
+            self.size = size
+            self.entry_price = entry_price or 0.0
+            self.entry_oid = oids.get("entry")
+            self.sl_oid = oids.get("sl")
+            self.tp_oid = oids.get("tp")
+            self.sl_price = sl_price
+            self.tp_price = tp_price
+            # Start as "resting" — will be promoted to "active" when chain confirms
+            self.state = "resting"
+            self.resting_cycles = 0
 
     def confirm_active(self, chain_entry_price: float, chain_size: float) -> None:
         """Chain confirms position exists — promote to active."""
-        self.state = "active"
-        self.resting_cycles = 0
-        if chain_entry_price > 0:
-            self.entry_price = chain_entry_price
-        if chain_size > 0:
-            self.size = chain_size
+        with self._lock:
+            self.state = "active"
+            self.resting_cycles = 0
+            if chain_entry_price > 0:
+                self.entry_price = chain_entry_price
+            if chain_size > 0:
+                self.size = chain_size
 
     def cancel_resting(self) -> None:
         """Limit order timed out — clear the tracker."""
@@ -132,12 +149,102 @@ class PositionTracker:
         self.clear()
 
     def tick_resting(self) -> None:
-        """Increment resting counter. Returns True if order should be cancelled."""
-        if self.state == "resting":
-            self.resting_cycles += 1
+        """Increment resting counter."""
+        with self._lock:
+            if self.state == "resting":
+                self.resting_cycles += 1
 
-    def should_cancel_resting(self) -> bool:
-        return self.state == "resting" and self.resting_cycles >= self.max_resting_cycles
+    # ─── WebSocket Event Sync ─────────────────────────────────────────
+
+    def apply_ws_event(self, event: Any) -> str:
+        """Apply a WebSocket order/fill event to tracker state. Thread-safe.
+
+        Called from the OrderMonitor's WebSocket callbacks (background thread).
+        Matches the event's oid against tracked entry/sl/tp oids and updates
+        state accordingly.
+
+        Returns a short description of what changed (empty string = no change).
+        """
+        # Lazy import to avoid circular dependency at module level
+        from kimi_quant.monitor import EventType
+
+        with self._lock:
+            oid = event.order_id
+            etype = event.event_type
+
+            if etype == EventType.ORDER_FILLED:
+                # Entry order filled → promote to active
+                if oid is not None and oid == self.entry_oid and self.state == "resting":
+                    self.state = "active"
+                    self.resting_cycles = 0
+                    if event.fill_price > 0:
+                        self.entry_price = event.fill_price
+                    if event.filled_size > 0:
+                        self.size = event.filled_size
+                    logger.info(
+                        "WS sync: entry #%d filled @ %.1f (state: resting→active)",
+                        oid, event.fill_price,
+                    )
+                    return f"entry_filled oid={oid}"
+
+                # SL filled → position closed
+                if oid is not None and oid == self.sl_oid:
+                    logger.info(
+                        "WS sync: stop loss #%d filled @ %.1f — position closed",
+                        oid, event.fill_price,
+                    )
+                    self.clear()
+                    return f"sl_filled oid={oid}"
+
+                # TP filled → position closed
+                if oid is not None and oid == self.tp_oid:
+                    logger.info(
+                        "WS sync: take profit #%d filled @ %.1f — position closed",
+                        oid, event.fill_price,
+                    )
+                    self.clear()
+                    return f"tp_filled oid={oid}"
+
+                # Unknown oid — log for visibility
+                if oid is not None:
+                    logger.debug(
+                        "WS sync: untracked fill oid=%d (tracked: entry=%s, sl=%s, tp=%s)",
+                        oid, self.entry_oid, self.sl_oid, self.tp_oid,
+                    )
+
+            elif etype == EventType.ORDER_PARTIAL:
+                if oid is not None and oid == self.entry_oid and self.state == "resting":
+                    logger.info(
+                        "WS sync: entry #%d partial fill %.4f/%.4f",
+                        oid, event.filled_size, event.total_size,
+                    )
+                    return f"entry_partial oid={oid}"
+
+            elif etype == EventType.ORDER_CANCELLED:
+                if oid is not None and oid == self.entry_oid:
+                    logger.info("WS sync: entry #%d cancelled", oid)
+                    self.clear()
+                    return f"entry_cancelled oid={oid}"
+                if oid is not None and oid == self.sl_oid:
+                    logger.info("WS sync: SL #%d cancelled", oid)
+                    self.sl_oid = None
+                    self.sl_price = 0.0
+                    return f"sl_cancelled oid={oid}"
+                if oid is not None and oid == self.tp_oid:
+                    logger.info("WS sync: TP #%d cancelled", oid)
+                    self.tp_oid = None
+                    self.tp_price = 0.0
+                    return f"tp_cancelled oid={oid}"
+
+            elif etype == EventType.ORDER_REJECTED:
+                if oid is not None and oid == self.entry_oid:
+                    logger.warning("WS sync: entry #%d rejected — clearing tracker", oid)
+                    self.clear()
+                    return f"entry_rejected oid={oid}"
+
+            return ""  # no tracked state change
+
+    # ─── Display ──────────────────────────────────────────────────────
 
     def to_summary(self) -> str:
         if self.state == "none":

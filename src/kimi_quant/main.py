@@ -419,6 +419,7 @@ def run_loop():
             monitor = OrderMonitor(
                 base_url=base_url,
                 address=executor.address,
+                tracker=executor.tracker,
             )
             reporter = FlashReporter(
                 event_queue=monitor.events,

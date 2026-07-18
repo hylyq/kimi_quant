@@ -99,9 +99,11 @@ class OrderMonitor:
         self,
         base_url: str,
         address: str,
+        tracker: Any = None,  # PositionTracker (avoids circular import)
     ):
         self.base_url = base_url
         self.address = address
+        self.tracker = tracker
         self._queue: queue.Queue[OrderEvent] = queue.Queue(maxsize=256)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -232,6 +234,8 @@ class OrderMonitor:
         try:
             event = self._parse_order_update(data)
             if event and event.is_significant:
+                # Sync to PositionTracker first (so LLM sees latest state)
+                self._sync_to_tracker(event)
                 self._enqueue(event)
                 logger.debug(
                     "Order update: type=%s oid=%s status=%s fill=%.4f/%.4f",
@@ -249,6 +253,7 @@ class OrderMonitor:
         try:
             event = self._parse_fill_update(data)
             if event and event.is_significant:
+                self._sync_to_tracker(event)
                 self._enqueue(event)
                 logger.debug(
                     "Fill update: oid=%s side=%s px=%.1f sz=%.4f",
@@ -259,6 +264,17 @@ class OrderMonitor:
                 )
         except Exception:
             logger.error("Failed to parse fill update: %s", data, exc_info=True)
+
+    def _sync_to_tracker(self, event: OrderEvent) -> None:
+        """Apply the event to the PositionTracker (thread-safe)."""
+        if self.tracker is None:
+            return
+        try:
+            changed = self.tracker.apply_ws_event(event)
+            if changed:
+                logger.info("WS → tracker synced: %s", changed)
+        except Exception:
+            logger.error("Failed to sync event to tracker", exc_info=True)
 
     def _enqueue(self, event: OrderEvent) -> None:
         """Push event to queue, dropping oldest if full (non-blocking)."""
