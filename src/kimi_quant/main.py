@@ -688,6 +688,57 @@ def _get_hl_info():
     return info, account.address, base_url
 
 
+def _classify_order(
+    is_buy: bool,
+    limit_px: float,
+    pos_side: str,
+    pos_entry: float,
+    mid_price: float,
+) -> str:
+    """Infer order type from context (openOrders API lacks orderType field).
+
+    With an active position:
+      - Opposite-side order above entry (long) / below entry (short) → Take Profit
+      - Opposite-side order below entry (long) / above entry (short) → Stop Loss
+      - Same-side order → Limit (add to position)
+
+    Without a position:
+      - BUY below market → Limit (entry long)
+      - SELL above market → Limit (entry short)
+      - BUY above market or SELL below market → Limit (aggressive)
+    """
+    if pos_side and pos_entry > 0:
+        # We have a position — classify relative to entry
+        is_opposite = (pos_side == "long" and not is_buy) or (pos_side == "short" and is_buy)
+
+        if is_opposite:
+            if pos_side == "long":
+                if limit_px > pos_entry:
+                    return "Take Profit 📈"
+                else:
+                    return "Stop Loss 🛑"
+            else:  # short
+                if limit_px < pos_entry:
+                    return "Take Profit 📈"
+                else:
+                    return "Stop Loss 🛑"
+        else:
+            # Same-side order — adding to position or new entry
+            return "Limit (entry)"
+
+    # No position — classify relative to market
+    if is_buy:
+        if limit_px < mid_price:
+            return "Limit (buy below mkt)"
+        else:
+            return "Limit (buy above mkt)"
+    else:
+        if limit_px > mid_price:
+            return "Limit (sell above mkt)"
+        else:
+            return "Limit (sell below mkt)"
+
+
 def cmd_status():
     """Print live account status: balance, position, open orders, market price."""
     from hyperliquid.info import Info
@@ -797,45 +848,41 @@ def cmd_status():
     print()
     print(f"  📝 Open Orders ({len(our_orders)})")
 
+    # Determine position side/entry for order classification
+    pos_side = ""
+    pos_entry = 0.0
+    if pos_data:
+        raw_sz = float(pos_data.get("szi", 0))
+        pos_side = "long" if raw_sz > 0 else "short"
+        pos_entry = float(pos_data.get("entryPx", 0))
+
     if our_orders:
         # Header
-        print(f"  {'OID':<12} {'Type':<20} {'Side':<6} {'Size':<12} {'Price':<14} {'Status':<10}")
-        print(f"  {'─'*12} {'─'*20} {'─'*6} {'─'*12} {'─'*14} {'─'*10}")
+        print(f"  {'OID':<14} {'Type':<22} {'Side':<6} {'Size':<12} {'Price':<14}")
+        print(f"  {'─'*14} {'─'*22} {'─'*6} {'─'*12} {'─'*14}")
 
         for o in our_orders:
             oid = str(o.get("oid", "?"))
             sz = float(o.get("sz", 0))
             limit_px = float(o.get("limitPx", 0))
             side_raw = o.get("side", "")
-            order_type_raw = o.get("orderType", "")
+            is_buy = side_raw == "B"
 
-            side_label = "BUY" if side_raw == "B" else ("SELL" if side_raw == "A" else side_raw)
+            side_label = "BUY" if is_buy else ("SELL" if side_raw == "A" else side_raw)
 
-            # Classify order type
-            if isinstance(order_type_raw, dict):
-                if "trigger" in order_type_raw:
-                    tpsl = order_type_raw["trigger"].get("tpsl", "")
-                    if tpsl == "sl":
-                        type_label = "Stop Loss"
-                    elif tpsl == "tp":
-                        type_label = "Take Profit"
-                    else:
-                        type_label = "Trigger"
-                elif "limit" in order_type_raw:
-                    tif = order_type_raw["limit"].get("tif", "")
-                    type_label = f"Limit ({tif})" if tif else "Limit"
-                else:
-                    type_label = str(order_type_raw)[:20]
-            else:
-                type_label = str(order_type_raw)[:20]
-
-            # Try to determine status from resting/filled info
-            # The open_orders endpoint only returns resting orders, so all are "Active"
-            status_label = "Active"
+            # Infer order type from context (openOrders API has no orderType field).
+            # Strategy: compare side and price to position/market to guess intent.
+            type_label = _classify_order(
+                is_buy=is_buy,
+                limit_px=limit_px,
+                pos_side=pos_side,
+                pos_entry=pos_entry,
+                mid_price=mid_price,
+            )
 
             print(
-                f"  {oid:<12} {type_label:<20} {side_label:<6} "
-                f"{sz:<12.4f} ${limit_px:<13,.2f} {status_label:<10}"
+                f"  {oid:<14} {type_label:<22} {side_label:<6} "
+                f"{sz:<12.4f} ${limit_px:<13,.2f}"
             )
     else:
         print("  (none)")

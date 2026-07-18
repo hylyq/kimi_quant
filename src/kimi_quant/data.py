@@ -752,6 +752,7 @@ class DataProvider:
         timeframes: list[TimeframeSummary] = []
         funding_trend = None
         account = None
+        open_orders_raw: list[dict] = []
 
         # Define fetch tasks — snapshot and order book are fast, candles are slow
         def _fetch_snapshot():
@@ -769,6 +770,14 @@ class DataProvider:
         def _fetch_account():
             return self.get_account_snapshot(address) if address else None
 
+        def _fetch_open_orders():
+            if not address:
+                return []
+            return retry_api_call(
+                lambda: self._info_local.open_orders(address),
+                description="open_orders",
+            )
+
         # Run independent fetches with limited concurrency (max_workers=2).
         # On Alibaba Cloud, too many parallel TLS handshakes trigger rate-based
         # fingerprint blocking (TCP RST). Low concurrency avoids the threshold.
@@ -779,6 +788,7 @@ class DataProvider:
             (_fetch_timeframes, "timeframes"),
             (_fetch_funding, "funding"),
             (_fetch_account, "account"),
+            (_fetch_open_orders, "open_orders"),
         ]
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures: dict[Any, str] = {}
@@ -800,6 +810,8 @@ class DataProvider:
                         funding_trend = result
                     elif key == "account":
                         account = result
+                    elif key == "open_orders":
+                        open_orders_raw = result
                 except Exception as e:
                     logger.error("Parallel fetch [%s] failed: %s", key, e)
 
@@ -826,6 +838,7 @@ class DataProvider:
             "market": snapshot,
             "order_book": order_book,
             "account": account,
+            "open_orders_raw": open_orders_raw,
         }
 
     @staticmethod
@@ -838,10 +851,33 @@ class DataProvider:
         analysis = report.get("analysis")
         if analysis:
             prompt = analysis.to_llm_prompt()
-            # Inject open orders info (SL/TP oids) if present
+
+            # Inject ALL open orders from chain (not just tracker-known ones).
+            # This lets the LLM see stale/manual orders and decide to cancel them.
+            raw_orders = report.get("open_orders_raw", [])
+            coin = config.trading_pair
+            our_orders = [o for o in raw_orders if o.get("coin") == coin]
+            if our_orders:
+                prompt += "\n# Open Orders (from chain)\n"
+                prompt += f"You have {len(our_orders)} open order(s) on Hyperliquid:\n"
+                for o in our_orders:
+                    oid = o.get("oid", "?")
+                    sz = float(o.get("sz", 0))
+                    px = float(o.get("limitPx", 0))
+                    side = "BUY" if o.get("side") == "B" else "SELL"
+                    prompt += f"  oid={oid} {side} {sz:.4f} BTC @ ${px:.1f}\n"
+                prompt += (
+                    "If these orders are stale (from a previous run) or conflict "
+                    "with your current strategy, you should cancel them before "
+                    "placing new ones. Use CLOSE or consider using the cancel "
+                    "functions to clean up.\n"
+                )
+
+            # Inject tracker-known open orders (SL/TP oids with richer context)
             orders = report.get("open_orders_summary", "")
             if orders:
-                prompt += "\n# Open Orders\n" + orders + "\n"
+                prompt += "\n# Tracked Orders (known SL/TP)\n" + orders + "\n"
+
             # Inject performance context if present
             perf = report.get("performance_context", "")
             if perf:
