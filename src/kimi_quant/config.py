@@ -40,7 +40,7 @@ class Config:
         )
     )
     deepseek_model: str = field(
-        default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-v3.1")
+        default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
     )
 
     # --- LLM Parameters ---
@@ -103,6 +103,27 @@ class Config:
     )  # hard upper bound (default 3 hours)
     dry_run: bool = field(
         default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true"
+    )
+
+    # --- Order Monitor (Real-time WebSocket + Flash LLM reporting) ---
+    monitor_enabled: bool = field(
+        default_factory=lambda: os.getenv("MONITOR_ENABLED", "true").lower()
+        == "true"
+    )
+    monitor_flash_model: str = field(
+        default_factory=lambda: os.getenv(
+            "MONITOR_FLASH_MODEL", "deepseek-v4-flash"
+        )
+    )
+    monitor_flash_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "MONITOR_FLASH_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+        )
+    )
+    monitor_flash_api_key: str = field(
+        default_factory=lambda: os.getenv(
+            "MONITOR_FLASH_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")
+        )
     )
 
     # --- Logging ---

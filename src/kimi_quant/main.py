@@ -30,6 +30,7 @@ from kimi_quant.config import config
 from kimi_quant.data import DataProvider
 from kimi_quant.executor import TradeExecutor
 from kimi_quant.llm import KimiLLM
+from kimi_quant.monitor import FlashReporter, OrderMonitor
 from kimi_quant.notify import notify
 from kimi_quant.risk import RiskManager
 logger = logging.getLogger("kimi_quant")
@@ -405,6 +406,37 @@ def run_loop():
         notify.send(f"❌ Kimi Quant startup failed: {e}")
         raise  # can't recover from startup failures
 
+    # ── Real-time Order Monitor (WebSocket + Flash LLM) ─────────────────
+    monitor: OrderMonitor | None = None
+    reporter: FlashReporter | None = None
+    if config.monitor_enabled and not config.dry_run:
+        try:
+            base_url = (
+                "https://api.hyperliquid-testnet.xyz"
+                if config.hl_testnet
+                else config.hl_base_url
+            )
+            monitor = OrderMonitor(
+                base_url=base_url,
+                address=executor.address,
+            )
+            reporter = FlashReporter(
+                event_queue=monitor.events,
+                model=config.monitor_flash_model,
+                api_key=config.monitor_flash_api_key or None,
+                base_url=config.monitor_flash_base_url or None,
+            )
+            monitor.start()
+            reporter.start()
+            logger.info(
+                "Order monitor active (flash_model=%s, llm=%s)",
+                config.monitor_flash_model,
+                "enabled" if config.monitor_flash_api_key or config.deepseek_api_key
+                else "fallback-only",
+            )
+        except Exception as e:
+            logger.warning("Failed to start order monitor (non-fatal): %s", e)
+
     notify.send(
         f"🚀 Kimi Quant started\n"
         f"Mode: {mode} | Dry Run: {config.dry_run}\n"
@@ -524,6 +556,12 @@ def run_loop():
 
     # ── Shutdown ─────────────────────────────────────────────────────────
     logger.info("Shutting down. Total cycles: %d", cycle_count)
+
+    # Stop order monitor (reporter first — it consumes the monitor's queue)
+    if reporter is not None:
+        reporter.stop()
+    if monitor is not None:
+        monitor.stop()
 
     stats = trade_logger.get_stats()
     if stats.total_trades > 0:

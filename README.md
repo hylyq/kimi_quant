@@ -521,7 +521,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | **DeepSeek (可选备份)** | | 自动降级 |
 | `DEEPSEEK_API_KEY` | — | DeepSeek API Key（留空仅用 Kimi） |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | API 端点 |
-| `DEEPSEEK_MODEL` | `deepseek-v3.1` | 模型名称 |
+| `DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名称 |
 | **LLM 参数** | | |
 | `PRIMARY_LLM` | `kimi` | 主模型：`kimi` 或 `deepseek` |
 | `REASONING_EFFORT` | `max` | 推理强度：`max`/`high`/`medium`/`low`/`minimal`/`off` |
@@ -543,6 +543,11 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `MIN_INTERVAL` | `300` | LLM 建议间隔的硬下限（秒，默认 5 分钟） |
 | `MAX_INTERVAL` | `10800` | LLM 建议间隔的硬上限（秒，默认 3 小时） |
 | `DRY_RUN` | `true` | 模拟模式开关 |
+| **订单监控 (实时 WebSocket + Flash LLM)** | | |
+| `MONITOR_ENABLED` | `true` | 开启实时订单状态监控 |
+| `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash 模型（轻量汇报） |
+| `MONITOR_FLASH_BASE_URL` | 同 `DEEPSEEK_BASE_URL` | Flash 模型 API 端点 |
+| `MONITOR_FLASH_API_KEY` | 同 `DEEPSEEK_API_KEY` | Flash 模型 API Key（留空复用） |
 | **日志** | | |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
