@@ -184,6 +184,33 @@ class PositionTracker:
         )
 
 
+def _extract_errors(result: Any, num_orders: int) -> list[str]:
+    """Check a bulk_orders response for per-order errors.
+
+    The top-level may say 'ok' while individual statuses contain errors.
+    Returns list of error messages (empty if all orders succeeded).
+    """
+    errors: list[str] = []
+    try:
+        statuses = None
+        if isinstance(result, dict):
+            statuses = (
+                result.get("response", {})
+                .get("data", {})
+                .get("statuses", [])
+            )
+        elif isinstance(result, list):
+            statuses = result
+
+        if statuses:
+            for s in statuses:
+                if isinstance(s, dict) and "error" in s:
+                    errors.append(s["error"])
+    except Exception:
+        pass
+    return errors
+
+
 def _parse_oids_from_result(result: Any, num_orders: int) -> dict[str, int | None]:
     """Extract order IDs from a bulk_orders or order response."""
     oids: dict[str, int | None] = {"entry": None, "sl": None, "tp": None}
@@ -484,7 +511,7 @@ class TradeExecutor:
 
             if num_orders > 1:
                 result = self.exchange.bulk_orders(
-                    orders, grouping="positionTpsl"
+                    orders, grouping="normalTpsl"
                 )
                 logger.info(
                     "Bulk order placed (%d orders): open + SL + TP", num_orders
@@ -498,6 +525,17 @@ class TradeExecutor:
                     order_type=orders[0]["order_type"],
                 )
                 logger.info("Single order placed (no SL/TP)")
+
+            # Check for errors in bulk order response
+            errors = _extract_errors(result, num_orders)
+            if errors:
+                logger.error("Order rejected by exchange: %s", errors)
+                return {
+                    "action": signal.action,
+                    "executed": False,
+                    "error": f"Exchange rejected order: {errors}",
+                    "reasoning": signal.reasoning,
+                }
 
             oids = _parse_oids_from_result(result, num_orders)
             self.tracker.update_from_open(
