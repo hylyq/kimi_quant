@@ -153,9 +153,12 @@ def create_structured_llm(
     # Structured output (json_schema) is incompatible with thinking on DeepSeek
     registry = _build_model_registry(temp, tokens, include_thinking=False)
 
-    # Apply structured output to each model
+    # Apply structured output to each model.
+    # Use function_calling (not json_schema) — json_schema response_format
+    # is not supported by DeepSeek (returns 400). function_calling uses the
+    # standard tool-calling mechanism, compatible with both Kimi and DeepSeek.
     structured_registry = {
-        name: llm.with_structured_output(schema, method="json_schema")
+        name: llm.with_structured_output(schema, method="function_calling")
         for name, llm in registry.items()
     }
     return _resolve_chain(structured_registry, config.primary_llm)
