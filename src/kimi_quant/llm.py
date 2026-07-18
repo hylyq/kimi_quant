@@ -6,7 +6,6 @@ Fallback: DeepSeek V3 via DeepSeek API (auto-activated when Kimi fails).
 Both use OpenAI-compatible ChatOpenAI.
 """
 
-import json
 import logging
 from typing import Any
 
@@ -21,20 +20,11 @@ logger = logging.getLogger(__name__)
 # ─── LLM Factory with Fallback ────────────────────────────────────────────
 
 
-def _build_model_registry(
-    temp: float, tokens: int, include_thinking: bool = True
-) -> dict[str, ChatOpenAI]:
+def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
     """Build available LLM instances keyed by provider name.
 
     Only includes models whose API key is configured.
     Handles provider-specific reasoning/thinking parameters.
-
-    Args:
-        temp: LLM temperature.
-        tokens: Max output tokens.
-        include_thinking: If False, skip thinking/reasoning params.
-            Structured output (json_schema) is incompatible with thinking
-            on DeepSeek, so the Judge disables it.
     """
     registry: dict[str, ChatOpenAI] = {}
     effort = config.reasoning_effort.lower()
@@ -49,7 +39,7 @@ def _build_model_registry(
             max_tokens=tokens,
         )
         # Kimi K3: reasoning_effort is a direct API param (only "max" supported)
-        if include_thinking and effort == "max":
+        if effort == "max":
             kimi_kwargs["reasoning_effort"] = "max"
         registry["kimi"] = ChatOpenAI(**kimi_kwargs)
 
@@ -62,14 +52,11 @@ def _build_model_registry(
             temperature=temp,
             max_tokens=tokens,
         )
-        # DeepSeek: thinking control via extra_body (OpenAI SDK passthrough).
-        # Skip when structured output is active — json_schema + thinking
-        # is incompatible on DeepSeek (returns 400).
-        if include_thinking:
-            if effort == "off":
-                ds_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-            else:
-                ds_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        # DeepSeek: thinking control via extra_body (OpenAI SDK passthrough)
+        if effort == "off":
+            ds_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        else:
+            ds_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         registry["deepseek"] = ChatOpenAI(**ds_kwargs)
 
     return registry
@@ -128,40 +115,6 @@ def create_llm(
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
     registry = _build_model_registry(temp, tokens)
     return _resolve_chain(registry, config.primary_llm)
-
-
-def create_structured_llm(
-    schema: type[BaseModel],
-    temperature: float | None = None,
-    max_tokens: int | None = None,
-):
-    """Create a structured-output LLM with automatic fallback chain.
-
-    Primary model is determined by PRIMARY_LLM env var (default: "kimi").
-    Each model gets with_structured_output(schema) applied, then chained.
-
-    Args:
-        schema: Pydantic model class for structured output.
-        temperature: Override default temperature.
-        max_tokens: Override default max_tokens.
-
-    Returns:
-        A Runnable[dict, schema] with fallback chain.
-    """
-    temp = temperature if temperature is not None else config.llm_temperature
-    tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
-    # Structured output (json_schema) is incompatible with thinking on DeepSeek
-    registry = _build_model_registry(temp, tokens, include_thinking=False)
-
-    # Apply structured output to each model.
-    # Use function_calling (not json_schema) — json_schema response_format
-    # is not supported by DeepSeek (returns 400). function_calling uses the
-    # standard tool-calling mechanism, compatible with both Kimi and DeepSeek.
-    structured_registry = {
-        name: llm.with_structured_output(schema, method="function_calling")
-        for name, llm in registry.items()
-    }
-    return _resolve_chain(structured_registry, config.primary_llm)
 
 
 class TradingSignal(BaseModel):
@@ -296,7 +249,6 @@ Output JSON only (no markdown):
 
     def __init__(self):
         self.llm = create_llm()
-        self.structured_llm = create_structured_llm(TradingSignal)
 
         # Show the actual primary model, not hardcoded kimi_model
         primary = config.primary_llm.lower()
@@ -320,7 +272,11 @@ Output JSON only (no markdown):
         """Analyze market data and return a trading signal.
 
         Returns None if analysis fails or the LLM is unavailable.
+        Uses raw text + JSON parsing for universal compatibility (structured
+        output via json_schema/function_calling is not supported by DeepSeek).
         """
+        import re
+
         try:
             prompt = self.build_prompt(market_data)
             messages = [
@@ -329,7 +285,16 @@ Output JSON only (no markdown):
             ]
 
             logger.info("Requesting trading analysis...")
-            signal: TradingSignal = self.structured_llm.invoke(messages)
+            response = self.llm.invoke(messages)
+            text = str(response.content)
+
+            # Extract JSON from response (handle markdown code fences)
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if not json_match:
+                logger.error("LLM response contained no JSON: %.200s...", text)
+                return None
+
+            signal = TradingSignal.model_validate_json(json_match.group(0))
 
             logger.info(
                 "Signal received: action=%s confidence=%.2f reasoning=%s",

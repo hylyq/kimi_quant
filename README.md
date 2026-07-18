@@ -76,7 +76,7 @@
 | LLM 编排 | LangChain + LangGraph StateGraph |
 | 状态持久化 | LangGraph MemorySaver + JSONL 文件（fcntl 锁） |
 | 交易所 | Hyperliquid (Perpetual DEX) |
-| 结构化输出 | Pydantic + LangChain json_schema |
+| 结构化输出 | Pydantic + JSON 正则提取（兼容全部模型） |
 | 交易执行 | hyperliquid-python-sdk (15/15 全覆盖) |
 
 ## LLM 模型配置
@@ -138,7 +138,7 @@ REASONING_EFFORT=off      # 关闭推理，大幅节省 token
 
 **费用影响**：推理 token 占输出 80%。`REASONING_EFFORT=off` 每次调用可节省约 **75% 输出费用**。适合高频轮询或低成本模式。
 
-> **结构化输出**：系统使用 `function_calling`（tool calling）机制实现 JSON 结构化输出，兼容 Kimi 和 DeepSeek。DeepSeek 不支持 `response_format: json_schema`（返回 400）。
+> **结构化 JSON 输出**：系统使用纯文本 + 正则提取 JSON 的方式实现结构化输出（`model_validate_json` 解析），兼容 Kimi 和 DeepSeek。DeepSeek 不支持 `response_format: json_schema` 和 `function_calling`（均返回 400），因此不依赖 LangChain 的 `with_structured_output`。
 
 ## 自适应唤醒间隔
 
