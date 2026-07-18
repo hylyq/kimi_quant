@@ -674,11 +674,24 @@ def main():
         help="Transfer USDC from spot to perp account and exit",
     )
     parser.add_argument(
+        "--set-account-type",
+        type=str,
+        default=None,
+        metavar="MODE",
+        choices=["manual", "unified", "portfolio"],
+        help="Change Hyperliquid account type (manual/unified/portfolio)",
+    )
+    parser.add_argument(
         "--arb-balance",
         action="store_true",
         help="Check Arbitrum USDC/ETH balances and exit",
     )
     args = parser.parse_args()
+
+    if args.set_account_type is not None:
+        from kimi_quant.deposit import cmd_set_account_type
+        cmd_set_account_type(args.set_account_type, force=args.force)
+        return
 
     if args.spot_to_perp is not None:
         from kimi_quant.deposit import cmd_spot_to_perp

@@ -212,7 +212,113 @@ def cmd_deposit(amount: float, force: bool = False) -> None:
         receipt = deposit_usdc(amount)
         print(f"Tx hash: {receipt['transactionHash'].hex()}")
         print("Done. Check Hyperliquid in 1-2 minutes.")
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
+        print(f"Error: {e}")
+        raise SystemExit(1) from None
+
+
+# ─── Account Type Management ─────────────────────────────────────────────
+
+
+ACCOUNT_TYPE_LABELS = {
+    "default": "Default",
+    "disabled": "Manual (separate spot & perp)",
+    "unifiedAccount": "Unified Account",
+    "portfolioMargin": "Portfolio Margin",
+    "dexAbstraction": "DEX Abstraction",
+}
+
+
+def get_account_type(address: str | None = None) -> str:
+    """Query the current account abstraction mode."""
+    from hyperliquid.info import Info
+
+    acct = _get_account()
+    addr = address or acct.address
+    base_url = (
+        "https://api.hyperliquid-testnet.xyz"
+        if config.hl_testnet
+        else "https://api.hyperliquid.xyz"
+    )
+    info = Info(base_url=base_url, skip_ws=True)
+    state = info.query_user_abstraction_state(addr)
+    return state or "default"
+
+
+def set_account_type(mode: str) -> dict:
+    """Change account abstraction mode.
+
+    Args:
+        mode: "manual" | "unified" | "portfolio"
+    """
+    from hyperliquid.exchange import Exchange
+
+    mode_map = {
+        "manual": "disabled",
+        "unified": "unifiedAccount",
+        "portfolio": "portfolioMargin",
+    }
+    hl_mode = mode_map.get(mode, mode)
+
+    acct = _get_account()
+    base_url = (
+        "https://api.hyperliquid-testnet.xyz"
+        if config.hl_testnet
+        else "https://api.hyperliquid.xyz"
+    )
+    ex = Exchange(wallet=acct, base_url=base_url)
+
+    logger.info(
+        "Setting account type for %s → %s (%s)...",
+        acct.address, mode, hl_mode,
+    )
+    result = ex.user_set_abstraction(acct.address, hl_mode)
+    logger.info("Result: %s", result)
+    return result
+
+
+def cmd_set_account_type(mode: str, force: bool = False) -> None:
+    """CLI handler for account type changes."""
+    try:
+        current = get_account_type()
+        label = ACCOUNT_TYPE_LABELS.get(current, current)
+        print(f"Current account type: {label} ({current})")
+        print()
+
+        valid_modes = ["manual", "unified", "portfolio"]
+        if mode not in valid_modes:
+            print(f"Usage: uv run kimi-quant --set-account-type <mode>")
+            print(f"  Valid modes: {', '.join(valid_modes)}")
+            print(f"  Recommended for kimi_quant: manual")
+            return
+
+        target_hl = {
+            "manual": "disabled",
+            "unified": "unifiedAccount",
+            "portfolio": "portfolioMargin",
+        }[mode]
+        if current == target_hl:
+            print(f"Account is already in {mode} mode. Nothing to change.")
+            return
+
+        target_label = ACCOUNT_TYPE_LABELS.get(target_hl, target_hl)
+        if not force:
+            resp = input(
+                f"Change from {label} → {target_label}? Type YES to confirm: "
+            )
+            if resp.strip() != "YES":
+                print("Cancelled.")
+                return
+
+        result = set_account_type(mode)
+        print(f"Done: {result}")
+
+        # Verify
+        new_current = get_account_type()
+        new_label = ACCOUNT_TYPE_LABELS.get(new_current, new_current)
+        print(f"New account type: {new_label}")
+
+    except Exception as e:
         print(f"Error: {e}")
         raise SystemExit(1) from None
 
@@ -354,6 +460,112 @@ def cmd_spot_to_perp(amount: float, force: bool = False) -> None:
         new_perp = get_perp_balance()
         print(f"Perp balance now: {new_perp:.2f} USDC")
 
-    except ValueError as e:
+    except (ValueError, RuntimeError) as e:
+        print(f"Error: {e}")
+        raise SystemExit(1) from None
+
+
+# ─── Account Type Management ─────────────────────────────────────────────
+
+
+ACCOUNT_TYPE_LABELS = {
+    "default": "Default",
+    "disabled": "Manual (separate spot & perp)",
+    "unifiedAccount": "Unified Account",
+    "portfolioMargin": "Portfolio Margin",
+    "dexAbstraction": "DEX Abstraction",
+}
+
+
+def get_account_type(address: str | None = None) -> str:
+    """Query the current account abstraction mode."""
+    from hyperliquid.info import Info
+
+    acct = _get_account()
+    addr = address or acct.address
+    base_url = (
+        "https://api.hyperliquid-testnet.xyz"
+        if config.hl_testnet
+        else "https://api.hyperliquid.xyz"
+    )
+    info = Info(base_url=base_url, skip_ws=True)
+    state = info.query_user_abstraction_state(addr)
+    return state or "default"
+
+
+def set_account_type(mode: str) -> dict:
+    """Change account abstraction mode.
+
+    Args:
+        mode: "manual" | "unified" | "portfolio"
+    """
+    from hyperliquid.exchange import Exchange
+
+    mode_map = {
+        "manual": "disabled",
+        "unified": "unifiedAccount",
+        "portfolio": "portfolioMargin",
+    }
+    hl_mode = mode_map.get(mode, mode)
+
+    acct = _get_account()
+    base_url = (
+        "https://api.hyperliquid-testnet.xyz"
+        if config.hl_testnet
+        else "https://api.hyperliquid.xyz"
+    )
+    ex = Exchange(wallet=acct, base_url=base_url)
+
+    logger.info(
+        "Setting account type for %s → %s (%s)...",
+        acct.address, mode, hl_mode,
+    )
+    result = ex.user_set_abstraction(acct.address, hl_mode)
+    logger.info("Result: %s", result)
+    return result
+
+
+def cmd_set_account_type(mode: str, force: bool = False) -> None:
+    """CLI handler for account type changes."""
+    try:
+        current = get_account_type()
+        label = ACCOUNT_TYPE_LABELS.get(current, current)
+        print(f"Current account type: {label} ({current})")
+        print()
+
+        valid_modes = ["manual", "unified", "portfolio"]
+        if mode not in valid_modes:
+            print(f"Usage: uv run kimi-quant --set-account-type <mode>")
+            print(f"  Valid modes: {', '.join(valid_modes)}")
+            print(f"  Recommended for kimi_quant: manual")
+            return
+
+        target_hl = {
+            "manual": "disabled",
+            "unified": "unifiedAccount",
+            "portfolio": "portfolioMargin",
+        }[mode]
+        if current == target_hl:
+            print(f"Account is already in {mode} mode. Nothing to change.")
+            return
+
+        target_label = ACCOUNT_TYPE_LABELS.get(target_hl, target_hl)
+        if not force:
+            resp = input(
+                f"Change from {label} → {target_label}? Type YES to confirm: "
+            )
+            if resp.strip() != "YES":
+                print("Cancelled.")
+                return
+
+        result = set_account_type(mode)
+        print(f"Done: {result}")
+
+        # Verify
+        new_current = get_account_type()
+        new_label = ACCOUNT_TYPE_LABELS.get(new_current, new_current)
+        print(f"New account type: {new_label}")
+
+    except Exception as e:
         print(f"Error: {e}")
         raise SystemExit(1) from None
