@@ -122,6 +122,13 @@ class Config:
                 "Set it in .env or use DRY_RUN=true."
             )
 
+    @property
+    def display_model(self) -> str:
+        """The model name to show in logs/banners, based on PRIMARY_LLM."""
+        if self.primary_llm.lower() == "deepseek" and self.deepseek_api_key:
+            return self.deepseek_model
+        return self.kimi_model
+
 
 # Singleton config instance
 config = Config()

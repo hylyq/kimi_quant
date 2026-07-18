@@ -276,14 +276,7 @@ Output JSON only (no markdown):
     def __init__(self):
         self.llm = create_llm()
         self.structured_llm = create_structured_llm(TradingSignal)
-
-        # Show the actual primary model, not hardcoded kimi_model
-        primary = config.primary_llm.lower()
-        if primary == "deepseek" and config.deepseek_api_key:
-            display = config.deepseek_model
-        else:
-            display = config.kimi_model
-        logger.info("KimiLLM initialized (primary=%s)", display)
+        logger.info("KimiLLM initialized (primary=%s)", config.display_model)
 
     @staticmethod
     def build_prompt(market_data: dict[str, Any]) -> str:
@@ -323,18 +316,3 @@ Output JSON only (no markdown):
             logger.error("LLM analysis failed: %s", e, exc_info=True)
             return None
 
-    def analyze_raw(self, market_data: dict[str, Any]) -> str:
-        """Fallback: get raw text response (when structured output fails)."""
-        try:
-            prompt = self.build_prompt(market_data)
-            messages = [
-                ("system", self.SYSTEM_PROMPT),
-                ("user", prompt),
-            ]
-
-            response = self.llm.invoke(messages)
-            return str(response.content)
-
-        except Exception as e:
-            logger.error("Raw LLM analysis failed: %s", e)
-            return ""

@@ -348,16 +348,10 @@ def run_loop():
       - Fatal (KeyboardInterrupt, SystemExit): clean shutdown
     """
     mode = config.strategy_mode
-    # Resolve primary model name: pick the model that PRIMARY_LLM points to
-    primary = config.primary_llm.lower()
-    if primary == "deepseek" and config.deepseek_api_key:
-        display_model = config.deepseek_model
-    else:
-        display_model = config.kimi_model
     logger.info("=" * 50)
     logger.info("Kimi Quant — BTC Perpetual Contract Trading")
     logger.info("Model: %s | Mode: %s | Interval: %ds | Dry Run: %s",
-                display_model, mode,
+                config.display_model, mode,
                 config.trading_interval_seconds, config.dry_run)
     logger.info("=" * 50)
 
