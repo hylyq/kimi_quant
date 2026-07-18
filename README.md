@@ -80,7 +80,7 @@
 5. **TradeLogger** — 盈亏分析 + LLM 表现反馈（自省循环）
 6. **OrderMonitor** — WebSocket 实时订阅订单状态变化（成交/部分成交/取消/清算），毫秒级同步到 PositionTracker，使 LLM 在下一周期看到最新状态
 7. **FlashReporter** — 消费 WS 事件 → Flash 模型生成中文自然语言通知 → 微信/飞书推送
-8. **上下文注入** — 每轮将账户余额、持仓、挂单（SL/TP 价格+oid）注入 LLM prompt
+8. **上下文注入** — 每轮将账户余额、持仓、**全部链上挂单**（含孤儿订单）和 tracker 追踪的 SL/TP 价格注入 LLM prompt。LLM 能识别并取消上一轮遗留的过期订单
 9. **自适应间隔** — LLM 建议下次唤醒时间（5min-3h），横盘省费/关键位盯紧
 
 ### 技术栈
@@ -764,7 +764,11 @@ uv run kimi-quant --status
 | 📝 Orders | `open_orders` | 所有挂单（限价单、SL、TP），含 OID、类型、价格 |
 | 📈 Market | `all_mids` + `meta_and_asset_ctxs` | 中间价、24h 涨跌、资金费率、未平仓量 |
 
-所有数据直接从链上查询，不经本地 tracker——是客观真实数据。可在终端持续刷新：
+所有数据直接从链上查询，不经本地 tracker——是客观真实数据。
+
+> **订单类型推断**：Hyperliquid 的 `openOrders` API 不返回 `orderType` 字段。`--status` 通过上下文自动推断：比较订单价格与持仓入场价/市场价，判断是 Limit Entry、Stop Loss 还是 Take Profit。
+
+可在终端持续刷新：
 
 ```bash
 watch -n 5 uv run kimi-quant --status
@@ -1158,12 +1162,22 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash # Flash 模型
 
 ### Q: 大模型做决策时能看到最新的订单/持仓状态吗？
 
-能。每次 LLM 决策前，系统会把两部分信息注入 prompt：
+能。每次 LLM 决策前，系统注入三类信息：
 
 1. **链上仓位**：`DataProvider` 查询 `user_state`，获取持仓方向、大小、入场价、浮动盈亏
-2. **挂单状态**：`PositionTracker.to_orders_summary()` 输出当前 SL/TP 的 oid 和价格
+2. **全部链上挂单**：`DataProvider` 查询 `open_orders`，列出所有未成交订单（oid、方向、数量、价格）。LLM 能看到**所有**订单——包括上一轮遗留的孤儿订单——并决定是否取消它们
+3. **Tracker 追踪的 SL/TP**：`PositionTracker.to_orders_summary()` 输出 bot 自己创建的 SL/TP 的 oid 和价格
 
-加上 **OrderMonitor** 的 WebSocket 实时同步，`PositionTracker` 在订单成交瞬间更新——大模型在下一个决策周期就能看到最新状态，无需等待周期内的 `sync_with_chain()`。
+加上 **OrderMonitor** 的 WebSocket 实时同步，`PositionTracker` 在订单成交瞬间更新——大模型在下一个决策周期就能看到最新状态。
+
+### Q: 如果上一轮运行留下了未成交的限价单怎么办？
+
+每个周期 LLM prompt 会列出**全部链上挂单**，并提示：
+
+> If these orders are stale (from a previous run) or conflict with your
+> current strategy, you should cancel them before placing new ones.
+
+LLM 可以判断这些订单是否还有效，选择保留或建议取消。你也可以用 `--status` 手动查看并用 CLI 清理。
 
 ### Q: 程序会因为异常崩溃吗？
 
