@@ -274,11 +274,12 @@ def _validate_and_execute(
         trade_opened_this_cycle = True
         notional = size * entry_price
         margin = notional / config.max_leverage
+        total_balance = account.balance if account else 0.0
         notify.send(
             f"📈 {signal_result.action} {size} BTC @ ${entry_price:.0f}\n"
             f"Notional: ${notional:.0f} | Margin: ${margin:.2f} | Leverage: {config.max_leverage}x\n"
             f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
-            f"Confidence: {signal_result.confidence:.2f}"
+            f"Confidence: {signal_result.confidence:.2f} | Balance: ${total_balance:.2f}"
         )
 
     # ── Phase 4: Execute ──
@@ -303,11 +304,12 @@ def _validate_and_execute(
             else:
                 risk.record_loss(trade.net_pnl)
             emoji = "🟢" if trade.is_win else "🔴"
+            total_balance = account.balance if account else 0.0
             notify.send(
                 f"{emoji} Position closed: {trade.side.upper()}\n"
                 f"Entry: ${trade.entry_price:.0f} → Exit: ${trade.exit_price:.0f}\n"
                 f"P&L: ${trade.net_pnl:+.2f} ({trade.pnl_pct:+.2f}%) | Leverage: {config.max_leverage}x\n"
-                f"Reason: {trade.close_reason}"
+                f"Reason: {trade.close_reason} | Balance: ${total_balance:.2f}"
             )
 
     # Entry price is already set in open_trade() from signal.entry_price
