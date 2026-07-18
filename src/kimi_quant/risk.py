@@ -189,6 +189,121 @@ class RiskManager:
             f"{self.cooldown_remaining} cycles remaining in cooldown"
         )
 
+    # ─── LLM Context ────────────────────────────────────────────────────
+
+    def get_risk_context(
+        self,
+        mid_price: float = 0.0,
+        account_balance: float | None = None,
+        current_side: str = "none",
+    ) -> str:
+        """Build a risk-constraints summary for injection into the LLM prompt.
+
+        This ensures the LLM knows the hard limits BEFORE proposing a trade,
+        rather than wasting a cycle on a decision that will be rejected.
+
+        Dynamic values (mid_price, account_balance) are computed from the
+        current cycle's market data and plugged into the constraint formulas.
+        """
+        lines = ["# Risk Constraints (this cycle)\n"]
+
+        # ── Circuit Breaker ──────────────────────────────────────────
+        if self.cooldown_remaining > 0:
+            daily_info = ""
+            if self.initial_balance and self.initial_balance > 0:
+                drawdown = self.total_realized_pnl / self.initial_balance
+                daily_info = f" | Daily P&L: {drawdown:.1%}"
+            lines.append(
+                f"⚠️  CIRCUIT BREAKER ACTIVE — {self.consecutive_losses} "
+                f"consecutive losses, {self.cooldown_remaining} cycles remaining "
+                f"in cooldown{daily_info}.\n"
+                f"  → NEW POSITIONS BLOCKED (LONG/SHORT will be rejected).\n"
+                f"  → ALLOWED: CLOSE, MODIFY_SL, MODIFY_TP, HOLD.\n"
+                f"  → Do NOT propose LONG or SHORT — they WILL be rejected.\n"
+            )
+        elif self.consecutive_losses > 0:
+            lines.append(
+                f"⚡ Circuit breaker: {self.consecutive_losses}/"
+                f"{self.MAX_CONSECUTIVE_LOSSES} consecutive losses. "
+                f"Next loss triggers {self.COOLDOWN_CYCLES}-cycle cooldown. "
+                f"Be more conservative.\n"
+            )
+
+        if self.initial_balance and self.initial_balance > 0 and self.total_realized_pnl < 0:
+            drawdown = self.total_realized_pnl / self.initial_balance
+            if drawdown < -0.02:  # approaching -5% hard cap
+                lines.append(
+                    f"⚠️  Daily drawdown: {drawdown:.1%} (hard cap: "
+                    f"{self.MAX_DAILY_DRAWDOWN:.0%}). Reduce risk.\n"
+                )
+
+        # ── Static thresholds ────────────────────────────────────────
+        lines.append("## Hard Limits")
+        lines.append(f"- Min confidence: {self.min_confidence}")
+        lines.append(f"- Max position size: {self.max_position} BTC")
+        lines.append(f"- Max leverage: {self.max_leverage}x")
+        lines.append(f"- SL min distance: {self.MIN_SL_DISTANCE:.1%} of entry "
+                     f"(BTC noise is ~0.3%)")
+        lines.append(f"- SL is REQUIRED for LONG/SHORT (no SL → rejected)")
+        lines.append("")
+
+        # ── Margin budget (dynamic) ──────────────────────────────────
+        if account_balance and account_balance > 0:
+            max_margin = account_balance * 0.95
+            max_notional = max_margin * self.max_leverage
+            lines.append("## Margin Budget (from your account)")
+            lines.append(f"- Available balance: ${account_balance:.2f}")
+            lines.append(f"- Max margin usable (95%): ${max_margin:.2f}")
+            lines.append(f"- Max position notional: ${max_notional:.2f} "
+                         f"({max_margin:.2f} × {self.max_leverage}x)")
+            if mid_price > 0:
+                max_size_margin = max_notional / mid_price
+                capped_size = min(max_size_margin, self.max_position)
+                lines.append(f"- At current price ${mid_price:.0f}: "
+                             f"max size = {max_size_margin:.4f} BTC "
+                             f"(capped at {capped_size:.4f} by position limit)")
+            lines.append("")
+
+            # ── Risk budget (dynamic) ────────────────────────────────
+            max_risk_hard = account_balance * 0.02  # 2%
+            max_risk_warn = account_balance * 0.01  # 1%
+            lines.append("## Risk Budget (per trade, from your account)")
+            lines.append(f"- Max risk per trade: ${max_risk_hard:.2f} "
+                         f"(2% of ${account_balance:.2f})")
+            lines.append(f"- Risk = |entry - SL| × size  (calculate this BEFORE proposing)")
+            lines.append(f"- If risk > ${max_risk_hard:.2f} → HARD REJECT")
+            lines.append(f"- If risk > ${max_risk_warn:.2f} → warning (but still allowed)")
+            if mid_price > 0:
+                # Show example: with a 1% SL distance, max size
+                example_sl_dist = mid_price * 0.01
+                example_max_size = max_risk_hard / example_sl_dist
+                lines.append(f"- Example: at 1% SL distance (${example_sl_dist:.0f}), "
+                             f"max size = ${max_risk_hard:.2f} / ${example_sl_dist:.0f} "
+                             f"= {example_max_size:.4f} BTC")
+            lines.append("")
+
+        # ── Direction constraints ────────────────────────────────────
+        lines.append("## Direction Constraints (this cycle)")
+        if current_side == "long":
+            lines.append("- You HOLD a LONG position.")
+            lines.append("  → LONG → REJECTED (already long)")
+            lines.append("  → SHORT → OK (opens opposite)")
+            lines.append("  → CLOSE → OK (flattens position)")
+            lines.append("  → MODIFY_SL / MODIFY_TP → OK")
+        elif current_side == "short":
+            lines.append("- You HOLD a SHORT position.")
+            lines.append("  → SHORT → REJECTED (already short)")
+            lines.append("  → LONG → OK (opens opposite)")
+            lines.append("  → CLOSE → OK (flattens position)")
+            lines.append("  → MODIFY_SL / MODIFY_TP → OK")
+        else:
+            lines.append("- No position held.")
+            lines.append("  → LONG / SHORT → OK")
+            lines.append("  → CLOSE → REJECTED (nothing to close)")
+            lines.append("  → MODIFY_SL / MODIFY_TP → REJECTED (no position)")
+
+        return "\n".join(lines)
+
     # ─── Individual Checks ────────────────────────────────────────────────
 
     def _check_circuit_breaker(self, signal: TradingSignal) -> RiskCheck:

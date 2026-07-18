@@ -901,6 +901,11 @@ class DataProvider:
                     "Consider MODIFY_TP to set a new take profit target.\n"
                 )
 
+            # Inject risk context if present (hard constraints the LLM must respect)
+            risk_ctx = report.get("risk_context", "")
+            if risk_ctx:
+                prompt += "\n" + risk_ctx
+
             # Inject performance context if present
             perf = report.get("performance_context", "")
             if perf:

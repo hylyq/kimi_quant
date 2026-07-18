@@ -109,6 +109,20 @@ def run_once_single(
             logger.warning("TP order missing from exchange — LLM will be notified")
     report["sl_tp_status"] = sl_tp_status
 
+    # Inject risk constraints BEFORE LLM analysis so it knows the hard limits.
+    # This prevents wasted cycles where the LLM proposes a trade that would
+    # be rejected by risk checks — e.g. violating margin budget, risk cap,
+    # or proposing a new position while circuit breaker is active.
+    mid_price = market.mid_price if market else 0.0
+    account_balance = account.available_balance if account else None
+    current_side = account.position_side if account else "none"
+    risk_context = risk.get_risk_context(
+        mid_price=mid_price,
+        account_balance=account_balance,
+        current_side=current_side,
+    )
+    report["risk_context"] = risk_context
+
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
 
@@ -177,6 +191,19 @@ def run_once_debate(
         if sl_tp_status["tp_missing"]:
             logger.warning("TP order missing from exchange — debate will be notified")
     report["sl_tp_status"] = sl_tp_status
+
+    # Inject risk constraints BEFORE debate so agents know the hard limits.
+    # This prevents wasted cycles where the debate produces a signal that
+    # would be rejected by risk checks.
+    mid_price = market.mid_price if market else 0.0
+    account_balance = account.available_balance if account else None
+    current_side = account.position_side if account else "none"
+    risk_context = risk.get_risk_context(
+        mid_price=mid_price,
+        account_balance=account_balance,
+        current_side=current_side,
+    )
+    report["risk_context"] = risk_context
 
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)

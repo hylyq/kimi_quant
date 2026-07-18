@@ -275,6 +275,11 @@ def build_market_prompt(market_data: dict[str, Any]) -> str:
     if perf_ctx:
         prompt_parts.append(perf_ctx)
 
+    # Append risk constraints if available (hard limits the LLM must respect)
+    risk_ctx = market_data.get("risk_context", "")
+    if risk_ctx:
+        prompt_parts.append(risk_ctx)
+
     return "\n".join(prompt_parts)
 
 
