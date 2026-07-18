@@ -3,11 +3,13 @@
 **BTC 永续合约量化交易程序** — 基于大模型的智能交易决策系统，运行于 Hyperliquid 去中心化交易所。
 
 - 🧠 **双模型容灾**：Kimi K3 + DeepSeek V4，一键切换主备，自动降级
+- 🎯 **决策工作流**：Step 0 强制审视已有持仓+挂单 → Step 1 市场分析，不跳过现状评估
+- 🔗 **多操作组合**：单周期翻转仓位（`CLOSE→SHORT`）、同时调整 SL+TP，失败即停
 - 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、LLM 引导长间隔、可配置唤醒下限
 - 📱 **消息推送**：微信/飞书实时通知交易事件，自动检测无需配置
 - 🔄 **实时监控**：WebSocket 订阅订单状态，Flash 模型生成中文通知，毫秒级同步到持仓追踪器
 - 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
-- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断，炸不穿
+- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断 + SL/TP 链上验证，炸不穿
 - 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
 - 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + 前缀缓存 + Judge 裁决）
 - 🔧 **账户工具**：CLI 一键查账户状态、切换类型、划转、余额查询
@@ -16,6 +18,7 @@
 ## 目录
 
 - [策略模式](#策略模式)
+  - [决策工作流](#决策工作流decision-workflow)
 - [架构概览](#架构概览)
 - [快速开始](#快速开始)
 - [分阶段测试指南](#分阶段测试指南)
@@ -48,6 +51,39 @@
 ```
 3 个 Agent 并行辩论 + 1 个裁判裁决，通过对抗验证减少单一模型偏见。4 次 LLM 调用/周期。
 
+### 决策工作流（Decision Workflow）
+
+无论哪种策略模式，LLM 每周期都遵循**强制两步决策流程**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Step 0 — 审视已有状态（在分析市场之前强制执行）        │
+│                                                     │
+│  a. 持仓合理性：原始入场逻辑是否依然成立？             │
+│     → 逻辑破坏 → CLOSE                              │
+│     → 运行良好 → 考虑 MODIFY_SL 锁利润/移保本         │
+│                                                     │
+│  b. SL/TP 链上验证：tracker 记录的 SL/TP 是否在链上？  │
+│     → 丢失 → MODIFY_SL/MODIFY_TP 立即恢复（最高优先级）│
+│     → 存在 → 继续                                    │
+│                                                     │
+│  c. 僵尸订单清理：链上是否有非 bot 创建的挂单？        │
+│                                                     │
+│  d. SL/TP 距离检查：止损止盈距离是否匹配当前 ATR？     │
+│     → 波动率下降 → 收紧止损                           │
+│     → 波动率上升 → 放宽止损                           │
+├─────────────────────────────────────────────────────┤
+│ Step 1 — 市场分析（完成 Step 0 后才能进行）            │
+│                                                     │
+│  多周期趋势 → 订单簿 → 资金费率 → 决策                  │
+│  Step 0 的修复动作必须放在 actions 数组最前面          │
+└─────────────────────────────────────────────────────┘
+```
+
+**关键原则**：Step 0 的修复动作（如恢复丢失的 SL）优先级高于 Step 1 的新开仓动作。如果 Step 0 发现 SL 丢失且市场出现做多信号，LLM 应输出 `["MODIFY_SL", "LONG"]` 而非 `["LONG"]`——先保护仓位，再开新仓。
+
+这项设计通过 **System Prompt + User Prompt Instructions + Judge Prompt** 三层提示词共同强制，不需要额外代码逻辑。
+
 ## 架构概览
 
 ```
@@ -73,14 +109,14 @@
 
 ### 数据流
 
-1. **DataProvider** — 行情数据走主网（`meta_and_asset_ctxs`，含 mark/oracle/funding/OI），多周期 K 线 TTL 缓存
-2. **策略引擎** — Single：单次 LLM 分析；Debate：三 Agent 辩论 + Judge 裁决（60s 超时）
-3. **RiskManager** — 七层风控校验（熔断、置信度、仓位上限、保证金需求、风险金额、止损距离、方向）
-4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + SL/TP 价格追踪 + 15/15 SDK 全覆盖
+1. **DataProvider** — 行情数据走主网（`meta_and_asset_ctxs`，含 mark/oracle/funding/OI），多周期 K 线 TTL 缓存。同步查询链上全部挂单（`open_orders`）
+2. **策略引擎** — Single：单次 LLM 分析；Debate：三 Agent 辩论 + Judge 裁决（60s 超时）。两种模式均遵循 Step 0→Step 1 决策工作流
+3. **RiskManager** — 七层风控校验 + `validate_sequence()` 多操作状态模拟（支持翻转 CLOSE+LONG/SHORT 风控通过）
+4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + SL/TP 价格追踪 + 多操作顺序执行（失败即停）+ 15/15 SDK 全覆盖
 5. **TradeLogger** — 盈亏分析 + LLM 表现反馈（自省循环）
 6. **OrderMonitor** — WebSocket 实时订阅订单状态变化（成交/部分成交/取消/清算），毫秒级同步到 PositionTracker，使 LLM 在下一周期看到最新状态
 7. **FlashReporter** — 消费 WS 事件 → Flash 模型生成中文自然语言通知 → 微信/飞书推送
-8. **上下文注入** — 每轮将账户余额、持仓、**全部链上挂单**（含孤儿订单）和 tracker 追踪的 SL/TP 价格注入 LLM prompt。LLM 能识别并取消上一轮遗留的过期订单
+8. **上下文注入** — 每轮将账户余额、持仓、**全部链上挂单**（含孤儿订单）和 tracker 追踪的 SL/TP 价格注入 LLM prompt。**LLM 决策前先做 SL/TP 链上验证**——若 SL/TP 丢失，prompt 中显示 ⚠️ 告警并要求 LLM 优先修复
 9. **自适应间隔** — LLM 建议下次唤醒时间（5min-3h），横盘省费/关键位盯紧
 
 ### 技术栈
@@ -890,7 +926,7 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 
 ## 风控规则
 
-### 七层校验
+### 多层防护
 
 | 层级 | 检查项 | 规则 |
 |------|--------|------|
@@ -900,7 +936,9 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 4 | **保证金需求** | `size × price / leverage` ≤ 可用余额的 95%，超出则拒绝并建议合理 size |
 | 5 | **风险金额** | 单笔止损亏损 > 1% 账户警告，> 2% 拒绝（`\|entry - SL\| × size`） |
 | 6 | **止损距离** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝） |
-| 7 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；支持翻转（CLOSE+LONG/SHORT）风控模拟状态转换 |
+| 7 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换 |
+| — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`，丢失时 prompt 告警 + 推送通知 |
+| — | **多操作失败即停** | 序列中任一非 HOLD 操作失败，立即停止后续操作，防止半完成状态 |
 
 ### 熔断状态机
 
@@ -909,6 +947,7 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
                             │
                             │ (期间亏损不延长 cooldown)
                             │ (期间盈利自动清零)
+                            │ (CLOSE/MODIFY_SL/MODIFY_TP 始终允许)
                             ▼
                         Cooldown 继续倒数
 ```
@@ -1183,19 +1222,28 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash # Flash 模型
 能。每次 LLM 决策前，系统注入三类信息：
 
 1. **链上仓位**：`DataProvider` 查询 `user_state`，获取持仓方向、大小、入场价、浮动盈亏
-2. **全部链上挂单**：`DataProvider` 查询 `open_orders`，列出所有未成交订单（oid、方向、数量、价格）。LLM 能看到**所有**订单——包括上一轮遗留的孤儿订单——并决定是否取消它们
+2. **全部链上挂单**：`DataProvider` 查询 `open_orders`，列出所有未成交订单（oid、方向、数量、价格）。LLM 能看到**所有**订单——包括上一轮遗留的孤儿订单
 3. **Tracker 追踪的 SL/TP**：`PositionTracker.to_orders_summary()` 输出 bot 自己创建的 SL/TP 的 oid 和价格
+4. **SL/TP 链上验证结果**：程序在 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`，若发现丢失，在 prompt 中注入 ⚠️ 告警
+
+更重要的是，LLM 的 **System Prompt 强制执行 Step 0**——在分析市场之前先审视已有持仓和挂单。这确保 LLM 不会跳过现状评估直接做新交易决策。
 
 加上 **OrderMonitor** 的 WebSocket 实时同步，`PositionTracker` 在订单成交瞬间更新——大模型在下一个决策周期就能看到最新状态。
 
 ### Q: 如果上一轮运行留下了未成交的限价单怎么办？
 
-每个周期 LLM prompt 会列出**全部链上挂单**，并提示：
+两层保护：
 
-> If these orders are stale (from a previous run) or conflict with your
-> current strategy, you should cancel them before placing new ones.
+1. **程序化**：限价单 3 个周期未成交自动取消（`max_resting_cycles=3`）
+2. **LLM 判断**：每个周期 prompt 列出**全部链上挂单**，且 Step 0-c 要求 LLM 检查僵尸订单。LLM 可以判断这些订单是否还有效，通过 `CLOSE` 清理或在下个 `actions` 中覆盖。你也可以用 `--status` 手动查看。
 
-LLM 可以判断这些订单是否还有效，选择保留或建议取消。你也可以用 `--status` 手动查看并用 CLI 清理。
+### Q: SL/TP 订单会被交易所意外取消吗？如何防护？
+
+有。三层保护：
+
+1. **程序化验证**：每周期 LLM 调用前，`verify_tracked_orders()` 交叉对比 tracker 记录的 `sl_oid`/`tp_oid` 与链上 `open_orders`。若发现丢失 → prompt 注入 ⚠️ 告警 + 推送通知
+2. **LLM 响应**：Step 0-b 要求 LLM 将 SL/TP 丢失视为最高优先级，输出 `MODIFY_SL`/`MODIFY_TP` 立即恢复
+3. **WebSocket 实时感知**：若 SL/TP 被执行（成交）或被取消，`OrderMonitor` 毫秒级同步到 tracker
 
 ### Q: 程序会因为异常崩溃吗？
 
