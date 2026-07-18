@@ -72,7 +72,7 @@
 
 | 组件 | 技术 |
 |------|------|
-| 大模型 | Kimi K3 (主) + DeepSeek V3 (自动降级备份) |
+| 大模型 | Kimi K3 (主) + DeepSeek V3/V4 (自动降级备份) |
 | LLM 编排 | LangChain + LangGraph StateGraph |
 | 状态持久化 | LangGraph MemorySaver + JSONL 文件（fcntl 锁） |
 | 交易所 | Hyperliquid (Perpetual DEX) |
@@ -130,11 +130,11 @@ REASONING_EFFORT=off      # 关闭推理，大幅节省 token
 
 底层转换：
 
-| 配置 | Kimi K3 | DeepSeek V3 |
+| 配置 | Kimi K3 | DeepSeek V3/V4 |
 |------|---------|-------------|
-| `max` | `reasoning_effort: "max"` | `thinking: enabled` |
-| `high` ~ `minimal` | 不传参（K3 仅支持 max） | `thinking: enabled` |
-| `off` | 不传参 | `thinking: disabled` |
+| `max` | `reasoning_effort: "max"` | `extra_body → thinking: enabled` |
+| `high` ~ `minimal` | 不传参（K3 仅支持 max） | `extra_body → thinking: enabled` |
+| `off` | 不传参 | `extra_body → thinking: disabled` |
 
 **费用影响**：推理 token 占输出 80%。`REASONING_EFFORT=off` 每次调用可节省约 **75% 输出费用**。适合高频轮询或低成本模式。
 
@@ -855,9 +855,27 @@ PRIMARY_LLM=deepseek  # DeepSeek 主力，Kimi 备份（省钱）
 
 只需配好两个模型的 API Key，主模型挂了自动切备机。不需改任何代码。见 [LLM 模型配置](#llm-模型配置)。
 
+### Q: 设了 `PRIMARY_LLM=deepseek`，但 HTTP 请求还是发到 Kimi API？
+
+DeepSeek 调用失败时会静默降级到 Kimi（LangChain `with_fallbacks` 机制），`httpx` 日志只记录成功的请求，所以看到的全是 `api.moonshot.cn`。常见原因：
+
+1. **`thinking` 参数格式错误** — 必须通过 `extra_body` 传递（v2.2+ 已修复）
+2. **API key 过期或余额不足**
+3. **网络不可达**（某些机房有墙）
+
+快速诊断：
+```bash
+# 在服务器上直接测试 DeepSeek API
+curl -s https://api.deepseek.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+  -d '{"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
+```
+正常返回 JSON → API 通；报错/超时 → 检查网络和 key。
+
 ### Q: Kimi API 挂了怎么办？
 
-配置 `DEEPSEEK_API_KEY` 即可。Kimi 调用失败时自动切换到 DeepSeek V3，无需人工干预。日志会显示 `LLM: kimi primary → fallback: deepseek`。未配置则仅用 Kimi。
+配置 `DEEPSEEK_API_KEY` 即可。Kimi 调用失败时自动切换到 DeepSeek，无需人工干预。日志会显示 `LLM: kimi primary → fallback: deepseek`。未配置则仅用 Kimi。
 
 ### Q: 程序会因为异常崩溃吗？
 
