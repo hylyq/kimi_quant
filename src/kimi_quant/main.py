@@ -659,7 +659,12 @@ def main():
         type=float,
         default=None,
         metavar="AMOUNT",
-        help="Deposit USDC from Arbitrum to Hyperliquid and exit",
+        help="Deposit USDC from Arbitrum to Hyperliquid (experimental, use official UI instead)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation prompts (use with --deposit for scripting)",
     )
     parser.add_argument(
         "--arb-balance",
@@ -679,7 +684,7 @@ def main():
 
     if args.deposit is not None:
         from kimi_quant.deposit import cmd_deposit
-        cmd_deposit(args.deposit)
+        cmd_deposit(args.deposit, force=args.force)
         return
 
     if args.history:

@@ -1,7 +1,18 @@
 """Deposit USDC from Arbitrum to Hyperliquid L1.
 
-Hyperliquid's bridge credits the sender's L1 address automatically
-when USDC is transferred to the bridge contract on Arbitrum.
+⚠️ WARNING — USE AT YOUR OWN RISK ⚠️
+
+This module calls ERC20 `transfer` to the Hyperliquid Bridge2 contract.
+The bridge MAY NOT accept plain transfers — it might require a specific
+`deposit()` function call. If that's the case, USDC sent via this method
+could be IRREVERSIBLY LOST.
+
+The SAFEST way to deposit is the official UI:
+  https://app.hyperliquid.xyz/trade → Deposit
+
+This module is provided as a reference. Verify the bridge contract
+interface against Hyperliquid's official documentation before using:
+  https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/bridge2
 
 Minimum deposit: 5 USDC. Amounts below this are lost by the bridge.
 """
@@ -170,19 +181,32 @@ def deposit_usdc(amount: float) -> TxReceipt:
     return receipt
 
 
-def cmd_deposit(amount: float) -> None:
+def cmd_deposit(amount: float, force: bool = False) -> None:
     """CLI handler for deposit command."""
     try:
         usdc_bal, eth_bal = check_balance()
+        acct = _get_account()
         print(f"Arbitrum balances: {usdc_bal:.2f} USDC | {eth_bal:.6f} ETH")
-        print(f"From: {_get_account().address}")
+        print(f"From: {acct.address}")
         print(f"To:   {BRIDGE_ADDRESS} (Hyperliquid Bridge2)")
+        print()
+        print("⚠️  This tool is experimental. The SAFEST way is:")
+        print("    https://app.hyperliquid.xyz/trade → Deposit")
         print()
 
         if amount <= 0:
             print(f"Usage: uv run kimi-quant --deposit <amount>")
             print(f"  Minimum deposit: {MIN_DEPOSIT_USDC} USDC")
             return
+
+        if not force:
+            resp = input(
+                f"Deposit {amount:.2f} USDC to Hyperliquid Bridge2? "
+                f"Type YES to confirm: "
+            )
+            if resp.strip() != "YES":
+                print("Cancelled.")
+                return
 
         print(f"Depositing {amount:.2f} USDC...")
         receipt = deposit_usdc(amount)
