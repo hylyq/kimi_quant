@@ -128,7 +128,9 @@ HOLD_USER_PROMPT = (
 
 JUDGE_SYSTEM_PROMPT = """\
 You are the Head Trader. Your team (Bull/Long, Bear/Short, Risk/Hold) debated. \
-Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, or MODIFY_SL.
+Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, or MODIFY_TP. \
+For multi-step actions, use the `actions` array: ["CLOSE", "SHORT"] to flip, \
+["MODIFY_SL", "MODIFY_TP"] to adjust both stops.
 
 Decision framework (higher TF = more weight: 4h > 1h > 15m > 5m):
 - 1h+4h aligned + strong argument → confidence 0.75+
@@ -142,10 +144,17 @@ Guidelines:
 - Divergence = smaller size + tighter stop, NOT automatic HOLD
 - Confidence < 0.65 → skip trade
 - stop_loss mandatory for LONG/SHORT, min 0.5% from entry
+- Open orders: verify that SL/TP orders reported by the tracker actually
+  appear on the chain open orders list. If SL/TP are missing, the position
+  is UNPROTECTED — use MODIFY_SL or MODIFY_TP to restore them, or CLOSE.
+  If chain shows stale/manual orders not in the tracker, clean them up.
 
 Output TradingSignal JSON:
-- action, confidence, reasoning, size (BTC), entry_price (null=market),
-  stop_loss, take_profit, modify_sl_to, key_factors (2-4 items),
+- actions: ordered list of actions (preferred). Use for flip ["CLOSE", "SHORT"],
+  adjust both ["MODIFY_SL", "MODIFY_TP"], or single ["LONG"].
+  For backward compatibility, may also output a single `action` string.
+- confidence, reasoning, size (BTC), entry_price (null=market),
+  stop_loss, take_profit, modify_sl_to, modify_tp_to, key_factors (2-4 items),
   next_interval (null=default, range 300-10800s): ONLY use 300-600 for
   active positions or confirmed breakout setups. Default to null or 1800+
   for normal HOLD conditions. When in doubt, go longer.
@@ -462,6 +471,21 @@ class DebateStrategy:
         prompt = self.build_market_prompt(market_data)
         account = market_data.get("account")
         account_summary = account.to_summary() if account else "No position"
+
+        # Inject open orders context so the Judge can see SL/TP state
+        orders_summary = market_data.get("open_orders_summary", "")
+        if orders_summary:
+            account_summary += "\n" + orders_summary
+        sl_tp_status = market_data.get("sl_tp_status", {})
+        if sl_tp_status.get("sl_missing"):
+            account_summary += (
+                "\n⚠️ STOP LOSS MISSING from exchange — position is unprotected!"
+            )
+        if sl_tp_status.get("tp_missing"):
+            account_summary += (
+                "\n⚠️ TAKE PROFIT MISSING from exchange!"
+            )
+
         cycle_id = datetime.now(timezone.utc).isoformat()
 
         initial_state: DebateState = {

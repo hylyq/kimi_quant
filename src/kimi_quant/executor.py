@@ -466,45 +466,104 @@ class TradeExecutor:
     # ─── Main entry point ────────────────────────────────────────────────
 
     def execute(self, signal: TradingSignal) -> dict:
-        """Execute a trading signal. Returns result with position summary."""
-        result: dict = {}
+        """Execute a trading signal. Supports multi-action sequences.
 
-        # Pre-check: if we have a resting limit order that's unfilled,
-        # don't place new orders — check chain state first
-        if signal.action in ("LONG", "SHORT") and self.tracker.has_resting_order():
-            logger.warning(
-                "Limit order #%d still resting — skip new entry",
-                self.tracker.entry_oid,
-            )
-            return {
-                "action": signal.action,
-                "executed": False,
-                "reason": "Previous limit order still resting",
-                "position": self.tracker.to_summary(),
-            }
+        Actions are executed in order. Execution stops on the first
+        non-HOLD failure to avoid partial state.
+        """
+        actions = signal.get_actions()
+        results: list[dict] = []
 
-        if signal.action == "HOLD":
+        for i, action in enumerate(actions):
+            is_first = (i == 0)
+
+            # Pre-check: if we have a resting limit order that's unfilled,
+            # don't place new entry orders — check chain state first.
+            # Only applies to the first action (subsequent actions in a flip
+            # should proceed since CLOSE already cleared the tracker).
+            if is_first and action in ("LONG", "SHORT") and self.tracker.has_resting_order():
+                logger.warning(
+                    "Limit order #%d still resting — skip new entry",
+                    self.tracker.entry_oid,
+                )
+                return {
+                    "action": "/".join(actions),
+                    "executed": False,
+                    "reason": "Previous limit order still resting",
+                    "position": self.tracker.to_summary(),
+                }
+
+            result = self._dispatch(action, signal)
+            results.append(result)
+
+            # Stop on first failure. HOLD is never "executed" but is not a
+            # failure — it's an intentional no-op. Only real failures stop.
+            if action != "HOLD" and not result.get("executed"):
+                logger.warning(
+                    "Action %d/%d (%s) failed — stopping sequence. %s",
+                    i + 1, len(actions), action, result.get("reason", ""),
+                )
+                break
+
+        return self._merge_results(actions, results, signal)
+
+    def _dispatch(self, action: str, signal: TradingSignal) -> dict:
+        """Execute a single action from a trading signal."""
+        if action == "HOLD":
             logger.info("HOLD — no action taken")
-            result = {"action": "HOLD", "executed": False,
-                      "reason": signal.reasoning}
+            return {"action": "HOLD", "executed": False,
+                    "reason": signal.reasoning}
 
-        elif signal.action == "CLOSE":
-            result = self._close_position()
+        elif action == "CLOSE":
+            return self._close_position()
 
-        elif signal.action == "MODIFY_SL":
-            result = self._handle_modify_sl(signal)
+        elif action == "MODIFY_SL":
+            return self._handle_modify_sl(signal)
 
-        elif signal.action in ("LONG", "SHORT"):
-            result = self._open_position(
-                signal, is_buy=(signal.action == "LONG")
+        elif action == "MODIFY_TP":
+            return self._handle_modify_tp(signal)
+
+        elif action in ("LONG", "SHORT"):
+            return self._open_position(
+                signal, is_buy=(action == "LONG")
             )
 
         else:
-            result = {"action": signal.action, "executed": False,
-                      "reason": f"Unknown action: {signal.action}"}
+            return {"action": action, "executed": False,
+                    "reason": f"Unknown action: {action}"}
 
-        result["position"] = self.tracker.to_summary()
-        return result
+    def _merge_results(
+        self, actions: list[str], results: list[dict], signal: TradingSignal
+    ) -> dict:
+        """Merge individual action results into a single result dict."""
+        executed = all(r.get("executed") for r in results)
+        action_label = "/".join(actions)
+
+        merged: dict = {
+            "action": action_label,
+            "executed": executed,
+            "actions": actions,
+            "results": results,
+        }
+
+        # Forward key fields from the last result (price/size info)
+        if results:
+            last = results[-1]
+            for key in ("dry_run", "side", "size", "entry_price",
+                        "stop_loss", "take_profit", "oids", "result",
+                        "new_sl", "new_tp"):
+                if key in last:
+                    merged[key] = last[key]
+
+        # If any action failed, include the first failure reason
+        if not executed:
+            for r in results:
+                if not r.get("executed") and r.get("reason"):
+                    merged["reason"] = r["reason"]
+                    break
+
+        merged["position"] = self.tracker.to_summary()
+        return merged
 
     # ─── Chain State Sync (called from main loop each cycle) ─────────────
 
@@ -571,6 +630,56 @@ class TradeExecutor:
             self.tracker.entry_price = chain_entry
             self.tracker.state = "active"
             self.tracker.coin = self.coin
+
+    def verify_tracked_orders(self, open_orders_raw: list[dict]) -> dict:
+        """Cross-reference tracker SL/TP oids against chain open orders.
+
+        Called each cycle when there's an active position. Returns a dict
+        indicating which tracked orders are missing from the exchange.
+
+        Args:
+            open_orders_raw: List of open order dicts from the chain API.
+
+        Returns:
+            {"sl_missing": bool, "tp_missing": bool}
+        """
+        result = {"sl_missing": False, "tp_missing": False}
+
+        if not self.tracker.has_position():
+            return result
+
+        # Build set of chain order IDs for this coin
+        chain_oids: set[int] = set()
+        for o in open_orders_raw:
+            if o.get("coin") == self.coin:
+                oid = o.get("oid")
+                if oid is not None:
+                    chain_oids.add(int(oid))
+
+        # Check SL
+        if self.tracker.sl_oid is not None and self.tracker.sl_oid not in chain_oids:
+            logger.warning(
+                "SL order #%d ($%.0f) NOT FOUND on chain! Position is unprotected.",
+                self.tracker.sl_oid, self.tracker.sl_price,
+            )
+            result["sl_missing"] = True
+
+        # Check TP
+        if self.tracker.tp_oid is not None and self.tracker.tp_oid not in chain_oids:
+            logger.warning(
+                "TP order #%d ($%.0f) NOT FOUND on chain!",
+                self.tracker.tp_oid, self.tracker.tp_price,
+            )
+            result["tp_missing"] = True
+
+        if not result["sl_missing"] and not result["tp_missing"]:
+            logger.debug(
+                "SL/TP verification OK: SL=#%d ($%.0f), TP=#%d ($%.0f) both on chain",
+                self.tracker.sl_oid, self.tracker.sl_price,
+                self.tracker.tp_oid, self.tracker.tp_price,
+            )
+
+        return result
 
     # ─── Open Position ───────────────────────────────────────────────────
 
@@ -956,6 +1065,39 @@ class TradeExecutor:
         self.tracker.sl_price = new_sl  # track the new SL price for LLM visibility
         return self.modify_stop_loss(
             oid=sl_oid, new_price=new_sl,
+            is_buy=(self.tracker.side == "short"),
+            size=self.tracker.size,
+        )
+
+    def _handle_modify_tp(self, signal: TradingSignal) -> dict:
+        """Move take profit using tracked oid. Requires active position."""
+        new_tp = signal.modify_tp_to or signal.take_profit
+        if new_tp is None:
+            return {"action": "MODIFY_TP", "executed": False,
+                    "reason": "No new take profit price provided"}
+
+        if not self.tracker.has_position():
+            return {"action": "MODIFY_TP", "executed": False,
+                    "reason": f"No active position (state={self.tracker.state})"}
+
+        tp_oid = self.tracker.tp_oid
+
+        if self.dry_run:
+            self.tracker.tp_price = new_tp
+            return {
+                "action": "MODIFY_TP", "executed": True, "dry_run": True,
+                "tp_oid": tp_oid, "new_tp": new_tp,
+                "reasoning": signal.reasoning,
+            }
+
+        if tp_oid is None:
+            return {"action": "MODIFY_TP", "executed": False,
+                    "reason": "No tracked TP order ID."}
+
+        logger.info("MODIFY_TP: moving TP #%d to $%.1f", tp_oid, new_tp)
+        self.tracker.tp_price = new_tp  # track the new TP price for LLM visibility
+        return self.modify_take_profit(
+            oid=tp_oid, new_price=new_tp,
             is_buy=(self.tracker.side == "short"),
             size=self.tracker.size,
         )

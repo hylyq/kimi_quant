@@ -83,6 +83,62 @@ class RiskManager:
         logger.info("All risk checks passed")
         return RiskCheck(passed=True, reason="All checks passed")
 
+    def validate_sequence(
+        self,
+        signal: TradingSignal,
+        current_position_size: float = 0.0,
+        current_position_side: str = "none",
+        mid_price: float = 0.0,
+        account_balance: float | None = None,
+    ) -> RiskCheck:
+        """Validate a multi-action sequence with simulated state transitions.
+
+        Each action is validated against the state that would result from
+        executing all prior actions. For example, ["CLOSE", "SHORT"] validates
+        CLOSE against the current long position, then SHORT against a simulated
+        "no position" state (since CLOSE would have cleared it).
+
+        Falls back to single-action validate() for backward compatibility.
+        """
+        actions = signal.get_actions()
+        sim_side = current_position_side
+        sim_size = current_position_size
+
+        for i, action in enumerate(actions):
+            temp = TradingSignal(
+                action=action,
+                confidence=signal.confidence,
+                reasoning=signal.reasoning,
+                size=signal.size,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                modify_sl_to=signal.modify_sl_to,
+                modify_tp_to=signal.modify_tp_to,
+                key_factors=signal.key_factors,
+            )
+            check = self.validate(
+                temp, sim_size, sim_side, mid_price, account_balance,
+            )
+            if not check.passed:
+                logger.warning(
+                    "Risk check FAILED for action %d/%d (%s): %s",
+                    i + 1, len(actions), action, check.reason,
+                )
+                return check
+
+            # Simulate state change from this action for the next iteration
+            if action == "CLOSE":
+                sim_side = "none"
+                sim_size = 0.0
+            elif action in ("LONG", "SHORT"):
+                sim_side = "long" if action == "LONG" else "short"
+                sim_size = signal.size or self.max_position
+            # MODIFY_SL, MODIFY_TP, HOLD: state unchanged
+
+        logger.info("All risk checks passed (%d actions)", len(actions))
+        return RiskCheck(passed=True, reason=f"All {len(actions)} actions passed")
+
     # ─── Lifecycle (called from main loop) ────────────────────────────────
 
     def record_loss(self, pnl: float) -> None:
@@ -138,10 +194,10 @@ class RiskManager:
     def _check_circuit_breaker(self, signal: TradingSignal) -> RiskCheck:
         """Block new positions if circuit breaker is active.
 
-        CLOSE and MODIFY_SL are always allowed (risk-reducing actions).
+        CLOSE, MODIFY_SL, and MODIFY_TP are always allowed (risk-reducing actions).
         HOLD is a no-op.
         """
-        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL"):
+        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL", "MODIFY_TP"):
             return RiskCheck(passed=True, reason="Not a new position")
 
         if self.cooldown_remaining > 0:
@@ -159,7 +215,7 @@ class RiskManager:
         return RiskCheck(passed=True, reason="Circuit breaker OK")
 
     def _check_confidence(self, signal: TradingSignal) -> RiskCheck:
-        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL"):
+        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL", "MODIFY_TP"):
             return RiskCheck(passed=True, reason="Confidence not required")
 
         if signal.confidence < self.min_confidence:
@@ -178,7 +234,7 @@ class RiskManager:
         mid_price: float,
         account_balance: float | None,
     ) -> RiskCheck:
-        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL"):
+        if signal.action in ("HOLD", "CLOSE", "MODIFY_SL", "MODIFY_TP"):
             return RiskCheck(passed=True, reason="No size needed")
 
         size = signal.size or self.max_position
@@ -251,6 +307,8 @@ class RiskManager:
             return RiskCheck(passed=False, reason="No position to close")
         if signal.action == "MODIFY_SL" and current_side == "none":
             return RiskCheck(passed=False, reason="No position to modify SL for")
+        if signal.action == "MODIFY_TP" and current_side == "none":
+            return RiskCheck(passed=False, reason="No position to modify TP for")
 
         return RiskCheck(passed=True, reason="Direction OK")
 

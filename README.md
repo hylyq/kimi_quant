@@ -818,22 +818,26 @@ Hyperliquid 支持三种账户模式：
 
 ## TradingSignal
 
-### LLM 输出格式
+### LLM 输出格式（推荐：多操作 `actions`）
 
 ```json
 {
-  "action": "LONG",
+  "actions": ["CLOSE", "SHORT"],
   "confidence": 0.85,
-  "reasoning": "1h 和 4h 均上涨，订单簿 bid wall 强劲...",
+  "reasoning": "1h 趋势反转确认，先平多仓再开空...",
   "size": 0.005,
   "entry_price": 87000.0,
-  "stop_loss": 86500.0,
-  "take_profit": 88000.0,
+  "stop_loss": 88000.0,
+  "take_profit": 85000.0,
   "modify_sl_to": null,
-  "key_factors": ["4h uptrend", "bid wall at 86500", "funding neutral"],
+  "modify_tp_to": null,
+  "key_factors": ["1h breakdown", "ask wall stacking", "funding positive"],
   "next_interval": 120
 }
 ```
+
+> **`actions` 优先**：LLM 应输出 `actions` 数组。单个操作用 `["LONG"]`，翻转仓位用 `["CLOSE", "SHORT"]`，调整止盈止损用 `["MODIFY_SL", "MODIFY_TP"]`。仍支持旧格式 `action` 字符串以保证向后兼容。
+
 > `next_interval`：LLM 建议的下次唤醒秒数（60-10800），null 则用默认值。上例中 120s 表示开仓后紧盯。
 
 ### Action 说明
@@ -845,12 +849,26 @@ Hyperliquid 支持三种账户模式：
 | `CLOSE` | 平仓信号 | 市价平仓 |
 | `HOLD` | 观望/不确定 | 无操作 |
 | `MODIFY_SL` | 移动止损 | 将 SL 移至新价格（保本/追踪止损） |
+| `MODIFY_TP` | 移动止盈 | 将 TP 移至新价格（调整目标） |
+
+### 多操作组合（`actions` 数组）
+
+单个周期可执行有序操作序列，执行器按顺序执行，失败即停：
+
+| 场景 | `actions` | 说明 |
+|------|-----------|------|
+| 翻转仓位 | `["CLOSE", "SHORT"]` | 先平多仓，再开空仓 |
+| 调整止盈止损 | `["MODIFY_SL", "MODIFY_TP"]` | 同时移动 SL 和 TP |
+| 单操作 | `["LONG"]` | 等价于旧格式 `action="LONG"` |
 
 **字段说明**：
+- `actions`: **推荐使用**。有序操作列表，执行器按序执行，遇失败停止后续操作
+- `action`: 旧格式（仍支持），当 `actions` 为 null 时使用
 - `entry_price`: 设为具体价格 → 限价单；设为 `null` → 市价单（Ioc）
 - `stop_loss`: **强制字段**，LONG/SHORT 时必须提供，且距入场价 ≥ 0.5%
 - `size`: `null` 时自动使用 `MAX_POSITION_SIZE`
-- `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格。LLM 可在 prompt 中看到当前 SL/TP 价格（通过 `to_orders_summary`），从而做出合理的移动决策
+- `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格
+- `modify_tp_to`: 仅 MODIFY_TP 时使用，指定新的止盈价格
 
 ### Cycle Status
 
@@ -882,7 +900,7 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 4 | **保证金需求** | `size × price / leverage` ≤ 可用余额的 95%，超出则拒绝并建议合理 size |
 | 5 | **风险金额** | 单笔止损亏损 > 1% 账户警告，> 2% 拒绝（`\|entry - SL\| × size`） |
 | 6 | **止损距离** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝） |
-| 7 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL 需已持仓 |
+| 7 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；支持翻转（CLOSE+LONG/SHORT）风控模拟状态转换 |
 
 ### 熔断状态机
 

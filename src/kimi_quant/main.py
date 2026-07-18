@@ -94,6 +94,21 @@ def run_once_single(
     if orders_summary:
         report["open_orders_summary"] = orders_summary
 
+    # Verify tracked SL/TP orders exist on chain BEFORE LLM analysis
+    # so the LLM prompt includes any missing-order warnings
+    sl_tp_status = {"sl_missing": False, "tp_missing": False}
+    if executor.tracker.has_position():
+        open_orders_raw = report.get("open_orders_raw", [])
+        sl_tp_status = executor.verify_tracked_orders(open_orders_raw)
+        if sl_tp_status["sl_missing"]:
+            notify.send(
+                "⚠️ Stop Loss order missing from exchange\n"
+                "Position is unprotected. LLM will attempt to restore."
+            )
+        if sl_tp_status["tp_missing"]:
+            logger.warning("TP order missing from exchange — LLM will be notified")
+    report["sl_tp_status"] = sl_tp_status
+
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
 
@@ -147,6 +162,21 @@ def run_once_debate(
     orders_summary = executor.tracker.to_orders_summary()
     if orders_summary:
         report["open_orders_summary"] = orders_summary
+
+    # Verify tracked SL/TP orders exist on chain BEFORE debate
+    # so the debaters and judge see any missing-order warnings
+    sl_tp_status = {"sl_missing": False, "tp_missing": False}
+    if executor.tracker.has_position():
+        open_orders_raw = report.get("open_orders_raw", [])
+        sl_tp_status = executor.verify_tracked_orders(open_orders_raw)
+        if sl_tp_status["sl_missing"]:
+            notify.send(
+                "⚠️ Stop Loss order missing from exchange\n"
+                "Position is unprotected. Debate will attempt to restore."
+            )
+        if sl_tp_status["tp_missing"]:
+            logger.warning("TP order missing from exchange — debate will be notified")
+    report["sl_tp_status"] = sl_tp_status
 
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)
@@ -245,8 +275,9 @@ def _validate_and_execute(
     # Tick circuit breaker cooldown
     risk.tick_cooldown()
 
-    # ── Phase 2: Risk validation ──
-    risk_check = risk.validate(
+    # ── Phase 2: Risk validation (multi-action aware) ──
+    actions = signal_result.get_actions()
+    risk_check = risk.validate_sequence(
         signal_result, current_size, current_side,
         mid_price=mid_price, account_balance=account_balance,
     )
@@ -255,17 +286,22 @@ def _validate_and_execute(
         notify.send(f"🛡️ Risk rejected: {risk_check.reason}")
         return {
             "status": "rejected",
-            "signal": signal_result.action,
+            "signal": "/".join(actions),
             "confidence": signal_result.confidence,
             "reason": risk_check.reason,
         }
 
     # ── Phase 3: Record trade open intent ──
     trade_opened_this_cycle = False
-    if (signal_result.action in ("LONG", "SHORT")
+    has_close = "CLOSE" in actions
+    has_open = any(a in ("LONG", "SHORT") for a in actions)
+    if (has_open
             and not executor.tracker.has_resting_order()
-            and not executor.tracker.has_position()):
-        side = "long" if signal_result.action == "LONG" else "short"
+            and (not executor.tracker.has_position() or has_close)):
+        # Determine the side from the LAST directional action in the sequence
+        open_action = next((a for a in reversed(actions)
+                           if a in ("LONG", "SHORT")), None)
+        side = "long" if open_action == "LONG" else "short"
         size = signal_result.size or config.max_position_size
         entry_price = signal_result.entry_price or mid_price
         trade_logger.open_trade(
@@ -276,8 +312,9 @@ def _validate_and_execute(
         notional = size * entry_price
         margin = notional / config.max_leverage
         total_balance = account.balance if account else 0.0
+        action_label = " → ".join(actions)
         notify.send(
-            f"📈 {signal_result.action} {size} BTC @ ${entry_price:.0f}\n"
+            f"📈 {action_label} {size} BTC @ ${entry_price:.0f}\n"
             f"Notional: ${notional:.0f} | Margin: ${margin:.2f} | Leverage: {config.max_leverage}x\n"
             f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
             f"Confidence: {signal_result.confidence:.2f} | Balance: ${total_balance:.2f}"
@@ -289,14 +326,18 @@ def _validate_and_execute(
                 result, executor.tracker.to_summary())
 
     # If execution failed after opening a pending trade this cycle, clean it up
-    if (signal_result.action in ("LONG", "SHORT")
-            and trade_opened_this_cycle
-            and not result.get("executed")):
+    if has_open and trade_opened_this_cycle and not result.get("executed"):
         trade_logger.cancel_pending()
         logger.warning("Execution failed — cancelled pending trade record")
 
     # ── Phase 5: Post-execution recording ──
-    if signal_result.action == "CLOSE" and result.get("executed"):
+    # Check individual results for CLOSE (multi-action or single)
+    results_list = result.get("results", [result])
+    close_was_executed = any(
+        r.get("action") == "CLOSE" and r.get("executed")
+        for r in results_list
+    )
+    if close_was_executed:
         exit_price = _get_exit_price(report)
         trade = trade_logger.close_trade(exit_price, reason="signal")
         if trade:
@@ -318,7 +359,7 @@ def _validate_and_execute(
     # will update it from actual chain fill data.
 
     # Derive a human-readable status
-    if signal_result.action == "HOLD":
+    if actions == ["HOLD"]:
         cycle_status = "hold"
     elif result.get("executed"):
         cycle_status = "executed"
@@ -327,7 +368,7 @@ def _validate_and_execute(
 
     return {
         "status": cycle_status,
-        "signal": signal_result.action,
+        "signal": "/".join(actions),
         "confidence": signal_result.confidence,
         "reasoning": signal_result.reasoning,
         "execution": result,

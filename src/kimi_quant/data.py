@@ -306,6 +306,9 @@ class MarketAnalysis:
             f"Higher TF (4h>1h>15m>5m) carry more weight. "
             f"Confluence → higher confidence. Divergence → follow higher TF, "
             f"reduce size, tighten SL. Stop loss min 0.5% from entry.\n"
+            f"Output via `actions` array. Use [\"CLOSE\", \"SHORT\"] to flip, "
+            f"[\"MODIFY_SL\", \"MODIFY_TP\"] to adjust both stops. "
+            f"Single action: [\"LONG\"], [\"HOLD\"], etc.\n"
         )
 
         if self.performance_context:
@@ -877,6 +880,22 @@ class DataProvider:
             orders = report.get("open_orders_summary", "")
             if orders:
                 prompt += "\n# Tracked Orders (known SL/TP)\n" + orders + "\n"
+
+            # Inject SL/TP verification status — alerts LLM if orders are missing
+            sl_tp_status = report.get("sl_tp_status", {})
+            if sl_tp_status.get("sl_missing"):
+                prompt += (
+                    "\n⚠️  STOP LOSS IS MISSING from exchange! "
+                    "The tracked SL order was NOT found in the chain open orders. "
+                    "Position is UNPROTECTED. You MUST use MODIFY_SL to set a new "
+                    "stop loss immediately, or CLOSE the position to exit.\n"
+                )
+            if sl_tp_status.get("tp_missing"):
+                prompt += (
+                    "\n⚠️  TAKE PROFIT IS MISSING from exchange! "
+                    "The tracked TP order was NOT found in the chain open orders. "
+                    "Consider MODIFY_TP to set a new take profit target.\n"
+                )
 
             # Inject performance context if present
             perf = report.get("performance_context", "")

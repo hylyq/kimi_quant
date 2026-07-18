@@ -152,10 +152,27 @@ class TradingSignal(BaseModel):
       CLOSE — close the current position
       HOLD  — no action
       MODIFY_SL — move existing stop loss to a new price (trailing/breakeven)
+      MODIFY_TP — move existing take profit to a new price
+
+    Multi-action support: use `actions` (ordered list) to execute a sequence
+    in one cycle. Examples:
+      ["CLOSE", "SHORT"] — flip long → short
+      ["MODIFY_SL", "MODIFY_TP"] — adjust both stops in one cycle
+      ["LONG"] — equivalent to action="LONG" (single action)
+    The executor stops on the first failure.
     """
 
     action: str = Field(
-        description="Trading action: LONG, SHORT, CLOSE, HOLD, or MODIFY_SL"
+        default="HOLD",
+        description="Trading action: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, or MODIFY_TP. "
+                    "Use `actions` for multi-action sequences instead.",
+    )
+    actions: list[str] | None = Field(
+        default=None,
+        description="Ordered list of actions to execute sequentially. "
+                    "e.g. ['CLOSE', 'SHORT'] to flip position, "
+                    "['MODIFY_SL', 'MODIFY_TP'] to adjust both stops. "
+                    "When set, `action` is ignored. Executor stops on first failure.",
     )
     confidence: float = Field(
         ge=0.0,
@@ -185,6 +202,10 @@ class TradingSignal(BaseModel):
         default=None,
         description="New stop loss price when action=MODIFY_SL (e.g., move to breakeven)",
     )
+    modify_tp_to: float | None = Field(
+        default=None,
+        description="New take profit price when action=MODIFY_TP (e.g., adjust target)",
+    )
     key_factors: list[str] = Field(
         default_factory=list,
         description="Key factors that influenced this decision",
@@ -199,6 +220,16 @@ class TradingSignal(BaseModel):
             "Default recommendation: leave null unless you have a strong reason."
         ),
     )
+
+    def get_actions(self) -> list[str]:
+        """Return the ordered list of actions to execute.
+
+        When `actions` is set (multi-action mode), returns it directly.
+        Otherwise falls back to the single `action` field for backward compatibility.
+        """
+        if self.actions:
+            return self.actions
+        return [self.action]
 
 
 def build_market_prompt(market_data: dict[str, Any]) -> str:
@@ -232,6 +263,9 @@ def build_market_prompt(market_data: dict[str, Any]) -> str:
         f"\n# Instructions\n"
         f"Max position size: {_config.max_position_size} BTC.\n"
         f"Analyze the data above and produce a trading signal.\n"
+        f"Use `actions` array. Flip: [\"CLOSE\", \"SHORT\"]. "
+        f"Adjust stops: [\"MODIFY_SL\", \"MODIFY_TP\"]. "
+        f"Single: [\"LONG\"], [\"HOLD\"], etc.\n"
     )
 
     # Append performance context if available (LLM self-reflection)
@@ -256,9 +290,20 @@ Key principles:
 3. Funding: very positive → crowded longs (reversal risk); negative → shorts paying (squeeze risk).
 4. Multi-TF confluence → higher confidence. Divergence → follow higher TF, reduce size.
 5. When uncertain, HOLD. Confidence < 0.7 → skip trade.
+6. Open orders: check the Open Orders and Tracked Orders sections. Verify that SL/TP
+   orders reported by the tracker actually appear on the chain open orders list.
+   If SL/TP are missing from chain, the position is UNPROTECTED — use MODIFY_SL
+   or MODIFY_TP to restore them immediately, or CLOSE to exit. If the chain shows
+   stale/manual orders not in the tracker, decide whether to clean them up.
 
 Output JSON only (no markdown):
-- action: LONG|SHORT|CLOSE|HOLD|MODIFY_SL
+- actions: ordered list of actions to execute sequentially. Use this for:
+  - Single action: ["LONG"], ["SHORT"], ["CLOSE"], ["HOLD"], ["MODIFY_SL"], ["MODIFY_TP"]
+  - Flip position: ["CLOSE", "SHORT"] or ["CLOSE", "LONG"]
+  - Adjust both stops: ["MODIFY_SL", "MODIFY_TP"]
+  The executor runs actions in order and stops on first failure.
+  For backward compatibility, you may also output a single `action` string
+  instead of `actions` — but `actions` is preferred.
 - confidence: 0.0-1.0
 - reasoning: brief synthesis
 - size: BTC amount (null for CLOSE/HOLD)
@@ -266,6 +311,7 @@ Output JSON only (no markdown):
 - stop_loss: mandatory for directional (min 0.5% from entry)
 - take_profit: realistic target
 - modify_sl_to: new SL price (MODIFY_SL only)
+- modify_tp_to: new TP price (MODIFY_TP only)
 - key_factors: 2-4 items
 - next_interval: suggested seconds until next cycle (null=use default).
   Range 300-10800 (5min-3h). ONLY use 300-600 for active positions or confirmed
