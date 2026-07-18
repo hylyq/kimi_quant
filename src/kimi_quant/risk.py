@@ -3,9 +3,11 @@
 Checks:
   1. Confidence threshold
   2. Position size limits (with dynamic ATR-based sizing)
-  3. Direction validation (no redundant trades)
-  4. Stop loss distance (minimum % from entry)
-  5. Drawdown circuit breaker (pause after consecutive losses)
+  3. Margin requirement (position notional / leverage ≤ 95% available balance)
+  4. Risk amount (|entry - SL| × size ≤ 2% of balance)
+  5. Direction validation (no redundant trades)
+  6. Stop loss distance (minimum % from entry)
+  7. Drawdown circuit breaker (pause after consecutive losses)
 """
 
 import logging
@@ -189,6 +191,26 @@ class RiskManager:
                 passed=False,
                 reason=f"Size {size} exceeds max {self.max_position}",
             )
+
+        # Margin requirement check: ensure account can afford the position.
+        # Without this, the LLM can order a position whose required margin
+        # exceeds the available balance even though risk_amount passes below.
+        if account_balance and account_balance > 0 and mid_price > 0:
+            position_notional = size * mid_price
+            margin_required = position_notional / self.max_leverage
+            max_allowable_margin = account_balance * 0.95  # 95% of available balance
+
+            if margin_required > max_allowable_margin:
+                suggested_size = (max_allowable_margin * self.max_leverage) / mid_price
+                return RiskCheck(
+                    passed=False,
+                    reason=(
+                        f"Margin required ${margin_required:.2f} (${position_notional:.0f} "
+                        f"notional / {self.max_leverage}x) exceeds 95% of available "
+                        f"balance ${account_balance:.2f}. "
+                        f"Suggested size: {suggested_size:.4f} (actual: {size:.4f})"
+                    ),
+                )
 
         # Dynamic risk-based sizing: don't risk more than 1% of balance per trade
         if account_balance and account_balance > 0 and signal.stop_loss and mid_price > 0:

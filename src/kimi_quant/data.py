@@ -173,7 +173,8 @@ class OrderBookDepth:
 class AccountSnapshot:
     """Current account and position state."""
 
-    balance: float
+    balance: float  # total account value (includes uPNL)
+    available_balance: float  # balance - margin used (free for new positions)
     position_size: float
     position_side: str  # "long", "short", "none"
     entry_price: float
@@ -184,7 +185,8 @@ class AccountSnapshot:
     def to_summary(self) -> str:
         side = self.position_side.upper() if self.position_side != 'none' else 'NONE'
         return (
-            f"Balance=${self.balance:.0f} Pos={self.position_size:.4f}{config.trading_pair}({side}) "
+            f"Balance=${self.balance:.0f}(avail=${self.available_balance:.0f}) "
+            f"Pos={self.position_size:.4f}{config.trading_pair}({side}) "
             f"Entry=${self.entry_price:.1f} uPNL=${self.unrealized_pnl:.1f} "
             f"Margin=${self.margin_used:.0f} Lev={self.leverage}x"
         )
@@ -722,15 +724,14 @@ class DataProvider:
                 unrealized_pnl = 0
                 leverage = 1
 
-            margin_used = float(
-                user_state.get("marginSummary", {}).get("totalMarginUsed", 0)
-            )
-            balance = float(
-                user_state.get("marginSummary", {}).get("accountValue", 0)
-            )
+            margin_summary = user_state.get("marginSummary", {})
+            margin_used = float(margin_summary.get("totalMarginUsed", 0))
+            balance = float(margin_summary.get("accountValue", 0))
+            available_balance = max(0.0, balance - margin_used)
 
             return AccountSnapshot(
                 balance=balance,
+                available_balance=available_balance,
                 position_size=size,
                 position_side=side,
                 entry_price=entry_px,

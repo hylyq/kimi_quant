@@ -175,7 +175,7 @@ def _validate_and_execute(
         current_size = account.position_size
         current_side = account.position_side
         chain_entry = account.entry_price
-        account_balance = account.balance
+        account_balance = account.available_balance  # free margin, not total value
 
     # Capture tracker state BEFORE sync (sync may clear it)
     tracker_was_resting = executor.tracker.has_resting_order()
