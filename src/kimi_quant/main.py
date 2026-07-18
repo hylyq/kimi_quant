@@ -667,6 +667,217 @@ def cmd_history():
         strategy.close()
 
 
+def _get_hl_info():
+    """Create an Info instance for read-only chain queries."""
+    from eth_account import Account
+    from hyperliquid.info import Info
+
+    config.validate()
+    if not config.hl_private_key:
+        raise ValueError(
+            "HYPERLIQUID_PRIVATE_KEY is required. Set it in .env."
+        )
+
+    account = Account.from_key(config.hl_private_key)
+    base_url = (
+        "https://api.hyperliquid-testnet.xyz"
+        if config.hl_testnet
+        else config.hl_base_url
+    )
+    info = Info(base_url=base_url, skip_ws=True)
+    return info, account.address, base_url
+
+
+def cmd_status():
+    """Print live account status: balance, position, open orders, market price."""
+    from hyperliquid.info import Info
+
+    try:
+        info, address, base_url = _get_hl_info()
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
+
+    coin = config.trading_pair
+    testnet_label = "TESTNET" if config.hl_testnet else "Mainnet"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    print()
+    print("═" * 60)
+    print(f"  Kimi Quant — Account Status")
+    print(f"  Address: {address[:6]}...{address[-4:]}")
+    print(f"  Network: {testnet_label} | {now}")
+    print("═" * 60)
+
+    # ── Fetch data ────────────────────────────────────────────────────
+    try:
+        from kimi_quant.data import retry_api_call
+
+        user_state = retry_api_call(
+            lambda: info.user_state(address),
+            description="user_state",
+        )
+        open_orders = retry_api_call(
+            lambda: info.open_orders(address),
+            description="open_orders",
+        )
+        all_mids = retry_api_call(
+            lambda: info.all_mids(),
+            description="all_mids",
+        )
+    except Exception as e:
+        print(f"\n  ❌ Failed to fetch data: {e}")
+        return
+
+    mid_price = float(all_mids.get(coin, 0))
+    margin_summary = user_state.get("marginSummary", {})
+    total_balance = float(margin_summary.get("accountValue", 0))
+    margin_used = float(margin_summary.get("totalMarginUsed", 0))
+    available = max(0.0, total_balance - margin_used)
+
+    # ── Account Balance ───────────────────────────────────────────────
+    print()
+    print("  💰 Account Balance")
+    print(f"  Total Value:     ${total_balance:,.2f}")
+    print(f"  Available:       ${available:,.2f}")
+    print(f"  Margin Used:     ${margin_used:,.2f}")
+    if total_balance > 0:
+        print(f"  Margin Ratio:    {margin_used/total_balance*100:.1f}%")
+
+    # ── Position ──────────────────────────────────────────────────────
+    positions = user_state.get("assetPositions", [])
+    pos_data = None
+    for p in positions:
+        if p["position"]["coin"] == coin:
+            pos_data = p["position"]
+            break
+
+    print()
+    if pos_data:
+        raw_size = float(pos_data.get("szi", 0))
+        if raw_size > 0:
+            side = "LONG"
+            size = raw_size
+        elif raw_size < 0:
+            side = "SHORT"
+            size = abs(raw_size)
+        else:
+            side = "NONE"
+            size = 0.0
+
+        entry_px = float(pos_data.get("entryPx", 0))
+        u_pnl = float(pos_data.get("unrealizedPnl", 0))
+        leverage_raw = pos_data.get("leverage", {})
+        if isinstance(leverage_raw, dict):
+            leverage = int(leverage_raw.get("value", 1))
+        else:
+            leverage = int(leverage_raw) if leverage_raw else 1
+
+        notional = size * entry_px if entry_px > 0 else 0
+
+        print("  📊 Position")
+        print(f"  Side:            {side}")
+        print(f"  Size:            {size:.4f} {coin}")
+        if entry_px > 0:
+            print(f"  Entry Price:     ${entry_px:,.2f}")
+        if mid_price > 0:
+            print(f"  Mark Price:      ${mid_price:,.2f}")
+        print(f"  Unrealized PnL:  ${u_pnl:+,.2f}", end="")
+        if notional > 0 and u_pnl != 0:
+            print(f" ({u_pnl/notional*100:+.2f}%)", end="")
+        print()
+        print(f"  Leverage:        {leverage}x")
+        if notional > 0:
+            print(f"  Notional:        ${notional:,.2f}")
+    else:
+        print("  📊 Position:     No position")
+
+    # ── Open Orders ───────────────────────────────────────────────────
+    our_orders = [o for o in open_orders if o.get("coin") == coin]
+    print()
+    print(f"  📝 Open Orders ({len(our_orders)})")
+
+    if our_orders:
+        # Header
+        print(f"  {'OID':<12} {'Type':<20} {'Side':<6} {'Size':<12} {'Price':<14} {'Status':<10}")
+        print(f"  {'─'*12} {'─'*20} {'─'*6} {'─'*12} {'─'*14} {'─'*10}")
+
+        for o in our_orders:
+            oid = str(o.get("oid", "?"))
+            sz = float(o.get("sz", 0))
+            limit_px = float(o.get("limitPx", 0))
+            side_raw = o.get("side", "")
+            order_type_raw = o.get("orderType", "")
+
+            side_label = "BUY" if side_raw == "B" else ("SELL" if side_raw == "A" else side_raw)
+
+            # Classify order type
+            if isinstance(order_type_raw, dict):
+                if "trigger" in order_type_raw:
+                    tpsl = order_type_raw["trigger"].get("tpsl", "")
+                    if tpsl == "sl":
+                        type_label = "Stop Loss"
+                    elif tpsl == "tp":
+                        type_label = "Take Profit"
+                    else:
+                        type_label = "Trigger"
+                elif "limit" in order_type_raw:
+                    tif = order_type_raw["limit"].get("tif", "")
+                    type_label = f"Limit ({tif})" if tif else "Limit"
+                else:
+                    type_label = str(order_type_raw)[:20]
+            else:
+                type_label = str(order_type_raw)[:20]
+
+            # Try to determine status from resting/filled info
+            # The open_orders endpoint only returns resting orders, so all are "Active"
+            status_label = "Active"
+
+            print(
+                f"  {oid:<12} {type_label:<20} {side_label:<6} "
+                f"{sz:<12.4f} ${limit_px:<13,.2f} {status_label:<10}"
+            )
+    else:
+        print("  (none)")
+
+    # ── Market ────────────────────────────────────────────────────────
+    print()
+    print("  📈 Market")
+    if mid_price > 0:
+        print(f"  {coin} Mid Price:  ${mid_price:,.2f}")
+
+    # Try to get 24h change from metadata
+    try:
+        from kimi_quant.data import retry_api_call as _retry
+        meta = _retry(
+            lambda: info.meta_and_asset_ctxs(),
+            description="meta",
+        )
+        for m in meta[0] if isinstance(meta, tuple) else meta:
+            if isinstance(m, dict) and m.get("name") == coin:
+                day_change = float(m.get("dayNtlVlm", 0))
+                break
+        # Actually, let's get proper 24h change from the market data
+    except Exception:
+        pass
+
+    # Show funding rate if available
+    try:
+        from kimi_quant.data import DataProvider
+        dp = DataProvider()
+        snapshot = dp.get_market_snapshot()
+        if snapshot:
+            print(f"  24h Change:      {snapshot.day_change_pct:+.2f}%")
+            print(f"  Funding Rate:    {snapshot.funding_rate*100:.4f}%")
+            print(f"  Open Interest:   ${snapshot.open_interest:,.0f}")
+    except Exception:
+        pass
+
+    print()
+    print("═" * 60)
+    print()
+
+
 def main():
     """Parse arguments and launch the trading loop."""
     parser = argparse.ArgumentParser(
@@ -698,6 +909,11 @@ def main():
         "--stats",
         action="store_true",
         help="Print trade P&L statistics and exit",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print live account status: balance, position, open orders, market price",
     )
     parser.add_argument(
         "--deposit",
@@ -763,6 +979,10 @@ def main():
 
     if args.stats:
         cmd_stats()
+        return
+
+    if args.status:
+        cmd_status()
         return
 
     if args.interval:
