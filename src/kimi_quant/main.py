@@ -77,6 +77,12 @@ def run_once_single(
             market.day_change_pct,
         )
 
+    account = report.get("account")
+    if account:
+        logger.info("Account: %s", account.to_summary())
+    else:
+        logger.warning("Account: NOT AVAILABLE (dry-run or API error)")
+
     # Inject performance context for LLM self-reflection
     perf_ctx = trade_logger.get_llm_context()
     if perf_ctx:
@@ -124,6 +130,12 @@ def run_once_debate(
             market.funding_rate * 100,
             market.day_change_pct,
         )
+
+    account = report.get("account")
+    if account:
+        logger.info("Account: %s", account.to_summary())
+    else:
+        logger.warning("Account: NOT AVAILABLE (dry-run or API error)")
 
     # Inject performance context
     perf_ctx = trade_logger.get_llm_context()
