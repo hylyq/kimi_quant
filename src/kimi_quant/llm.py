@@ -295,7 +295,13 @@ Output JSON only (no markdown):
         self.llm = create_llm()
         self.structured_llm = create_structured_llm(TradingSignal)
 
-        logger.info("KimiLLM initialized (primary=%s)", config.kimi_model)
+        # Show the actual primary model, not hardcoded kimi_model
+        primary = config.primary_llm.lower()
+        if primary == "deepseek" and config.deepseek_api_key:
+            display = config.deepseek_model
+        else:
+            display = config.kimi_model
+        logger.info("KimiLLM initialized (primary=%s)", display)
 
     @staticmethod
     def build_prompt(market_data: dict[str, Any]) -> str:

@@ -138,6 +138,8 @@ REASONING_EFFORT=off      # 关闭推理，大幅节省 token
 
 **费用影响**：推理 token 占输出 80%。`REASONING_EFFORT=off` 每次调用可节省约 **75% 输出费用**。适合高频轮询或低成本模式。
 
+> **例外 — Judge Agent**：Debate 模式的 Judge 和 Single 模式的结构化输出使用 `json_schema` 格式，与 DeepSeek 的 `thinking` 不兼容（返回 400）。系统自动在结构化输出场景禁用 thinking，Judge 直接用非推理模式生成 JSON。Debater（Hold/Bull/Bear）不受影响，始终保持 thinking 推理。
+
 ## 自适应唤醒间隔
 
 **大模型自己决定下次什么时候醒。** 无需外部 cron。无需手动 `--once` 反复跑。
