@@ -2,14 +2,15 @@
 
 **BTC 永续合约量化交易程序** — 基于大模型的智能交易决策系统，运行于 Hyperliquid 去中心化交易所。
 
-- 🧠 **双模型容灾**：Kimi K3 + DeepSeek V3，一键切换主备，自动降级
+- 🧠 **双模型容灾**：Kimi K3 + DeepSeek V4，一键切换主备，自动降级
 - 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、LLM 引导长间隔、可配置唤醒下限
-- 📱 **消息推送**：飞书实时通知交易事件，自动检测无需配置
-- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 启动重试 + 异常熔断，炸不穿
-- 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
+- 📱 **消息推送**：微信/飞书实时通知交易事件，自动检测无需配置
+- 🔄 **实时监控**：WebSocket 订阅订单状态，Flash 模型生成中文通知，毫秒级同步到持仓追踪器
 - 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
+- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断，炸不穿
+- 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
 - 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + 前缀缓存 + Judge 裁决）
-- 🔧 **账户工具**：CLI 一键切换账户类型、现货划转、链上余额查询
+- 🔧 **账户工具**：CLI 一键查账户状态、切换类型、划转、余额查询
 - 📝 **完整记录**：交易盈亏 + 辩论历史 JSONL 持久化，支持并发读写
 
 ## 目录
@@ -21,6 +22,7 @@
 - [实盘部署](#实盘部署)
 - [配置参考](#配置参考)
 - [CLI 命令](#cli-命令)
+- [订单实时监控](#订单实时监控)
 - [账户管理](#账户管理)
 - [TradingSignal](#tradingsignal)
 - [风控规则](#风控规则)
@@ -59,6 +61,14 @@
       └──────────────│ TradeLogger  │◀───────────────────────────────────┘
                      │ (盈亏反馈)    │
                      └──────────────┘
+                           │
+┌──────────────────┐       │       ┌──────────────────┐
+│   OrderMonitor   │───────┼──────▶│  FlashReporter   │
+│  (WebSocket 实时) │  tracker     │  (Flash LLM 通知) │
+│  订单/成交/清算   │  同步        │  中文推送消息      │
+└──────────────────┘               └──────────────────┘
+         │                                  │
+         └────── 微信/飞书推送 ◀────────────┘
 ```
 
 ### 数据流
@@ -68,17 +78,20 @@
 3. **RiskManager** — 七层风控校验（熔断、置信度、仓位上限、保证金需求、风险金额、止损距离、方向）
 4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + SL/TP 价格追踪 + 15/15 SDK 全覆盖
 5. **TradeLogger** — 盈亏分析 + LLM 表现反馈（自省循环）
-6. **上下文注入** — 每轮将账户余额、持仓、挂单（SL/TP 价格+oid）注入 LLM prompt
-7. **自适应间隔** — LLM 建议下次唤醒时间（5min-3h），横盘省费/关键位盯紧
+6. **OrderMonitor** — WebSocket 实时订阅订单状态变化（成交/部分成交/取消/清算），毫秒级同步到 PositionTracker，使 LLM 在下一周期看到最新状态
+7. **FlashReporter** — 消费 WS 事件 → Flash 模型生成中文自然语言通知 → 微信/飞书推送
+8. **上下文注入** — 每轮将账户余额、持仓、挂单（SL/TP 价格+oid）注入 LLM prompt
+9. **自适应间隔** — LLM 建议下次唤醒时间（5min-3h），横盘省费/关键位盯紧
 
 ### 技术栈
 
 | 组件 | 技术 |
 |------|------|
-| 大模型 | Kimi K3 (主) + DeepSeek V3/V4 (自动降级备份) |
+| 大模型 | Kimi K3 (主) + DeepSeek V4 (自动降级备份) |
 | LLM 编排 | LangChain + LangGraph StateGraph |
 | 状态持久化 | LangGraph MemorySaver + JSONL 文件（fcntl 锁） |
 | 交易所 | Hyperliquid (Perpetual DEX) |
+| 实时监控 | Hyperliquid WebSocket + deepseek-v4-flash (轻量汇报) |
 | 结构化输出 | Pydantic + LangChain json_mode (response_format: json_object) |
 | 交易执行 | hyperliquid-python-sdk (15/15 全覆盖) |
 
@@ -205,16 +218,20 @@ cryptoguard ──WeChatClient──▶── wechat:outgoing ──▶ WeChatSe
 
 ### 推送事件
 
-| 事件 | 消息 |
-|------|------|
-| 🚀 启动 | 模式、模型、间隔 |
-| ❌ 启动失败 | 错误详情 |
-| 📈 开仓 | 方向、仓位、入场价、SL/TP、置信度 |
-| 🟢/🔴 平仓 | 盈亏金额、百分比、平仓原因 |
-| 🛡️ 风控拒绝 | 拒绝原因（置信度不足/熔断/止损太近等） |
-| ⚠️ 熔断 | 连续亏损次数、冷却周期、累计盈亏 |
-| ⚠️ 异常 | 首个错误 + 每 10 轮（防刷屏） |
-| ⏹️ 停止 | 总周期、交易数、胜率、盈亏 |
+| 事件 | 消息 | 来源 |
+|------|------|------|
+| 🚀 启动 | 模式、模型、间隔 | 主循环 |
+| ❌ 启动失败 | 错误详情 | 主循环 |
+| 📈 开仓 | 方向、仓位、入场价、SL/TP、置信度、账户余额 | 主循环 |
+| 🟢/🔴 平仓 | 盈亏金额、百分比、平仓原因、账户余额 | 主循环 |
+| 🛡️ 风控拒绝 | 拒绝原因（置信度不足/熔断/止损太近等） | 主循环 |
+| ⚠️ 熔断 | 连续亏损次数、冷却周期、累计盈亏 | 主循环 |
+| ✅ 订单成交 | 入场成交 / 止盈止损触发 | **OrderMonitor (实时)** |
+| ⏳ 部分成交 | 成交进度百分比、价格 | **OrderMonitor (实时)** |
+| ❌ 订单取消/被拒 | OID、原因 | **OrderMonitor (实时)** |
+| 💀 仓位清算 | 清算价格、数量 | **OrderMonitor (实时)** |
+| ⚠️ 异常 | 首个错误 + 每 10 轮（防刷屏） | 主循环 |
+| ⏹️ 停止 | 总周期、交易数、胜率、盈亏 | 主循环 |
 
 ### 自动检测
 
@@ -231,6 +248,118 @@ Redis 配置（可选，默认 localhost:6379）：
 ```
 
 程序启动时自动 ping Redis，连通即走微信通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
+
+## 订单实时监控
+
+大模型下单后，订单可能在周期之间的任意时刻成交（尤其是市价单几秒内即成交，SL/TP 可能在数小时后触发）。如果只依赖每周期（默认 600s）的链上同步，你可能在 10 分钟后才知道订单已成交。
+
+**OrderMonitor + FlashReporter** 解决了这个问题：通过 Hyperliquid WebSocket **实时**订阅订单状态变化，毫秒级同步到持仓追踪器，并用便宜的 Flash 模型生成中文推送通知。
+
+### 架构
+
+```
+Hyperliquid WebSocket
+  ├── orderUpdates (订单状态变化)
+  └── userFills     (成交明细)
+         │
+         ▼
+   OrderMonitor (后台线程)
+    ├── 解析事件 → OrderEvent
+    ├── apply_ws_event() → PositionTracker (即时同步状态)
+    └── 入队 → queue.Queue (线程安全)
+         │
+         ▼
+   FlashReporter (后台线程)
+    ├── 消费事件
+    ├── Flash LLM 生成中文通知 (deepseek-v4-flash)
+    │    失败时降级为确定性格式化
+    └── Notifier → 微信/飞书推送
+```
+
+### 与主循环的协作
+
+```
+主循环 (每 600s)                     Monitor (实时)
+     │                                    │
+     ├── LLM 决策                          │
+     ├── risk.validate()                   ├── WS: 订单成交!
+     ├── executor.execute() 下单           │   ├── tracker.apply_ws_event()
+     │                                    │   │   resting → active
+     │                                    │   └── FlashReporter → 推送通知
+     ├── sleep(600s)                       │
+     │                                    ├── WS: SL 触发!
+     │                                    │   ├── tracker.clear()
+     │                                    │   └── FlashReporter → 推送通知
+     ▼                                    │
+  下一周期                                 ▼
+  tracker state 已是最新 → LLM 看到实时状态
+```
+
+### 追踪的事件类型
+
+| WS 事件 | tracker 状态变化 | 推送通知（Flash LLM 生成） |
+|---------|-----------------|--------------------------|
+| 入场订单成交 | `resting → active` | `✅ 订单成交 #12345 多 0.0100 BTC @ $67200` |
+| 部分成交 | 记录日志，等待完全成交 | `⏳ 部分成交 40% (0.004/0.01 BTC) @ $67150` |
+| 止损触发 | `clear tracker` | `🛑 止损触发 #12346 @ $66800` |
+| 止盈触发 | `clear tracker` | `🎯 止盈触发 #12347 @ $69100` |
+| 订单取消 | 清除对应 oid | `❌ 订单已取消 #12348` |
+| 订单被拒 | 清除 tracker | `🚫 订单被拒 #12349` |
+| 仓位清算 | 清除 tracker | `💀 仓位被清算 @ $70000` |
+
+### 线程安全
+
+`PositionTracker` 内置 `threading.Lock`，主循环和 Monitor 后台线程并发访问互斥：
+
+- **主线程**：`sync_with_chain()`、`execute()`、`to_summary()` 等读写
+- **Monitor 线程**：WebSocket 回调中调用 `apply_ws_event()` 写入
+
+所有公开的 mutation 方法（`clear()`、`update_from_open()`、`confirm_active()`、`tick_resting()`、`apply_ws_event()`）均持有锁。
+
+### Flash 模型降级保护
+
+如果 Flash LLM API 调用失败（网络超时、余额不足、key 失效），`FlashReporter` 立即切换到**确定性格式化**模式——按照固定模板生成通知文本。通知不会丢失，只是失去了自然语言的灵活性。
+
+**降级后的通知示例**：
+```
+✅ 订单成交 #12345
+多 0.0100 BTC @ $67200.0
+```
+
+### 配置
+
+```bash
+# .env
+MONITOR_ENABLED=true                     # 开启实时监控（默认开启）
+MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash 模型（便宜快速）
+# MONITOR_FLASH_API_KEY=                 # 留空则复用 DEEPSEEK_API_KEY
+# MONITOR_FLASH_BASE_URL=                # 留空则复用 DEEPSEEK_BASE_URL
+```
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `MONITOR_ENABLED` | `true` | 开启/关闭实时监控（dry-run 模式下自动禁用） |
+| `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash 模型名称。约 ¥0.14/1M tokens，<1s 延迟 |
+| `MONITOR_FLASH_API_KEY` | 同 `DEEPSEEK_API_KEY` | Flash 模型 API Key。不配则复用 DeepSeek key |
+| `MONITOR_FLASH_BASE_URL` | 同 `DEEPSEEK_BASE_URL` | Flash 模型 API 端点 |
+
+> **费用极低**：一次通知约 100-200 input tokens + 30-50 output tokens。DeepSeek V4 Flash 定价约 ¥0.14/1M input。即使每天 100 次通知，月成本不到 **¥0.01**。
+
+### 启动日志
+
+```
+OrderMonitor started (address=0xAeFB...)
+WebSocket subscribed: orderUpdates(#1) + userFills(#2)
+Order monitor active (flash_model=deepseek-v4-flash, llm=enabled)
+FlashReporter LLM ready: deepseek-v4-flash
+```
+
+运行时 WS 事件同步日志：
+```
+WS sync: entry #12345 filled @ 67200.0 (state: resting→active)
+WS → tracker synced: entry_filled oid=12345
+FlashReporter sent: ✅ 订单成交 #12345...
+```
 
 ## 快速开始
 
@@ -272,6 +401,7 @@ uv run kimi-quant
 #     获取行情 → 问 LLM → 风控 → 执行 → LLM 说睡多久就睡多久 → 醒来重复
 
 # 另一终端，随时查看状态
+uv run kimi-quant --status     # 账户余额、持仓、挂单、行情
 uv run kimi-quant --stats      # 盈亏
 uv run kimi-quant --history    # 辩论记录
 ```
@@ -369,15 +499,18 @@ uv run kimi-quant --once
 uv run kimi-quant --interval 120     # 2 分钟，加速测试
 
 # 监控
-uv run kimi-quant --stats
+uv run kimi-quant --status               # 实时账户状态
+uv run kimi-quant --stats                # 交易盈亏
 ```
 
 **检查清单**：
 - [ ] 启动日志显示 `TradeExecutor initialized (address=0x... testnet=True)`
+- [ ] 启动日志显示 `OrderMonitor started` + `WebSocket subscribed`（实时监控已激活）
 - [ ] 仓位追踪正确（`Position: [ACTIVE] LONG 0.0010 BTC @ $...`）
 - [ ] SL/TP 订单正常创建
 - [ ] CLOSE 信号正常平仓
 - [ ] 风控熔断机制正常触发
+- [ ] `--status` 显示与链上一致的持仓/挂单数据
 - [ ] `--stats` 显示盈亏记录
 - [ ] 去 [Hyperliquid Testnet](https://app.hyperliquid-testnet.xyz/trade) 确认仓位/订单可见
 
@@ -428,7 +561,8 @@ TRADING_INTERVAL=300                # 5 分钟
 uv run kimi-quant --interval 300
 
 # 另一终端实时监控
-watch -n 60 'echo "=== $(date) ===" && uv run kimi-quant --stats'
+uv run kimi-quant --status                            # 账户+持仓
+watch -n 60 'uv run kimi-quant --stats'               # 盈亏刷新
 ```
 
 **前 24 小时**：
@@ -575,9 +709,65 @@ uv run kimi-quant --interval 120               # 自定义间隔（秒）
 uv run kimi-quant --mode single                # 指定策略模式
 uv run kimi-quant --mode debate --interval 300 # 组合参数
 
-# 数据查询（可安全地与运行中的程序并发）
+# 实时状态查询（可安全地与运行中的程序并发）
+uv run kimi-quant --status                     # 账户余额、持仓、挂单、行情
 uv run kimi-quant --stats                      # 查看盈亏统计（真实+模拟）
 uv run kimi-quant --history                    # 查看辩论历史记录
+```
+
+### `--status` 实时账户状态
+
+直接查询 Hyperliquid 链上数据，输出四个维度的信息：
+
+```
+uv run kimi-quant --status
+
+════════════════════════════════════════════════════════════
+  Kimi Quant — Account Status
+  Address: 0xAeFB...9eC3
+  Network: Mainnet | 2026-07-18 10:28:12 UTC
+════════════════════════════════════════════════════════════
+
+  💰 Account Balance
+  Total Value:     $5,234.56
+  Available:       $4,892.10
+  Margin Used:     $342.46
+  Margin Ratio:    6.5%
+
+  📊 Position
+  Side:            LONG
+  Size:            0.0100 BTC
+  Entry Price:     $67,200.00
+  Mark Price:      $67,450.00
+  Unrealized PnL:  +$25.00 (+0.37%)
+  Leverage:        3x
+  Notional:        $672.00
+
+  📝 Open Orders (2)
+  OID          Type                 Side   Size (BTC)   Price          Status
+  ──────────────────────────────────────────────────────────────────────────
+  12345678     Stop Loss            SELL   0.0100       $66,800.00     Active
+  12345679     Take Profit          SELL   0.0100       $69,100.00     Active
+
+  📈 Market
+  BTC Mid Price:  $67,450.00
+  24h Change:     +1.36%
+  Funding Rate:   0.0013%
+  Open Interest:  $39,038
+════════════════════════════════════════════════════════════
+```
+
+| 区域 | 数据来源 | 说明 |
+|------|---------|------|
+| 💰 Balance | `user_state.marginSummary` | 总资产、可用余额、保证金占用 |
+| 📊 Position | `user_state.assetPositions` | 多空方向、仓位、开仓价、标记价、浮动盈亏、杠杆 |
+| 📝 Orders | `open_orders` | 所有挂单（限价单、SL、TP），含 OID、类型、价格 |
+| 📈 Market | `all_mids` + `meta_and_asset_ctxs` | 中间价、24h 涨跌、资金费率、未平仓量 |
+
+所有数据直接从链上查询，不经本地 tracker——是客观真实数据。可在终端持续刷新：
+
+```bash
+watch -n 5 uv run kimi-quant --status
 ```
 
 ## 账户管理
@@ -836,7 +1026,8 @@ kimi_quant/
 │   ├── llm.py           # TradingSignal + 双模型容灾 (Kimi/DeepSeek)
 │   ├── debate.py        # Multi-Agent 辩论 + LangGraph Checkpointing
 │   ├── risk.py          # 七层风控校验 + 熔断状态机
-│   ├── executor.py      # 15/15 SDK 全覆盖 + PositionTracker 三态模型
+│   ├── executor.py      # 15/15 SDK 全覆盖 + PositionTracker 线程安全 + WS 同步
+│   ├── monitor.py       # WebSocket 订单监控 + Flash LLM 汇报 Agent
 │   ├── analytics.py     # TradeLogger — 盈亏分析 + LLM 自省反馈
 │   ├── notify.py        # 微信/飞书消息推送（可选，自动检测）
 │   ├── deposit.py       # 入金/划转/账户类型管理（web3）
@@ -951,6 +1142,29 @@ curl -s https://api.deepseek.com/v1/chat/completions \
 
 配置 `DEEPSEEK_API_KEY` 即可。Kimi 调用失败时自动切换到 DeepSeek，无需人工干预。日志会显示 `LLM: kimi primary → fallback: deepseek`。未配置则仅用 Kimi。
 
+### Q: 订单成交了怎么知道？有实时通知吗？
+
+有。**OrderMonitor** 通过 Hyperliquid WebSocket 实时订阅订单状态变化，**FlashReporter** 用便宜的 Flash 模型生成中文推送通知。配置：
+
+```bash
+# .env
+MONITOR_ENABLED=true                  # 开启（默认）
+MONITOR_FLASH_MODEL=deepseek-v4-flash # Flash 模型
+```
+
+通知事件包括：入场成交、止损/止盈触发、部分成交、订单取消/被拒、仓位清算。如果 Flash 模型不可用，自动降级为格式化文本通知。
+
+参见 [订单实时监控](#订单实时监控)。
+
+### Q: 大模型做决策时能看到最新的订单/持仓状态吗？
+
+能。每次 LLM 决策前，系统会把两部分信息注入 prompt：
+
+1. **链上仓位**：`DataProvider` 查询 `user_state`，获取持仓方向、大小、入场价、浮动盈亏
+2. **挂单状态**：`PositionTracker.to_orders_summary()` 输出当前 SL/TP 的 oid 和价格
+
+加上 **OrderMonitor** 的 WebSocket 实时同步，`PositionTracker` 在订单成交瞬间更新——大模型在下一个决策周期就能看到最新状态，无需等待周期内的 `sync_with_chain()`。
+
 ### Q: 程序会因为异常崩溃吗？
 
 不会。三层错误防护确保程序炸不穿：
@@ -1054,7 +1268,13 @@ uv run kimi-quant --set-account-type portfolio # 组合保证金
 ### Q: 运行中怎么查看状态？
 
 ```bash
-# 实时盈亏
+# 实时账户 + 持仓 + 挂单（直接查询链上数据）
+uv run kimi-quant --status
+
+# 实时刷新（每 5 秒）
+watch -n 5 uv run kimi-quant --status
+
+# 盈亏统计
 uv run kimi-quant --stats
 
 # 辩论历史
