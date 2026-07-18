@@ -55,9 +55,9 @@ def _build_model_registry(temp: float, tokens: int) -> dict[str, ChatOpenAI]:
         )
         # DeepSeek: thinking control via extra_body (OpenAI SDK passthrough)
         if effort == "off":
-            ds_kwargs["model_kwargs"] = {"extra_body": {"thinking": {"type": "disabled"}}}
+            ds_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         else:
-            ds_kwargs["model_kwargs"] = {"extra_body": {"thinking": {"type": "enabled"}}}
+            ds_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         registry["deepseek"] = ChatOpenAI(**ds_kwargs)
 
     return registry
