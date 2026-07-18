@@ -272,8 +272,11 @@ def _validate_and_execute(
             dry_run=executor.dry_run,
         )
         trade_opened_this_cycle = True
+        notional = size * entry_price
+        margin = notional / config.max_leverage
         notify.send(
             f"📈 {signal_result.action} {size} BTC @ ${entry_price:.0f}\n"
+            f"Notional: ${notional:.0f} | Margin: ${margin:.2f} | Leverage: {config.max_leverage}x\n"
             f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
             f"Confidence: {signal_result.confidence:.2f}"
         )
@@ -302,7 +305,8 @@ def _validate_and_execute(
             emoji = "🟢" if trade.is_win else "🔴"
             notify.send(
                 f"{emoji} Position closed: {trade.side.upper()}\n"
-                f"P&L: ${trade.net_pnl:+.2f} ({trade.pnl_pct:+.2f}%)\n"
+                f"Entry: ${trade.entry_price:.0f} → Exit: ${trade.exit_price:.0f}\n"
+                f"P&L: ${trade.net_pnl:+.2f} ({trade.pnl_pct:+.2f}%) | Leverage: {config.max_leverage}x\n"
                 f"Reason: {trade.close_reason}"
             )
 
