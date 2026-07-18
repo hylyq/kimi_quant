@@ -117,6 +117,32 @@ def create_llm(
     return _resolve_chain(registry, config.primary_llm)
 
 
+def create_structured_llm(
+    schema: type[BaseModel],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+):
+    """Create a structured-output LLM with automatic fallback chain.
+
+    Uses json_mode (response_format: json_object) — the only structured
+    output mode supported by DeepSeek. json_schema and function_calling
+    both return 400 on DeepSeek. Kimi also supports json_object.
+
+    Primary model is determined by PRIMARY_LLM env var (default: "kimi").
+    """
+    temp = temperature if temperature is not None else config.llm_temperature
+    tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
+    registry = _build_model_registry(temp, tokens)
+
+    # json_mode → response_format={'type': 'json_object'}
+    # Schema guidance is included in the system prompt (Pydantic schema dump).
+    structured_registry = {
+        name: llm.with_structured_output(schema, method="json_mode")
+        for name, llm in registry.items()
+    }
+    return _resolve_chain(structured_registry, config.primary_llm)
+
+
 class TradingSignal(BaseModel):
     """Structured trading signal from the LLM analysis.
 
@@ -249,6 +275,7 @@ Output JSON only (no markdown):
 
     def __init__(self):
         self.llm = create_llm()
+        self.structured_llm = create_structured_llm(TradingSignal)
 
         # Show the actual primary model, not hardcoded kimi_model
         primary = config.primary_llm.lower()
@@ -272,11 +299,7 @@ Output JSON only (no markdown):
         """Analyze market data and return a trading signal.
 
         Returns None if analysis fails or the LLM is unavailable.
-        Uses raw text + JSON parsing for universal compatibility (structured
-        output via json_schema/function_calling is not supported by DeepSeek).
         """
-        import re
-
         try:
             prompt = self.build_prompt(market_data)
             messages = [
@@ -285,16 +308,7 @@ Output JSON only (no markdown):
             ]
 
             logger.info("Requesting trading analysis...")
-            response = self.llm.invoke(messages)
-            text = str(response.content)
-
-            # Extract JSON from response (handle markdown code fences)
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if not json_match:
-                logger.error("LLM response contained no JSON: %.200s...", text)
-                return None
-
-            signal = TradingSignal.model_validate_json(json_match.group(0))
+            signal: TradingSignal = self.structured_llm.invoke(messages)
 
             logger.info(
                 "Signal received: action=%s confidence=%.2f reasoning=%s",

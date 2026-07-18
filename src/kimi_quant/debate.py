@@ -197,17 +197,17 @@ class SingleTurnAgent:
 
 
 class JudgeAgent:
-    """The judge agent uses plain text LLM + manual JSON parsing.
+    """The judge agent uses structured output via json_mode (response_format: json_object).
 
-    Structured output (json_schema / function_calling) is not supported by
-    DeepSeek (returns 400). Instead we ask the model to output raw JSON and
-    parse it ourselves — the most universally compatible approach.
+    json_mode is the only structured output method supported by DeepSeek
+    (json_schema and function_calling both return 400). Kimi also supports it.
     """
 
     def __init__(self):
-        from kimi_quant.llm import create_llm
+        from kimi_quant.llm import create_structured_llm
 
-        self.llm = create_llm(
+        self.structured_llm = create_structured_llm(
+            TradingSignal,
             temperature=config.judge_temperature,
             max_tokens=4096,  # Judge needs more room for synthesizing 3 arguments
         )
@@ -221,8 +221,6 @@ class JudgeAgent:
         have already embedded all key data (prices, levels, funding, etc.)
         in their arguments. This saves ~450 tokens per cycle.
         """
-        import re
-
         try:
             debate_transcript = (
                 "# === DEBATE TRANSCRIPT ===\n\n"
@@ -236,7 +234,7 @@ class JudgeAgent:
                 "Weigh the arguments above. "
                 "The debaters have already referenced all relevant market data "
                 "(prices, levels, funding, order book, multi-timeframe trends) "
-                "in their arguments. Produce the final trading signal as JSON."
+                "in their arguments. Produce the final trading signal."
             )
             messages = [
                 ("system", JUDGE_SYSTEM_PROMPT),
@@ -247,20 +245,7 @@ class JudgeAgent:
                 "Judge deliberating on %d chars of debate...",
                 len(debate_transcript),
             )
-            response = await self.llm.ainvoke(messages)
-            text = str(response.content)
-
-            # Extract JSON from the response (handle markdown code fences)
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if not json_match:
-                logger.error("Judge response contained no JSON: %.200s...", text)
-                return None
-
-            signal = TradingSignal.model_validate_json(json_match.group(0))
-            logger.info(
-                "Judge verdict: action=%s confidence=%.2f",
-                signal.action, signal.confidence,
-            )
+            signal: TradingSignal = await self.structured_llm.ainvoke(messages)
             return signal
 
         except Exception as e:
