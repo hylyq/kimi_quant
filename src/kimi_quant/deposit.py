@@ -263,7 +263,9 @@ def get_perp_balance(address: str | None = None) -> float:
 def spot_to_perp(amount: float) -> dict:
     """Transfer USDC from spot to perp account.
 
-    Uses Hyperliquid's native L1 action — fast, no gas cost.
+    For standard accounts: uses usd_class_transfer (L1 action, instant).
+    For unified accounts: falls back to spot_transfer to self, or
+    instructs the user to use the web UI.
     """
     from hyperliquid.exchange import Exchange
 
@@ -285,13 +287,30 @@ def spot_to_perp(amount: float) -> dict:
     )
     ex = Exchange(wallet=acct, base_url=base_url)
 
-    logger.info(
-        "Transferring %.2f USDC spot → perp (%s)...",
-        amount, acct.address,
-    )
+    logger.info("Transferring %.2f USDC spot → perp...", amount)
+
+    # Try usd_class_transfer (works for standard accounts)
     result = ex.usd_class_transfer(amount, to_perp=True)
-    logger.info("Transfer result: %s", result)
-    return result
+    logger.info("Result: %s", result)
+
+    if result.get("status") == "ok":
+        return result
+
+    # Unified account: usd_class_transfer is disabled.
+    # spot_transfer moves between users, not between spot/perp.
+    # The SDK has no unified-account transfer method yet.
+    if "unified account" in str(result).lower():
+        raise RuntimeError(
+            "Your account is a Unified Account, which blocks programmatic "
+            "spot→perp transfers.\n\n"
+            "Please use the web UI instead:\n"
+            "  https://app.hyperliquid.xyz/trade\n"
+            f"  → Click your balance → Transfer → Move {amount:.2f} USDC "
+            "from Spot to Perpetual\n"
+            "  → Then restart: uv run kimi-quant"
+        )
+
+    raise RuntimeError(f"Transfer failed: {result}")
 
 
 def cmd_spot_to_perp(amount: float, force: bool = False) -> None:
