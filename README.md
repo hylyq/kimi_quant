@@ -64,9 +64,10 @@
 1. **DataProvider** — 行情数据走主网（`meta_and_asset_ctxs`，含 mark/oracle/funding/OI），多周期 K 线 TTL 缓存
 2. **策略引擎** — Single：单次 LLM 分析；Debate：三 Agent 辩论 + Judge 裁决（60s 超时）
 3. **RiskManager** — 七层风控校验（熔断、置信度、仓位上限、保证金需求、风险金额、止损距离、方向）
-4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + 15/15 SDK 全覆盖
+4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + SL/TP 价格追踪 + 15/15 SDK 全覆盖
 5. **TradeLogger** — 盈亏分析 + LLM 表现反馈（自省循环）
-6. **自适应间隔** — LLM 建议下次唤醒时间（60s-3h），横盘省费/关键位盯紧
+6. **上下文注入** — 每轮将账户余额、持仓、挂单（SL/TP 价格+oid）注入 LLM prompt
+6. **自适应间隔** — LLM 建议下次唤醒时间（5min-3h），横盘省费/关键位盯紧
 
 ### 技术栈
 
@@ -606,7 +607,7 @@ uv run kimi-quant --history                    # 查看辩论历史记录
 - `entry_price`: 设为具体价格 → 限价单；设为 `null` → 市价单（Ioc）
 - `stop_loss`: **强制字段**，LONG/SHORT 时必须提供，且距入场价 ≥ 0.5%
 - `size`: `null` 时自动使用 `MAX_POSITION_SIZE`
-- `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格
+- `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格。LLM 可在 prompt 中看到当前 SL/TP 价格（通过 `to_orders_summary`），从而做出合理的移动决策
 
 ## 风控规则
 
@@ -658,9 +659,9 @@ PositionTracker 三态模型:
 
 TradeExecutor 启动时自动查询链上状态：
 - 恢复已有持仓（`user_state` → positions）
-- 恢复挂单 ID（`open_orders` → SL/TP oid）
+- 恢复挂单 ID 和价格（`open_orders` → SL/TP oid + trigger price）
 - 恢复仓位自动补录 TradeLogger pending trade
-- 崩溃重启后可立即管理现有仓位（平仓、移止损）
+- 崩溃重启后可立即管理现有仓位（平仓、移止损），且 LLM 能看到当前 SL/TP 价格
 
 ### Dry-Run 模拟盈亏
 
@@ -690,6 +691,8 @@ TradeExecutor 启动时自动查询链上状态：
 > **前缀缓存**：三个 Agent 接收完全相同的行情数据。将其置于 prompt 最前面（system message），DeepSeek V3 的后端自动复用第一个请求的 KV-cache。Phase 2 的两个 Agent 输入 token 费用降低 ~95%，整个 Debate 输入 token 省 ~63%。见[费用优化](#费用优化)。
 
 ### Judge 决策框架
+
+Judge 现在接收账户上下文（余额、可用保证金、当前持仓、挂单 SL/TP 价格）和交易约束（最大仓位、杠杆），在此基础上裁决。
 
 | 市场状态 | Judge 决策倾向 |
 |----------|---------------|

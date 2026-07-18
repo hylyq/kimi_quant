@@ -838,6 +838,10 @@ class DataProvider:
         analysis = report.get("analysis")
         if analysis:
             prompt = analysis.to_llm_prompt()
+            # Inject open orders info (SL/TP oids) if present
+            orders = report.get("open_orders_summary", "")
+            if orders:
+                prompt += "\n# Open Orders\n" + orders + "\n"
             # Inject performance context if present
             perf = report.get("performance_context", "")
             if perf:

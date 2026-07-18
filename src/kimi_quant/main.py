@@ -82,6 +82,11 @@ def run_once_single(
     if perf_ctx:
         report["performance_context"] = perf_ctx
 
+    # Inject open orders so LLM knows existing SL/TP levels
+    orders_summary = executor.tracker.to_orders_summary()
+    if orders_summary:
+        report["open_orders_summary"] = orders_summary
+
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
 
@@ -124,6 +129,11 @@ def run_once_debate(
     perf_ctx = trade_logger.get_llm_context()
     if perf_ctx:
         report["performance_context"] = perf_ctx
+
+    # Inject open orders so debaters know existing SL/TP levels
+    orders_summary = executor.tracker.to_orders_summary()
+    if orders_summary:
+        report["open_orders_summary"] = orders_summary
 
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)

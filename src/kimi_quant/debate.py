@@ -213,16 +213,26 @@ class JudgeAgent:
         )
 
     async def ajudge(
-        self, market_prompt: str, bull: str, bear: str, hold: str
+        self, account_summary: str, bull: str, bear: str, hold: str
     ) -> TradingSignal | None:
         """Asynchronously judge the debate and produce a TradingSignal.
 
-        Note: we do NOT include the full market prompt here — the debaters
-        have already embedded all key data (prices, levels, funding, etc.)
-        in their arguments. This saves ~450 tokens per cycle.
+        The account summary and trading constraints are included so the Judge
+        knows the actual account state and position size limits — without this,
+        the Judge can propose sizes far beyond what the account can afford.
         """
         try:
+            size_limit = config.max_position_size
+            max_lev = config.max_leverage
+            constraints = (
+                f"Max position size: {size_limit} BTC | Max leverage: {max_lev}x\n"
+                f"Size must respect available balance (notional / {max_lev}x ≤ available).\n"
+                f"When in doubt, use smaller size. Never exceed {size_limit} BTC."
+            )
             debate_transcript = (
+                "# === ACCOUNT CONTEXT ===\n"
+                f"{account_summary}\n"
+                f"Trading constraints: {constraints}\n\n"
                 "# === DEBATE TRANSCRIPT ===\n\n"
                 "## 🐂 BULL ANALYST (LONG Case)\n"
                 f"{bull}\n\n"
@@ -231,10 +241,12 @@ class JudgeAgent:
                 "## 😐 RISK MANAGER (HOLD Case)\n"
                 f"{hold}\n\n"
                 "# === YOUR DECISION ===\n"
-                "Weigh the arguments above. "
+                "Weigh the arguments above against the account context. "
                 "The debaters have already referenced all relevant market data "
                 "(prices, levels, funding, order book, multi-timeframe trends) "
-                "in their arguments. Produce the final trading signal."
+                "in their arguments. "
+                f"IMPORTANT: size must not exceed {size_limit} BTC. "
+                "Produce the final trading signal."
             )
             messages = [
                 ("system", JUDGE_SYSTEM_PROMPT),
@@ -402,7 +414,7 @@ class DebateStrategy:
     async def _adjudicate_node(self, state: DebateState) -> DebateState:
         """Judge synthesizes all arguments into a TradingSignal."""
         signal = await self.judge.ajudge(
-            state["market_prompt"],
+            state["account_summary"],
             state["bull_argument"],
             state["bear_argument"],
             state["hold_argument"],

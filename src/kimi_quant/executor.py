@@ -61,10 +61,12 @@ class PositionTracker:
     entry_price: float = 0.0
     state: str = "none"  # "none" | "resting" | "active"
 
-    # Order IDs
+    # Order IDs and prices (prices stored so LLM can see current SL/TP levels)
     entry_oid: int | None = None
     sl_oid: int | None = None
     tp_oid: int | None = None
+    sl_price: float = 0.0  # current stop loss trigger price
+    tp_price: float = 0.0  # current take profit trigger price
 
     # How many cycles has the limit order been resting?
     resting_cycles: int = 0
@@ -85,6 +87,8 @@ class PositionTracker:
         self.entry_oid = None
         self.sl_oid = None
         self.tp_oid = None
+        self.sl_price = 0.0
+        self.tp_price = 0.0
         self.resting_cycles = 0
 
     def update_from_open(
@@ -93,6 +97,8 @@ class PositionTracker:
         size: float,
         entry_price: float | None,
         oids: dict[str, int | None],
+        sl_price: float = 0.0,
+        tp_price: float = 0.0,
     ) -> None:
         """Record a new position/order intent."""
         self.coin = config.trading_pair
@@ -102,6 +108,8 @@ class PositionTracker:
         self.entry_oid = oids.get("entry")
         self.sl_oid = oids.get("sl")
         self.tp_oid = oids.get("tp")
+        self.sl_price = sl_price
+        self.tp_price = tp_price
         # Start as "resting" — will be promoted to "active" when chain confirms
         self.state = "resting"
         self.resting_cycles = 0
@@ -135,10 +143,44 @@ class PositionTracker:
         if self.state == "none":
             return "No position"
         state_label = "RESTING" if self.state == "resting" else "ACTIVE"
+        sl_info = f"${self.sl_price:.0f}" if self.sl_price else "NONE"
+        tp_info = f"${self.tp_price:.0f}" if self.tp_price else "NONE"
         return (
             f"[{state_label}] {self.side.upper()} {self.size:.4f} {self.coin} "
-            f"@ ${self.entry_price:.1f} "
+            f"@ ${self.entry_price:.1f} SL={sl_info} TP={tp_info} "
             f"(entry_oid={self.entry_oid}, sl_oid={self.sl_oid}, tp_oid={self.tp_oid})"
+        )
+
+    def to_orders_summary(self) -> str:
+        """Generate a compact summary of open orders for LLM context.
+
+        Returns empty string if no open orders (no position and no resting).
+        """
+        if self.state == "none":
+            return ""
+
+        parts = []
+        if self.entry_oid is not None:
+            order_type = "LIMIT" if self.state == "resting" else "filled (position active)"
+            parts.append(f"Entry: oid={self.entry_oid} ({order_type})")
+
+        if self.sl_price and self.sl_oid is not None:
+            parts.append(f"Stop Loss: ${self.sl_price:.0f} (oid={self.sl_oid})")
+        elif self.sl_oid is not None:
+            parts.append(f"Stop Loss: oid={self.sl_oid} (price unknown)")
+        else:
+            parts.append("Stop Loss: NOT SET ⚠️")
+
+        if self.tp_price and self.tp_oid is not None:
+            parts.append(f"Take Profit: ${self.tp_price:.0f} (oid={self.tp_oid})")
+        elif self.tp_oid is not None:
+            parts.append(f"Take Profit: oid={self.tp_oid} (price unknown)")
+        else:
+            parts.append("Take Profit: NOT SET")
+
+        return (
+            f"Open orders for {self.side.upper()} {self.size:.4f} {self.coin}: "
+            + ", ".join(parts)
         )
 
 
@@ -264,13 +306,17 @@ class TradeExecutor:
                         if limit_px < self.tracker.entry_price:
                             if self.tracker.side == "long":
                                 self.tracker.sl_oid = oid  # below entry for long
+                                self.tracker.sl_price = limit_px
                             else:
                                 self.tracker.tp_oid = oid  # below entry for short
+                                self.tracker.tp_price = limit_px
                         else:
                             if self.tracker.side == "long":
                                 self.tracker.tp_oid = oid  # above entry for long
+                                self.tracker.tp_price = limit_px
                             else:
                                 self.tracker.sl_oid = oid  # above entry for short
+                                self.tracker.sl_price = limit_px
                         logger.info(
                             "Recovered order #%d (price=$%.1f)", oid, limit_px
                         )
@@ -411,7 +457,11 @@ class TradeExecutor:
                 signal.stop_loss or 0,
                 signal.take_profit or 0,
             )
-            self.tracker.update_from_open(side, size, signal.entry_price, {})
+            self.tracker.update_from_open(
+                side, size, signal.entry_price, {},
+                sl_price=signal.stop_loss or 0.0,
+                tp_price=signal.take_profit or 0.0,
+            )
             self.tracker.state = "active"  # in dry-run, pretend filled instantly
             return {
                 "action": signal.action,
@@ -450,7 +500,11 @@ class TradeExecutor:
                 logger.info("Single order placed (no SL/TP)")
 
             oids = _parse_oids_from_result(result, num_orders)
-            self.tracker.update_from_open(side, size, signal.entry_price, oids)
+            self.tracker.update_from_open(
+                side, size, signal.entry_price, oids,
+                sl_price=signal.stop_loss or 0.0,
+                tp_price=signal.take_profit or 0.0,
+            )
 
             # Determine if market order (should fill instantly) vs limit
             is_market = signal.entry_price is None
@@ -742,6 +796,7 @@ class TradeExecutor:
         sl_oid = self.tracker.sl_oid
 
         if self.dry_run:
+            self.tracker.sl_price = new_sl
             return {
                 "action": "MODIFY_SL", "executed": True, "dry_run": True,
                 "sl_oid": sl_oid, "new_sl": new_sl,
@@ -753,6 +808,7 @@ class TradeExecutor:
                     "reason": "No tracked SL order ID."}
 
         logger.info("MODIFY_SL: moving SL #%d to $%.1f", sl_oid, new_sl)
+        self.tracker.sl_price = new_sl  # track the new SL price for LLM visibility
         return self.modify_stop_loss(
             oid=sl_oid, new_price=new_sl,
             is_buy=(self.tracker.side == "short"),
