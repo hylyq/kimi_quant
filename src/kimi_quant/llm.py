@@ -133,6 +133,12 @@ def _resolve_chain(
     Returns:
         A Runnable (possibly with_fallbacks) ready to use.
     """
+    if not registry:
+        raise RuntimeError(
+            "No LLM API keys configured. Set at least one of "
+            "MOONSHOT_API_KEY or DEEPSEEK_API_KEY in .env"
+        )
+
     if primary_name not in registry:
         available = list(registry.keys())
         logger.warning(

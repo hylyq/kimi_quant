@@ -22,25 +22,33 @@ from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
-# Pre-patch for curl_cffi (bypasses TLS fingerprint blocking).
-# Must happen before Exchange/Info are constructed (__init__ calls API).
-_cf_requests_exec = None
-try:
-    from curl_cffi import requests as _cf_requests_exec  # noqa: F811
-
-    import hyperliquid.api as _hl_api
-    import hyperliquid.exchange as _hl_exchange
-    import hyperliquid.info as _hl_info
-    _hl_api.requests = _cf_requests_exec
-    _hl_exchange.requests = _cf_requests_exec
-    _hl_info.requests = _cf_requests_exec
-except ImportError:
-    pass
+# TLS fingerprint patching for Hyperliquid SDK (shared with data.py).
+# Must be imported BEFORE Exchange/Info construction since __init__ calls API.
+from kimi_quant.tls import _cf_requests as _cf_requests_exec  # noqa: F401
 
 from kimi_quant.config import config
 from kimi_quant.llm import TradingSignal
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _is_trigger_order(order: dict) -> bool:
+    """Check whether an open order is a trigger/TPSL order.
+
+    Hyperliquid returns orderType as a dict like {"trigger": {...}} or
+    {"limit": {...}} for trigger/TPSL orders. We check for the presence
+    of a triggerPx sub-field as the most reliable signal.
+    """
+    ot = order.get("orderType", "")
+    if isinstance(ot, dict):
+        # e.g. {"trigger": {"triggerPx": "64200", "isMarket": true, "tpsl": "sl"}}
+        return "trigger" in ot
+    if isinstance(ot, str):
+        return "trigger" in ot.lower()
+    return False
 
 
 # ─── Order State Tracking ────────────────────────────────────────────────
@@ -399,13 +407,21 @@ class TradeExecutor:
 
         If the bot restarted while holding a position, this ensures we
         know about it and can manage (modify SL, close, etc.).
+
+        Position recovery and order recovery are independent: failure
+        in open_orders does not prevent position recovery from user_state.
         """
         if self.dry_run:
             return
 
+        from kimi_quant.data import retry_api_call
+
+        # ── 1. Recover position from user_state ──────────────────────────
         try:
-            # 1. Check for existing position
-            user_state = self.info.user_state(self.address)
+            user_state = retry_api_call(
+                lambda: self.info.user_state(self.address),
+                description="user_state (recovery)",
+            )
             positions = user_state.get("assetPositions", [])
             for pos in positions:
                 if pos["position"]["coin"] == self.coin:
@@ -424,44 +440,62 @@ class TradeExecutor:
                             "Recovered position: %s %.4f @ $%.1f",
                             side.upper(), size, entry_px,
                         )
+        except Exception as e:
+            logger.warning(
+                "Startup position recovery failed (non-fatal): %s", e
+            )
 
-            # 2. Check for open orders (to recover SL/TP oids)
-            open_orders = self.info.open_orders(self.address)
+        # ── 2. Recover SL/TP orders from open_orders ─────────────────────
+        try:
+            open_orders = retry_api_call(
+                lambda: self.info.open_orders(self.address),
+                description="open_orders (recovery)",
+            )
             for o in open_orders:
                 if o["coin"] == self.coin:
                     oid = int(o["oid"])
-                    is_trigger = "triggerPx" in str(o.get("orderType", ""))
-                    is_tpsl = o.get("orderType", "") == "trigger"
-                    # Hyperliquid doesn't label tpsl directly; we infer
                     limit_px = float(o.get("limitPx", 0))
+
+                    # Only trigger/TPSL orders are SL/TP candidates.
+                    # Regular limit orders (entry, take-profit limit) should
+                    # not be misclassified as stop-loss or take-profit.
+                    if not _is_trigger_order(o):
+                        if self.tracker.state != "active":
+                            logger.info(
+                                "Recovered resting order #%d (price=$%.1f) "
+                                "— no position, may be a pending entry",
+                                oid, limit_px,
+                            )
+                        continue
 
                     if self.tracker.state == "active":
                         # Infer SL vs TP from price relative to entry
                         if limit_px < self.tracker.entry_price:
                             if self.tracker.side == "long":
-                                self.tracker.sl_oid = oid  # below entry for long
+                                self.tracker.sl_oid = oid
                                 self.tracker.sl_price = limit_px
                             else:
-                                self.tracker.tp_oid = oid  # below entry for short
+                                self.tracker.tp_oid = oid
                                 self.tracker.tp_price = limit_px
                         else:
                             if self.tracker.side == "long":
-                                self.tracker.tp_oid = oid  # above entry for long
+                                self.tracker.tp_oid = oid
                                 self.tracker.tp_price = limit_px
                             else:
-                                self.tracker.sl_oid = oid  # above entry for short
+                                self.tracker.sl_oid = oid
                                 self.tracker.sl_price = limit_px
                         logger.info(
-                            "Recovered order #%d (price=$%.1f)", oid, limit_px
+                            "Recovered SL/TP order #%d (price=$%.1f)", oid, limit_px
                         )
-
-            if self.tracker.has_position():
-                logger.info("Startup recovery: %s", self.tracker.to_summary())
-            else:
-                logger.info("Startup recovery: no active position found")
-
         except Exception as e:
-            logger.warning("Startup recovery failed (non-fatal): %s", e)
+            logger.warning(
+                "Startup order recovery failed (non-fatal): %s", e
+            )
+
+        if self.tracker.has_position():
+            logger.info("Startup recovery: %s", self.tracker.to_summary())
+        else:
+            logger.info("Startup recovery: no active position found")
 
     # ─── Main entry point ────────────────────────────────────────────────
 

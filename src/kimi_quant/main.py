@@ -70,7 +70,8 @@ def run_once_single(
     market = report.get("market")
     if market:
         logger.info(
-            "BTC mid=%.1f | spread=%.1f(%.4f%%) | funding=%.4f%% | 24h=%.2f%%",
+            "%s mid=%.1f | spread=%.1f(%.4f%%) | funding=%.4f%% | 24h=%.2f%%",
+            config.trading_pair,
             market.mid_price,
             market.spread,
             market.spread_pct,
@@ -81,8 +82,10 @@ def run_once_single(
     account = report.get("account")
     if account:
         logger.info("Account: %s", account.to_summary())
+    elif config.dry_run:
+        logger.info("Account: NOT AVAILABLE (dry-run — simulation only)")
     else:
-        logger.warning("Account: NOT AVAILABLE (dry-run or API error)")
+        logger.warning("Account: NOT AVAILABLE (API error)")
 
     # Inject performance context for LLM self-reflection
     perf_ctx = trade_logger.get_llm_context()
@@ -156,7 +159,8 @@ def run_once_debate(
     market = report.get("market")
     if market:
         logger.info(
-            "BTC mid=%.1f | spread=%.1f(%.4f%%) | funding=%.4f%% | 24h=%.2f%%",
+            "%s mid=%.1f | spread=%.1f(%.4f%%) | funding=%.4f%% | 24h=%.2f%%",
+            config.trading_pair,
             market.mid_price,
             market.spread,
             market.spread_pct,
@@ -167,8 +171,10 @@ def run_once_debate(
     account = report.get("account")
     if account:
         logger.info("Account: %s", account.to_summary())
+    elif config.dry_run:
+        logger.info("Account: NOT AVAILABLE (dry-run — simulation only)")
     else:
-        logger.warning("Account: NOT AVAILABLE (dry-run or API error)")
+        logger.warning("Account: NOT AVAILABLE (API error)")
 
     # Inject performance context
     perf_ctx = trade_logger.get_llm_context()
@@ -466,7 +472,7 @@ def run_loop():
     """
     mode = config.strategy_mode
     logger.info("=" * 50)
-    logger.info("Kimi Quant — BTC Perpetual Contract Trading")
+    logger.info("Kimi Quant — %s Perpetual Contract Trading", config.trading_pair)
     logger.info("Model: %s | Mode: %s | Interval: %ds | Dry Run: %s",
                 config.display_model, mode,
                 config.trading_interval_seconds, config.dry_run)

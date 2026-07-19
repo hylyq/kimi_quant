@@ -160,13 +160,38 @@ class OrderMonitor:
 
     # ─── Internal: WebSocket Event Loop ──────────────────────────────────
 
+    _RESTART_DELAY = 5.0   # seconds between restart attempts
+    _MAX_CONSECUTIVE_CRASHES = 10  # give up after this many crashes
+
     def _run_loop(self) -> None:
-        """Main event loop running in the background thread."""
-        try:
-            asyncio.run(self._async_run())
-        except Exception:
-            logger.error("OrderMonitor event loop crashed", exc_info=True)
-            self._error_count += 1
+        """Main event loop running in the background thread.
+
+        Auto-restarts on crash up to _MAX_CONSECUTIVE_CRASHES times,
+        with an exponential backoff capped at 60 seconds.
+        """
+        consecutive = 0
+        while not self._stop_event.is_set():
+            try:
+                asyncio.run(self._async_run())
+                # Clean exit (stop requested) — don't restart
+                break
+            except Exception:
+                consecutive += 1
+                self._error_count += 1
+                if consecutive >= self._MAX_CONSECUTIVE_CRASHES:
+                    logger.error(
+                        "OrderMonitor: %d consecutive crashes, giving up",
+                        consecutive,
+                    )
+                    break
+                delay = min(self._RESTART_DELAY * (2 ** (consecutive - 1)), 60.0)
+                logger.error(
+                    "OrderMonitor event loop crashed (crash %d/%d), "
+                    "restarting in %.1fs",
+                    consecutive, self._MAX_CONSECUTIVE_CRASHES, delay,
+                    exc_info=True,
+                )
+                self._stop_event.wait(delay)
 
     async def _async_run(self) -> None:
         """Async setup: create Info, subscribe, keep running until stopped."""
@@ -320,7 +345,7 @@ class OrderMonitor:
             status = entry.get("status", "").lower()
             coin = order.get("coin", "")
             oid = order.get("oid")
-            sz = float(order.get("sz", 0))
+            sz = float(order.get("sz") or 0)
             side = "buy" if order.get("side", "") == "B" else "sell"
 
             # Determine event type from status
@@ -332,7 +357,7 @@ class OrderMonitor:
                 filled_sz = sz  # fully filled
             elif status == "open":
                 # Check if partial fill
-                orig_sz = float(order.get("origSz", sz))
+                orig_sz = float(order.get("origSz") or sz)
                 if orig_sz > sz > 0:
                     event_type = EventType.ORDER_PARTIAL
                     filled_sz = orig_sz - sz
@@ -354,7 +379,7 @@ class OrderMonitor:
                 order_type=str(order.get("orderType", "")),
                 filled_size=filled_sz,
                 total_size=sz if filled_sz > 0 else sz,
-                fill_price=float(order.get("limitPx", 0)),
+                fill_price=float(order.get("limitPx") or 0),
                 remaining_size=sz,
                 status=status,
                 raw=entry,
@@ -386,8 +411,8 @@ class OrderMonitor:
                 continue
 
             oid = entry.get("oid")
-            px = float(entry.get("px", 0))
-            sz = float(entry.get("sz", 0))
+            px = float(entry.get("px") or 0)
+            sz = float(entry.get("sz") or 0)
             side = "buy" if entry.get("side", "") == "B" else "sell"
             coin = entry.get("coin", "")
 

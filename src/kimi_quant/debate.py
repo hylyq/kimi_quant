@@ -222,6 +222,44 @@ Output TradingSignal JSON:
 """
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _is_placeholder(text: str) -> bool:
+    """Check if a debater's output is a failure placeholder, not a real argument.
+
+    Placeholder formats (all start with [AgentName keyword):
+      "[Bull failed to respond: ...]"
+      "[Bull TIMEOUT after 60s — ...]"
+      "[BullRebut rebuttal failed: ...]"
+      "[BullRebut rebuttal TIMEOUT after 60s — ...]"
+      "[BullRebut skipped — ...]"
+
+    The agent name is always one of the known debater/rebuttal names,
+    immediately followed by a space and a failure keyword.
+    """
+    if not text.startswith("["):
+        return False
+    _AGENTS = {"Bull", "Bear", "Hold", "BullRebut", "BearRebut", "HoldRebut"}
+    for name in _AGENTS:
+        prefix = f"[{name} "
+        if text.startswith(prefix):
+            rest = text[len(prefix):]
+            return (
+                rest.startswith("failed")
+                or rest.startswith("TIMEOUT")
+                or rest.startswith("skipped")
+                or rest.startswith("rebuttal failed")
+                or rest.startswith("rebuttal TIMEOUT")
+            )
+    return False
+
+
+async def _make_skip_msg(msg: str) -> str:
+    """Return a placeholder string — used when skipping a rebuttal agent."""
+    return f"[{msg} to produce arguments]"
+
+
 # ─── Single-Turn Agent ──────────────────────────────────────────────────────
 
 
@@ -605,6 +643,9 @@ class DebateStrategy:
 
         Like the debate phase, Hold runs first to warm the KV-cache,
         then Bull + Bear run in parallel on the warm cache.
+
+        Skips rebuttal for agents whose opponents both returned failure
+        placeholders (timeout or error), avoiding wasted LLM calls.
         """
         prompt = state["market_prompt"]
         cycle_id = state.get("cycle_id", "?")
@@ -625,15 +666,27 @@ class DebateStrategy:
         bear_arg = state["bear_argument"]
         hold_arg = state["hold_argument"]
 
-        # Hold rebuts Bull + Bear (cache warm-up)
-        hold_rebuttal = await _run_with_timeout(
-            self.rebuttal_hold.arun(
-                prompt,
-                "🐂 BULL (LONG case)", bull_arg,
-                "🐻 BEAR (SHORT case)", bear_arg,
-            ),
-            "HoldRebut",
-        )
+        # Check which debaters produced valid arguments
+        bull_ok = not _is_placeholder(bull_arg)
+        bear_ok = not _is_placeholder(bear_arg)
+        hold_ok = not _is_placeholder(hold_arg)
+
+        skipped: list[str] = []
+
+        # Hold rebuts Bull + Bear (cache warm-up).
+        # Skip if both opponents failed — nothing meaningful to rebut.
+        if bull_ok or bear_ok:
+            hold_rebuttal = await _run_with_timeout(
+                self.rebuttal_hold.arun(
+                    prompt,
+                    "🐂 BULL (LONG case)", bull_arg,
+                    "🐻 BEAR (SHORT case)", bear_arg,
+                ),
+                "HoldRebut",
+            )
+        else:
+            skipped.append("HoldRebut (both opponents failed)")
+            hold_rebuttal = "[HoldRebut skipped — both Bull and Bear failed to produce arguments]"
 
         # Wait for cache flush (same rationale as _debate_node)
         if config.cache_warmup_delay > 0:
@@ -643,25 +696,39 @@ class DebateStrategy:
             )
             await asyncio.sleep(config.cache_warmup_delay)
 
-        # Bull + Bear rebut in parallel (cache hits)
-        bull_rebuttal, bear_rebuttal = await asyncio.gather(
-            _run_with_timeout(
+        # Bull rebuts Bear + Hold.
+        if bear_ok or hold_ok:
+            bull_coro = _run_with_timeout(
                 self.rebuttal_bull.arun(
                     prompt,
                     "🐻 BEAR (SHORT case)", bear_arg,
                     "😐 RISK MANAGER (HOLD case)", hold_arg,
                 ),
                 "BullRebut",
-            ),
-            _run_with_timeout(
+            )
+        else:
+            skipped.append("BullRebut (both opponents failed)")
+            bull_coro = _make_skip_msg("BullRebut skipped — both Bear and Hold failed")
+
+        # Bear rebuts Bull + Hold.
+        if bull_ok or hold_ok:
+            bear_coro = _run_with_timeout(
                 self.rebuttal_bear.arun(
                     prompt,
                     "🐂 BULL (LONG case)", bull_arg,
                     "😐 RISK MANAGER (HOLD case)", hold_arg,
                 ),
                 "BearRebut",
-            ),
-        )
+            )
+        else:
+            skipped.append("BearRebut (both opponents failed)")
+            bear_coro = _make_skip_msg("BearRebut skipped — both Bull and Hold failed")
+
+        bull_rebuttal, bear_rebuttal = await asyncio.gather(bull_coro, bear_coro)
+
+        if skipped:
+            logger.info("Rebuttal [%s]: skipped %d agent(s): %s",
+                         cycle_id, len(skipped), "; ".join(skipped))
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info("Rebuttal [%s] complete in %.1fs", cycle_id, elapsed)

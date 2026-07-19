@@ -17,22 +17,9 @@ from typing import Any, Callable, TypeVar
 
 from hyperliquid.info import Info
 
-# Import curl_cffi if available (bypasses TLS fingerprint blocking on some servers)
-try:
-    from curl_cffi import requests as _cf_requests
-
-    # Override Session() to always impersonate Firefox's TLS fingerprint.
-    # Firefox is less commonly impersonated than Chrome — TLS inspection
-    # services focus on Chrome anomalies, making Firefox a quieter choice.
-    # The SDK calls requests.Session() with no args — we inject impersonation.
-    _OriginalSession = _cf_requests.Session
-
-    def _make_session(**kw):
-        return _OriginalSession(impersonate="firefox147", timeout=30, **kw)
-
-    _cf_requests.Session = _make_session  # type: ignore[assignment]
-except ImportError:
-    _cf_requests = None
+# TLS fingerprint patching for Hyperliquid SDK (shared with executor.py).
+# Must be imported BEFORE Info/Exchange construction since __init__ calls API.
+from kimi_quant.tls import _cf_requests  # noqa: F401  (imported for side-effect + sentinel)
 
 from kimi_quant.config import config
 
@@ -136,7 +123,7 @@ class MarketSnapshot:
     def to_summary(self) -> str:
         """Render as a compact summary for the LLM prompt."""
         return (
-            f"BTC Mid=${self.mid_price:.1f} Mark=${self.mark_price:.1f} "
+            f"{self.coin} Mid=${self.mid_price:.1f} Mark=${self.mark_price:.1f} "
             f"Oracle=${self.oracle_price:.1f} Premium=${self.premium:.1f}\n"
             f"Bid=${self.bid_price:.1f}(sz={self.bid_size:.4f}) "
             f"Ask=${self.ask_price:.1f}(sz={self.ask_size:.4f}) "
@@ -346,14 +333,6 @@ class DataProvider:
         else:
             self.base_url = config.hl_base_url
             self.use_testnet = False
-
-        # Patch Hyperliquid SDK to use curl_cffi (Chrome TLS fingerprint).
-        # Must happen BEFORE Info() is constructed because __init__ calls API.
-        if _cf_requests is not None:
-            import hyperliquid.api as _hl_api
-            import hyperliquid.info as _hl_info
-            _hl_api.requests = _cf_requests
-            _hl_info.requests = _cf_requests
 
         self._info_local = retry_api_call(
             lambda: Info(base_url=self.base_url, skip_ws=True),
@@ -833,6 +812,16 @@ class DataProvider:
             timeframes = self.get_multi_timeframe_analysis()
         if funding_trend is None:
             funding_trend = self.get_funding_trend()
+        if account is None and address and not config.dry_run:
+            account = self.get_account_snapshot(address)
+        if not open_orders_raw and address and not config.dry_run:
+            try:
+                open_orders_raw = retry_api_call(
+                    lambda: self._info_local.open_orders(address),
+                    description="open_orders (fallback)",
+                )
+            except Exception as e:
+                logger.warning("open_orders fallback also failed: %s", e)
 
         analysis = MarketAnalysis(
             snapshot=snapshot,
@@ -926,7 +915,7 @@ class DataProvider:
             delta_pct = (delta / prev_px) * 100
             direction = "📈" if delta > 0 else "📉"
             lines.append(
-                f"BTC: ${prev_px:.1f} → ${cur_px:.1f} "
+                f"{self.coin}: ${prev_px:.1f} → ${cur_px:.1f} "
                 f"({direction} {delta:+.1f} / {delta_pct:+.2f}%)"
             )
             has_change = True

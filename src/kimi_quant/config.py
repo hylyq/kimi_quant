@@ -147,15 +147,75 @@ class Config:
     )
 
     def validate(self) -> None:
-        """Validate required configuration."""
-        if not self.moonshot_api_key:
-            raise ValueError(
-                "MOONSHOT_API_KEY is required. Set it in .env or environment."
+        """Validate required configuration and value ranges."""
+        errors: list[str] = []
+
+        # API keys
+        if not self.moonshot_api_key and not self.deepseek_api_key:
+            errors.append(
+                "At least one LLM API key is required. "
+                "Set MOONSHOT_API_KEY or DEEPSEEK_API_KEY in .env"
             )
         if not self.dry_run and not self.hl_private_key:
-            raise ValueError(
+            errors.append(
                 "HYPERLIQUID_PRIVATE_KEY is required for live trading. "
                 "Set it in .env or use DRY_RUN=true."
+            )
+
+        # LLM settings
+        if self.primary_llm not in ("kimi", "deepseek"):
+            errors.append(
+                f"PRIMARY_LLM must be 'kimi' or 'deepseek', got '{self.primary_llm}'"
+            )
+        if self.judge_primary_llm and self.judge_primary_llm not in ("kimi", "deepseek"):
+            errors.append(
+                f"JUDGE_PRIMARY_LLM must be 'kimi' or 'deepseek', got '{self.judge_primary_llm}'"
+            )
+        if self.llm_temperature < 0:
+            errors.append(f"LLM_TEMPERATURE must be >= 0, got {self.llm_temperature}")
+        if self.llm_max_tokens <= 0:
+            errors.append(f"LLM_MAX_TOKENS must be > 0, got {self.llm_max_tokens}")
+        if self.judge_temperature < 0:
+            errors.append(f"JUDGE_TEMPERATURE must be >= 0, got {self.judge_temperature}")
+
+        # Strategy
+        if self.strategy_mode not in ("single", "debate"):
+            errors.append(
+                f"STRATEGY_MODE must be 'single' or 'debate', got '{self.strategy_mode}'"
+            )
+
+        # Trading parameters
+        if not self.trading_pair:
+            errors.append("TRADING_PAIR must not be empty")
+        if self.min_confidence < 0.0 or self.min_confidence > 1.0:
+            errors.append(
+                f"MIN_CONFIDENCE must be in [0.0, 1.0], got {self.min_confidence}"
+            )
+        if self.max_leverage <= 0:
+            errors.append(f"MAX_LEVERAGE must be > 0, got {self.max_leverage}")
+        if self.max_position_size <= 0:
+            errors.append(f"MAX_POSITION_SIZE must be > 0, got {self.max_position_size}")
+
+        # Interval
+        if self.trading_interval_seconds <= 0:
+            errors.append(
+                f"TRADING_INTERVAL must be > 0, got {self.trading_interval_seconds}"
+            )
+        if self.min_interval <= 0:
+            errors.append(f"MIN_INTERVAL must be > 0, got {self.min_interval}")
+        if self.max_interval < self.min_interval:
+            errors.append(
+                f"MAX_INTERVAL ({self.max_interval}) must be >= "
+                f"MIN_INTERVAL ({self.min_interval})"
+            )
+        if self.cache_warmup_delay < 0:
+            errors.append(
+                f"CACHE_WARMUP_DELAY must be >= 0, got {self.cache_warmup_delay}"
+            )
+
+        if errors:
+            raise ValueError(
+                "Configuration errors:\n  - " + "\n  - ".join(errors)
             )
 
     @property
@@ -163,7 +223,9 @@ class Config:
         """The model name to show in logs/banners, based on PRIMARY_LLM."""
         if self.primary_llm.lower() == "deepseek" and self.deepseek_api_key:
             return self.deepseek_model
-        return self.kimi_model
+        if self.moonshot_api_key:
+            return self.kimi_model
+        return self.deepseek_model  # fallback: DeepSeek only
 
 
 # Singleton config instance

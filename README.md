@@ -11,7 +11,7 @@
 - 📱 **消息推送**：微信/飞书实时通知交易事件，自动检测无需配置
 - 🔄 **实时监控**：WebSocket 订阅订单状态，Flash 模型生成中文通知，毫秒级同步到持仓追踪器
 - 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
-- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断 + SL/TP 链上验证
+- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断 + SL/TP 链上验证 + WebSocket 自恢复
 - 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
 - 🔧 **账户工具**：CLI 一键查账户状态、切换类型、划转、余额查询
 - 📝 **完整记录**：交易盈亏 + 辩论历史（含反驳）JSONL 持久化，支持并发读写
@@ -1273,13 +1273,14 @@ Hyperliquid Python SDK 的 **15 个交易相关方法全部封装**：
 kimi_quant/
 ├── src/kimi_quant/
 │   ├── __init__.py      # 包定义
-│   ├── config.py        # 配置管理（env + .env）
-│   ├── data.py          # 市场数据（Hyperliquid Info API + K线缓存 + ATR）
+│   ├── config.py        # 配置管理（env + .env）+ 完整校验
+│   ├── tls.py           # curl_cffi Firefox TLS 指纹伪装（共享模块）
+│   ├── data.py          # 市场数据（Hyperliquid Info API + K线缓存 + ATR + 断线重试）
 │   ├── llm.py           # TradingSignal + 双模型容灾 (Kimi/DeepSeek)
-│   ├── debate.py        # Multi-Agent 辩论 + LangGraph Checkpointing
+│   ├── debate.py        # Multi-Agent 辩论 + 反驳轮 + LangGraph Checkpointing
 │   ├── risk.py          # 七层风控校验 + 熔断状态机
-│   ├── executor.py      # 15/15 SDK 全覆盖 + PositionTracker 线程安全 + WS 同步
-│   ├── monitor.py       # WebSocket 订单监控 + Flash LLM 汇报 Agent
+│   ├── executor.py      # 15/15 SDK 全覆盖 + 启动恢复 + PositionTracker
+│   ├── monitor.py       # WebSocket 订单监控 + 崩溃自恢复 + Flash LLM
 │   ├── analytics.py     # TradeLogger — 盈亏分析 + LLM 自省反馈
 │   ├── notify.py        # 微信/飞书消息推送（可选，自动检测）
 │   ├── deposit.py       # 入金/划转/账户类型管理（web3）
@@ -1300,7 +1301,7 @@ kimi_quant/
 
 阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置两层防护：
 
-**第一层 — TLS 指纹伪装（curl_cffi）**：自动伪装成 Firefox 147 浏览器的 JA3 TLS 指纹。选择 Firefox 而非 Chrome 是因为反爬服务对 Chrome 指纹的检测最严格（Chrome 是最常被仿冒的浏览器），Firefox 的 TLS 密码套件和扩展信号不同，不在重点盯防范围。
+**第一层 — TLS 指纹伪装（curl_cffi）**：通过 `tls.py` 共享模块在导入时自动将 Hyperliquid SDK 的 HTTP 客户端替换为 curl_cffi，伪装成 Firefox 147 浏览器的 JA3 TLS 指纹。`data.py` 和 `executor.py` 共用同一套补丁逻辑，避免重复维护。选择 Firefox 而非 Chrome 是因为反爬服务对 Chrome 指纹的检测最严格（Chrome 是最常被仿冒的浏览器），Firefox 的 TLS 密码套件和扩展信号不同，不在重点盯防范围。
 
 **第二层 — 重试+限流保护**：阿里云不仅检测指纹，还会对并发请求频率敏感。如果同一时刻发起过多 TLS 握手（例如多线程并行请求），即使指纹正确也会被临时封锁。代码已内置：
 - **指数退避重试**：遇到 `Connection reset by peer` 等瞬时错误时自动重试（最多 3 次，间隔 1.5s → 3s → 6s + 随机抖动）
