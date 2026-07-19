@@ -2,18 +2,19 @@
 
 **BTC 永续合约量化交易程序** — 基于大模型的智能交易决策系统，运行于 Hyperliquid 去中心化交易所。
 
-- 🧠 **双模型容灾**：Kimi K3 + DeepSeek V4，一键切换主备，自动降级
-- 🎯 **决策工作流**：Step 0 强制审视已有持仓+挂单 → Step 1 市场分析，不跳过现状评估
+- 🧠 **双模型容灾**：Kimi K3 + DeepSeek V4，一键切换主备，自动降级；Judge 可独立指定模型（辩弱 Judge 强）
+- 🎯 **三步决策**：Step 0 审视持仓 → Step 1 市场分析 → Step 1.5 反事实检查（"如果我错了？"）
 - 🔗 **多操作组合**：单周期翻转仓位（`CLOSE→SHORT`）、同时调整 SL+TP，失败即停
-- 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、LLM 引导长间隔、可配置唤醒下限
+- 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、辩弱 Judge 强省 65% vs 全 Kimi、LLM 引导长间隔
+- 📊 **周期间 diff**：自动对比上轮数据，标注实际耗时（LLM 自主控制唤醒间隔），聚焦变化量
+- 💬 **两种策略 + 反驳轮**：Single / Debate（三 Agent 辩论 + 可选反驳轮 + Judge 交叉验证裁决）
 - 📱 **消息推送**：微信/飞书实时通知交易事件，自动检测无需配置
 - 🔄 **实时监控**：WebSocket 订阅订单状态，Flash 模型生成中文通知，毫秒级同步到持仓追踪器
 - 📊 **多周期分析**：5m/15m/1h/4h K 线 + ATR + 订单簿 + 资金费率
-- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断 + SL/TP 链上验证，炸不穿
+- 🛡️ **多层防护**：Firefox TLS 指纹伪装 + 七层风控 + 异常熔断 + SL/TP 链上验证
 - 🕐 **自适应唤醒**：LLM 自决下次分析时间，默认 ≥5min，横盘自动拉长省费
-- 💬 **两种策略**：Single（单 Agent 快速分析） / Debate（三 Agent 辩论 + 前缀缓存 + Judge 裁决）
 - 🔧 **账户工具**：CLI 一键查账户状态、切换类型、划转、余额查询
-- 📝 **完整记录**：交易盈亏 + 辩论历史 JSONL 持久化，支持并发读写
+- 📝 **完整记录**：交易盈亏 + 辩论历史（含反驳）JSONL 持久化，支持并发读写
 
 ## 目录
 
@@ -272,6 +273,8 @@ LLM 根据市场状态动态调整：
 | 横盘、无方向 | 1800-3600s | 降低成本 |
 | 周末、低流动性 | 3600-10800s | 省到极致 |
 | LLM 不填 | 使用 `TRADING_INTERVAL` 默认值 | 默认行为 |
+
+每轮 prompt 自动注入**周期间 diff**（`# 📊 Since Last Cycle (X.Xmin ago)`），标注实际经过的时间。因为间隔由 LLM 自主决定——5 分钟前和 2 小时前的同一个 +0.26% 含义完全不同——diff 让 LLM 正确评估变化的显著性。
 
 ### 边界保护
 
@@ -1280,12 +1283,13 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 
 ### Q: Debate 模式怎么省 token？
 
-三个辩论 Agent 接收相同的行情数据（~1500 tokens）。系统已做两项优化：
+三个辩论 Agent 接收相同的行情数据（~1500 tokens）。系统已做多项优化：
 
-1. **前缀缓存**：行情数据放在 prompt 最前面，DeepSeek V3 自动复用 KV-cache。Hold 先跑预热缓存，Bull + Bear 并发命中——后两个 Agent 只对 ~50 token 角色指令计费。
-2. **Judge 统一信息**：Judge 看到与辩手相同的原始市场数据（通过 `RAW MARKET DATA` 区块），确保能交叉验证。此区块与辩手的行情数据内容相同，增加了 Judge 的 prompt 长度，但换来了更可靠的裁决质量。
+1. **前缀缓存**：行情数据放在 prompt 最前面，DeepSeek V3 自动复用 KV-cache。Hold 先跑预热缓存，Bull + Bear 并发命中——后两个 Agent 只对 ~50 token 角色指令计费。反驳轮同样受益。
+2. **辩弱 Judge 强**：辩手用便宜的 DeepSeek（定向搜索），Judge 用 Kimi K3（综合裁决）。比全 Kimi 省 65%，决策质量不变。见 [Debate 模式：独立 Judge 模型](#debate-模式独立-judge-模型辩弱-judge-强)。
+3. **周期间 diff**：零额外 API 调用，纯数据对比——LLM 聚焦变化量而非重新分析全量数据。
 
-整体效果：Debate 的 4 次调用等效 ~3 次 Single 调用的输入 token 量。
+整体效果：普通 Debate 的 4 次调用等效 ~3 次 Single 的输入 token 量。开启反驳轮后 7 次调用等效 ~5 次 Single 量。
 
 ### Q: 如何切换主/备模型？
 
