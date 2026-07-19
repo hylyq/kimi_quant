@@ -5,7 +5,7 @@
 - 🧠 **双模型容灾**：Kimi K3 + DeepSeek V4，一键切换主备，自动降级；Judge 可独立指定模型（辩弱 Judge 强）
 - 🎯 **三步决策**：Step 0 审视持仓 → Step 1 市场分析 → Step 1.5 反事实检查（"如果我错了？"）
 - 🔗 **多操作组合**：单周期翻转仓位（`CLOSE→SHORT`）、同时调整 SL+TP，失败即停
-- 💰 **成本优化**：前缀缓存省 63% Debate 输入 token、辩弱 Judge 强省 65% vs 全 Kimi、LLM 引导长间隔
+- 💰 **成本优化**：DeepSeek 上下文硬盘缓存自动生效，Debate 周期内省 55-73% 输入 token；辩弱 Judge 强省 65% vs 全 Kimi；LLM 引导长间隔
 - 📊 **周期间 diff**：自动对比上轮数据，标注实际耗时（LLM 自主控制唤醒间隔），聚焦变化量
 - 💬 **两种策略 + 反驳轮**：Single / Debate（三 Agent 辩论 + 可选反驳轮 + Judge 交叉验证裁决）
 - 📱 **消息推送**：微信/飞书实时通知交易事件，自动检测无需配置
@@ -289,6 +289,62 @@ Cycle 5 complete: signal=HOLD confidence=0.65
 LLM adjusted interval: 600s → 900s    ← 横盘拉长
 Sleeping 900.0s until next cycle...
 ```
+
+## DeepSeek 上下文硬盘缓存
+
+DeepSeek API 对所有用户默认开启**上下文硬盘缓存**（官方文档），无需修改代码即可享用。
+
+### 缓存机制
+
+系统通过三种方式落盘缓存前缀单元，后续请求匹配完整单元即可命中：
+
+| 机制 | 触发条件 | 本项目利用方式 |
+|------|---------|--------------|
+| **请求结束位置** | 每次请求完成 | —（Debate 辩手 user message 不同，无法直接命中） |
+| **公共前缀检测** | 多次请求共享前缀 | Single 模式：2 周期后 `SYSTEM_PROMPT` 成为公共前缀 |
+| **固定 token 间隔** | 长输入按间隔截取 | **Debate 周期内命中核心机制**：Hold 先跑 → 固定间隔单元落盘 → Bull/Bear 命中 system message 部分 |
+
+### Debate 模式缓存预热
+
+Debate 模式的 Phase 1（Hold 先跑）→ Phase 2（Bull + Bear 并行）设计利用了固定间隔缓存：
+
+```
+Cycle N:
+  Phase 1: Hold ──▶ 固定间隔缓存单元写入磁盘（~2000 token system message）
+                      │
+                      ▼ (~2s 落盘延迟)
+  Phase 2: Bull ──▶ 命中缓存（仅 ~50 token user message 计费）  ┐
+           Bear ──▶ 命中缓存（仅 ~50 token user message 计费）  ┘ 并行
+```
+
+**关键发现**：DeepSeek 缓存落盘耗时"秒级"（官方文档）。如果 Hold 响应很快（<1 秒），Bull/Bear 可能在缓存就绪前发出请求 → 全部 token 按全价计费。
+
+`CACHE_WARMUP_DELAY`（默认 2.0 秒）在 Hold 完成后等待缓存落盘，确保 Bull/Bear 稳定命中。
+
+### 缓存命中监控
+
+程序在 Debate 辩手和反驳 Agent 的每次 LLM 调用后记录缓存命中率：
+
+```
+Cache [Bull]: hit=1950 miss=50 input=2000 rate=97.5%
+Cache [Hold]: hit=0 miss=2050 input=2050 rate=0.0%
+```
+
+- `hit=0` → 该请求是"冷启动"（预热阶段），符合预期
+- `hit` 接近 input → 缓存命中良好
+- 连续多轮 Bull/Bear 的 hit=0 → 检查 `CACHE_WARMUP_DELAY` 是否太小
+
+> **注意**：缓存日志仅在**非结构化输出**的 LLM 调用中可用（Debate 辩手、反驳 Agent）。Single 模式和 Judge（使用 `json_mode` 结构化输出）的缓存数据暂不采集——但 Single 模式每周期仅 1 次调用，无周期内共享需求；Judge 的 system prompt 在第 3 周期起通过公共前缀检测自动命中。
+
+### 周期内缓存收益
+
+| 模式 | 周期内调用 | 缓存命中 | 有效输入 token | 缓存折扣 token |
+|------|----------|---------|---------------|---------------|
+| Single | 1 次 | 0（无共享对象） | ~4000 | 0 |
+| Debate（无反驳） | 4 次 | 2/4（Bull + Bear 命中） | ~7150 | ~3900 (55%) |
+| Debate（有反驳） | 7 次 | 4/7（Bull + Bear ×2） | ~10650 | ~7800 (73%) |
+
+> **周期内共享**（同一 market data 被多个 Agent 使用）是主要收益来源。**跨周期共享**（system prompt 公共前缀）收益较小——因为行情数据每次都变，只有固定指令部分可以跨周期缓存。
 
 ## 消息推送（微信 / 飞书）
 
@@ -758,6 +814,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
 | `JUDGE_PRIMARY_LLM` | (同 `PRIMARY_LLM`) | Judge 专用主模型：`kimi` 或 `deepseek`。留空则与辩手相同。推荐 `kimi`（强推理裁决） |
 | `DEBATE_REBUTTAL_ENABLED` | `false` | 开启反驳轮：辩手互相反驳后再由 Judge 裁决（+3 次 LLM 调用/周期） |
+| `CACHE_WARMUP_DELAY` | `2.0` | Debate 模式缓存落盘等待秒数。增大确保 Bull/Bear 命中缓存，设 0 关闭。仅影响时序，不影响决策质量 |
 | **Hyperliquid** | | |
 | `HYPERLIQUID_PRIVATE_KEY` | — | 钱包私钥（实盘必填） |
 | `HYPERLIQUID_TESTNET` | `true` | `true`=测试网, `false`=主网 |
@@ -1100,9 +1157,9 @@ TradeExecutor 启动时自动查询链上状态：
 
 ### 决策流程
 
-1. **Phase 1 — 缓存预热**：Hold Agent 先跑，其 prefill 阶段将行情数据写入 DeepSeek KV-cache
-2. **Phase 2 — 并行命中**：Bull + Bear 并发跑，两份请求的前缀（行情数据）命中缓存，仅对 ~50 token 的角色指令计费
-3. **Phase 3（可选）— 反驳轮**：Bull/Bear/Hold 各自看到另外两方的论证后进行反驳，指出对手逻辑漏洞或承认强论点
+1. **Phase 1 — 缓存预热**：Hold Agent 先跑，DeepSeek 后端将其输入按固定 token 间隔落盘为缓存单元
+2. **Phase 2 — 并行命中**：Bull + Bear 并发跑，两份请求的 system message（行情数据）命中 Phase 1 的固定间隔缓存单元，仅对 ~50 token 的角色指令计费。程序等待 `CACHE_WARMUP_DELAY`（默认 2s）确保缓存落盘完成
+3. **Phase 3（可选）— 反驳轮**：Bull/Bear/Hold 各自看到另外两方的论证后进行反驳，指出对手逻辑漏洞或承认强论点。反驳阶段同样使用 HoldRebut 预热 → BullRebut+BearRebut 并行的缓存策略
 4. **Judge 收到完整信息**：Judge 的 prompt 包含四个区块 — Account Context → Raw Market Data → Debate Transcript → **Rebuttal Round**（如有）。可交叉验证辩手引用的价格、指标、费率，并判断反驳轮中谁占了上风
 5. Judge 综合原始数据与辩论论证裁决，输出结构化 TradingSignal → 风控 → 执行
 
@@ -1121,7 +1178,7 @@ DEBATE_REBUTTAL_ENABLED=true
 debate (Bull/Bear/Hold) → rebuttal (互相反驳) → adjudicate (Judge)
 ```
 
-> **前缀缓存**：三个辩手 Agent 接收完全相同的行情数据。将其置于 prompt 最前面（system message），DeepSeek V3 的后端自动复用第一个请求的 KV-cache。Phase 2 的两个 Agent 输入 token 费用降低 ~95%，整个 Debate 输入 token 省 ~63%。反驳轮同样受益于前缀缓存——反驳 Agent 的 system message 也是相同的行情数据。
+> **前缀缓存**：三个辩手 Agent 接收完全相同的行情数据（置于 system message）。Phase 1 Hold 先跑 → DeepSeek 按固定 token 间隔落盘缓存单元 → Phase 2 Bull/Bear 命中，输入 token 费用降低 ~95%，整个 Debate 输入 token 省 ~55%。反驳轮同样受益——反驳 Agent 的 system message 也是相同的行情数据。详见 [DeepSeek 上下文硬盘缓存](#deepseek-上下文硬盘缓存)。
 
 ### Judge 决策框架
 
@@ -1265,7 +1322,7 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 
 | 配置 | 月成本 | vs Single |
 |------|--------|-----------|
-| 全 DeepSeek V3 | ~¥60 | 1.5x（缓存省 63% 输入 token） |
+| 全 DeepSeek V3 | ~¥60 | 1.5x（缓存省 ~55% 输入 token） |
 | 辩弱 Judge 强 (🏆) | ~¥160 | 1.6x（Judge 用 Kimi 保证质量） |
 | 全 Kimi K3 | ~¥450 | 1.4x |
 
@@ -1285,11 +1342,12 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 
 三个辩论 Agent 接收相同的行情数据（~1500 tokens）。系统已做多项优化：
 
-1. **前缀缓存**：行情数据放在 prompt 最前面，DeepSeek V3 自动复用 KV-cache。Hold 先跑预热缓存，Bull + Bear 并发命中——后两个 Agent 只对 ~50 token 角色指令计费。反驳轮同样受益。
+1. **周期内前缀缓存**：行情数据放在 system message（共享前缀），Hold 先跑预热，Bull + Bear 并行命中。后两个 Agent 仅对 ~50 token 角色指令计费，周期内省 ~55% 输入 token（无反驳）或 ~73%（有反驳）。反驳轮使用相同的 HoldRebut 预热策略。缓存落盘有 `CACHE_WARMUP_DELAY` 保证（默认 2 秒）。
 2. **辩弱 Judge 强**：辩手用便宜的 DeepSeek（定向搜索），Judge 用 Kimi K3（综合裁决）。比全 Kimi 省 65%，决策质量不变。见 [Debate 模式：独立 Judge 模型](#debate-模式独立-judge-模型辩弱-judge-强)。
 3. **周期间 diff**：零额外 API 调用，纯数据对比——LLM 聚焦变化量而非重新分析全量数据。
+4. **跨周期公共前缀**：Single 模式的 system prompt、Debate 辩手的共享系统指令在第 3 周期起自动命中公共前缀缓存。
 
-整体效果：普通 Debate 的 4 次调用等效 ~3 次 Single 的输入 token 量。开启反驳轮后 7 次调用等效 ~5 次 Single 量。
+整体效果：普通 Debate 的 4 次调用等效 ~2.4 次 Single 的输入 token 量。开启反驳轮后 7 次调用等效 ~3.5 次 Single 量。
 
 ### Q: 如何切换主/备模型？
 

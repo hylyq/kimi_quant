@@ -113,6 +113,13 @@ class Config:
         default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true"
     )
 
+    # --- Cache ---
+    cache_warmup_delay: float = field(
+        default_factory=lambda: float(os.getenv("CACHE_WARMUP_DELAY", "2.0"))
+    )  # Seconds to wait after cache-warmup agent completes (debate mode).
+    # Gives DeepSeek disk cache time to flush before subsequent agents fire.
+    # Set to 0 to disable.
+
     # --- Order Monitor (Real-time WebSocket + Flash LLM reporting) ---
     monitor_enabled: bool = field(
         default_factory=lambda: os.getenv("MONITOR_ENABLED", "true").lower()

@@ -62,7 +62,7 @@ from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from kimi_quant.config import config
-from kimi_quant.llm import TradingSignal
+from kimi_quant.llm import TradingSignal, _log_cache_usage
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +257,7 @@ class SingleTurnAgent:
                 ("user", self.user_prompt),
             ]
             response = await self.llm.ainvoke(messages)
+            _log_cache_usage(response, label=self.name)
             return str(response.content)
         except Exception as e:
             logger.error("Agent %s failed: %s", self.name, e)
@@ -313,6 +314,7 @@ class RebuttalAgent:
                 ("user", user_msg),
             ]
             response = await self.llm.ainvoke(messages)
+            _log_cache_usage(response, label=self.name)
             return str(response.content)
         except Exception as e:
             logger.error("Rebuttal %s failed: %s", self.name, e)
@@ -566,6 +568,17 @@ class DebateStrategy:
         # Phase 1: Hold warms the prefix cache
         hold_arg = await _run_with_timeout(self.hold, "Hold")
 
+        # Wait for DeepSeek disk cache to flush before Bull+Bear fire.
+        # Cache build takes "秒级" (seconds-level per official docs).
+        # If Hold returns very fast, the fixed-interval cache units
+        # may not be written yet — a short sleep makes it deterministic.
+        if config.cache_warmup_delay > 0:
+            logger.debug(
+                "Debate [%s]: waiting %.1fs for cache flush...",
+                cycle_id, config.cache_warmup_delay,
+            )
+            await asyncio.sleep(config.cache_warmup_delay)
+
         # Phase 2: Bull + Bear in parallel, both hit the warm cache
         logger.info("Debate [%s]: Phase 2 — Bull + Bear (cache warm)...",
                      cycle_id)
@@ -621,6 +634,14 @@ class DebateStrategy:
             ),
             "HoldRebut",
         )
+
+        # Wait for cache flush (same rationale as _debate_node)
+        if config.cache_warmup_delay > 0:
+            logger.debug(
+                "Rebuttal [%s]: waiting %.1fs for cache flush...",
+                cycle_id, config.cache_warmup_delay,
+            )
+            await asyncio.sleep(config.cache_warmup_delay)
 
         # Bull + Bear rebut in parallel (cache hits)
         bull_rebuttal, bear_rebuttal = await asyncio.gather(

@@ -17,6 +17,45 @@ from kimi_quant.config import config
 logger = logging.getLogger(__name__)
 
 
+# ─── Cache Monitoring ────────────────────────────────────────────────────
+
+
+def _log_cache_usage(response: Any, label: str = "") -> None:
+    """Log DeepSeek disk cache hit/miss from an LLM response (best-effort).
+
+    Reads prompt_cache_hit_tokens / prompt_cache_miss_tokens from
+    usage_metadata (langchain AIMessage or raw OpenAI response).
+    Silently ignores any errors — this is purely observability.
+    """
+    try:
+        usage: dict = {}
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            usage = dict(response.usage_metadata)
+        elif hasattr(response, "response_metadata"):
+            rm = response.response_metadata or {}
+            usage = dict(rm.get("token_usage", {}))
+        if not usage:
+            return
+        hit = usage.get("prompt_cache_hit_tokens", 0)
+        miss = usage.get("prompt_cache_miss_tokens", 0)
+        total_input = usage.get("input_tokens", hit + miss)
+        if isinstance(hit, (int, float)) and isinstance(miss, (int, float)):
+            if hit + miss > 0:
+                rate = hit / (hit + miss) * 100
+                label_str = f" [{label}]" if label else ""
+                logger.info(
+                    "Cache%s: hit=%d miss=%d input=%d rate=%.1f%%",
+                    label_str, int(hit), int(miss), int(total_input), rate,
+                )
+            elif hit > 0:
+                label_str = f" [{label}]" if label else ""
+                logger.info(
+                    "Cache%s: hit=%d (no miss count available)", label_str, int(hit),
+                )
+    except Exception:
+        pass  # best-effort
+
+
 # ─── LLM Factory with Fallback ────────────────────────────────────────────
 
 
