@@ -736,6 +736,13 @@ def cmd_history():
             print(f"Bull: {entry.get('bull_argument', 'N/A')[:200]}")
             print(f"Bear: {entry.get('bear_argument', 'N/A')[:200]}")
             print(f"Hold: {entry.get('hold_argument', 'N/A')[:200]}")
+            # Show rebuttals if present (debate rebuttal round enabled)
+            if entry.get("bull_rebuttal"):
+                print(f"Bull 🗣️: {entry['bull_rebuttal'][:200]}")
+            if entry.get("bear_rebuttal"):
+                print(f"Bear 🗣️: {entry['bear_rebuttal'][:200]}")
+            if entry.get("hold_rebuttal"):
+                print(f"Hold 🗣️: {entry['hold_rebuttal'][:200]}")
             if entry.get("final_signal_json"):
                 try:
                     sig = _json.loads(entry["final_signal_json"])
