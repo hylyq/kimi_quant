@@ -191,6 +191,8 @@ REASONING_EFFORT=off      # 关闭推理，大幅节省 token
 **费用影响**：推理 token 占输出 80%。`REASONING_EFFORT=off` 每次调用可节省约 **75% 输出费用**。适合高频轮询或低成本模式。
 
 > **结构化 JSON 输出**：使用 `response_format: json_object`（LangChain `json_mode`）。这是 DeepSeek 官方唯一支持的结构化输出方式（`json_schema` 和 `function_calling` 均返回 400）。Kimi 也兼容。Schema 通过 system prompt 传递给模型。
+> 
+> ⚠️ **重要**：结构化输出（`json_mode`）会**自动禁用推理/思考**（`reasoning_effort` / `thinking`），因为 `response_format` 与推理参数冲突——推理模式生成自由思考 token，JSON 模式要求严格 JSON 输出，两者不可兼得。若同时发送这两个参数，Moonshot API 会返回 **HTTP 400 Bad Request**。此行为是程序自动处理的，无需手动配置。
 
 ## 自适应唤醒间隔
 
@@ -1237,6 +1239,21 @@ curl -s https://api.deepseek.com/v1/chat/completions \
   -d '{"model": "deepseek-v4-pro", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}'
 ```
 正常返回 JSON → API 通；报错/超时 → 检查网络和 key。
+
+### Q: Kimi API 返回 HTTP 400 Bad Request 怎么办？
+
+大概率是 `REASONING_EFFORT=max` 与结构化 JSON 输出冲突导致的。Kimi 的 `reasoning_effort` 参数与 `response_format: json_object` 互斥——两者同时发送时 API 返回 400。
+
+**已自动修复**（v2.3+）：`create_structured_llm` 会自动禁用推理/思考参数，确保交易信号的 JSON 输出正常工作。正常的（非结构化）LLM 调用仍会使用 `reasoning_effort`。
+
+如果你仍然遇到 400：
+```bash
+# 临时关闭推理（会省费，但推理质量下降）
+REASONING_EFFORT=off
+
+# 或切换到 DeepSeek 主力
+PRIMARY_LLM=deepseek
+```
 
 ### Q: Kimi API 挂了怎么办？
 
