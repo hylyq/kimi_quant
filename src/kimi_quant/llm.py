@@ -40,11 +40,18 @@ def _build_model_registry(
 
     # Kimi / Moonshot
     if config.moonshot_api_key:
+        # Kimi K3 only supports temperature=1 (reasoning model).
+        # Using any other value returns HTTP 400.
+        kimi_temp = 1.0
+        if temp != 1.0:
+            logger.info(
+                "Kimi K3 requires temperature=1 (got %.2f), forcing to 1.0", temp,
+            )
         kimi_kwargs: dict[str, Any] = dict(
             api_key=config.moonshot_api_key,
             base_url=config.moonshot_base_url,
             model=config.kimi_model,
-            temperature=temp,
+            temperature=kimi_temp,
             max_tokens=tokens,
         )
         # Kimi K3: reasoning_effort is a direct API param (only "max" supported).
