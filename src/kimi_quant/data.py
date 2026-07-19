@@ -759,7 +759,7 @@ class DataProvider:
             return self.get_account_snapshot(address) if address else None
 
         def _fetch_open_orders():
-            if not address:
+            if not address or config.dry_run:
                 return []
             return retry_api_call(
                 lambda: self._info_local.open_orders(address),
