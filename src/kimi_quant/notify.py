@@ -1,7 +1,7 @@
-"""Notification via larky's WeChatClient (proven method) or LarkBot (Feishu).
+"""Notification via larky's UnifiedClient (recommended) or LarkBot (Feishu).
 
-Uses the same WeChatClient.notify() path that cryptoguard uses. A fresh
-WeChatClient is created per-send to avoid cross-thread event-loop issues
+Uses the same UnifiedClient.notify() path that cryptoguard uses. A fresh
+UnifiedClient is created per-send to avoid cross-thread event-loop issues
 with redis.asyncio connection pools.
 
 Usage:
@@ -21,11 +21,11 @@ logger = logging.getLogger(__name__)
 
 _channel: str | None = None  # "larky" | "lark" | None
 
-# 1) Try larky WeChatClient (same approach as cryptoguard — proven working)
+# 1) Try larky UnifiedClient (same approach as cryptoguard — proven working)
 try:
-    from larky import WeChatClient as _WeChatClient  # noqa: F401
+    from larky import UnifiedClient as _UnifiedClient  # noqa: F401
     _channel = "larky"
-    logger.info("Notification: larky WeChatClient available (WeChat via Redis)")
+    logger.info("Notification: larky UnifiedClient available (via Redis Pub/Sub)")
 except ImportError:
     logger.info("Notification: larky not available")
 
@@ -86,7 +86,7 @@ def _run_lark_loop() -> None:
 
 
 class Notifier:
-    """Singleton notifier. Auto-detects larky WeChatClient > Feishu > silent."""
+    """Singleton notifier. Auto-detects larky UnifiedClient > Feishu > silent."""
 
     def send(self, text: str, priority: str = "high") -> None:
         """Send a notification. No-op if no channel available.
@@ -101,13 +101,13 @@ class Notifier:
             self._send_lark(text)
 
     def _send_larky(self, text: str, priority: str) -> None:
-        """Send via larky WeChatClient.notify() — same path as cryptoguard.
+        """Send via larky UnifiedClient.notify() — same path as cryptoguard.
 
-        Creates a fresh WeChatClient per send. This avoids cross-thread
+        Creates a fresh UnifiedClient per send. This avoids cross-thread
         event-loop issues with redis.asyncio connection pools. The overhead
         (one new Redis connection per notification) is negligible."""
         try:
-            wc = _WeChatClient(
+            wc = _UnifiedClient(
                 source="kimi-quant",
                 redis_host=os.getenv("REDIS_HOST", "localhost"),
                 redis_port=int(os.getenv("REDIS_PORT", "6379")),
@@ -144,7 +144,7 @@ class Notifier:
         if _channel == "lark" and _lark_thread and _lark_thread.is_alive():
             _queue.put(None)
             _lark_thread.join(timeout=10)
-        # larky WeChatClient needs no cleanup — each send creates a fresh
+        # larky UnifiedClient needs no cleanup — each send creates a fresh
         # client via asyncio.run() which cleans up after itself.
 
 

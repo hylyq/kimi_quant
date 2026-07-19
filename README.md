@@ -236,23 +236,23 @@ Sleeping 900.0s until next cycle...
 
 ## 消息推送（微信 / 飞书）
 
-通过 larky 的 `WeChatClient.notify()` 将消息发布到 Redis Pub/Sub，由 larky 的 `WeChatService`（独立进程 `python -m larky`）投递到微信。多程序共享同一套基础设施，无需各自管理 Bot 登录。
+通过 larky 的 `UnifiedClient.notify()` 将消息发布到 Redis Pub/Sub，由 larky 的 `UnifiedService`（独立进程 `python -m larky`）投递到各平台（微信/飞书/QQ）。多程序共享同一套基础设施，无需各自管理 Bot 登录。
 
 ### 架构
 
 ```
-kimi_quant ──WeChatClient──▶
+kimi_quant ──UnifiedClient──▶
                             │
-cryptoguard ──WeChatClient──▶── wechat:outgoing ──▶ WeChatService ──▶ 微信
+cryptoguard ──UnifiedClient──▶── bot:outgoing ──▶ UnifiedService ──▶ 微信/飞书/QQ
                             │     (Redis Pub/Sub)     (larky 独立进程)
-其他程序   ──WeChatClient──▶
+其他程序   ──UnifiedClient──▶
 ```
 
 ### 依赖
 
 - `larky`（可编辑安装，已在 `pyproject.toml` 中）
 - `redis`（larky 的传递依赖，已显式声明确保安装）
-- `WeChatService` 独立运行（`python -m larky`），各程序共享
+- `UnifiedService` 独立运行（`python -m larky`），各程序共享
 
 ### 推送事件
 
@@ -274,7 +274,7 @@ cryptoguard ──WeChatClient──▶── wechat:outgoing ──▶ WeChatSe
 ### 自动检测
 
 ```
-larky 可导入 → WeChatClient 发送（需 WeChatService 运行中）
+larky 可导入 → UnifiedClient 发送（需 UnifiedService 运行中）
 有飞书 APP_ID → 飞书推送（降级方案）
 都没有        → 静默运行
 
@@ -285,7 +285,7 @@ Redis 配置（可选，默认 localhost:6379）：
 ```
 ```
 
-程序启动时自动 ping Redis，连通即走微信通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
+程序启动时自动 ping Redis，连通即走通知通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
 
 ## 订单实时监控
 
@@ -1316,12 +1316,12 @@ Layer 2 (休眠):  sleep 中断 → 记日志，下轮继续
 ### Q: 怎么收到交易通知？
 
 前提条件：
-1. 服务器上运行着 `python -m larky`（WeChatService，独立进程）
+1. 服务器上运行着 `python -m larky`（UnifiedService，独立进程）
 2. `redis` 包已安装（`uv sync` 自动处理）
 
-满足条件后程序自动通过 `WeChatClient.notify()` 推送。无需额外配置。启动日志会显示：
+满足条件后程序自动通过 `UnifiedClient.notify()` 推送。无需额外配置。启动日志会显示：
 ```
-Notification: larky WeChatClient available (WeChat via Redis)
+Notification: larky UnifiedClient available (via Redis Pub/Sub)
 ```
 如果 Redis 不在 `localhost:6379`，设置 `REDIS_HOST` / `REDIS_PORT` 环境变量。
 
