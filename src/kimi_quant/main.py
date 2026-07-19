@@ -123,6 +123,9 @@ def run_once_single(
     )
     report["risk_context"] = risk_context
 
+    # Inject cycle-over-cycle diff so LLM sees what changed
+    data.inject_cycle_diff(report)
+
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
 
@@ -205,6 +208,9 @@ def run_once_debate(
     )
     report["risk_context"] = risk_context
 
+    # Inject cycle-over-cycle diff so debaters and Judge see what changed
+    data.inject_cycle_diff(report)
+
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)
 
@@ -219,6 +225,12 @@ def run_once_debate(
     logger.info("Debate transcript (Bull): %s", transcript["bull"][:120])
     logger.info("Debate transcript (Bear): %s", transcript["bear"][:120])
     logger.info("Debate transcript (Hold): %s", transcript["hold"][:120])
+    if transcript.get("bull_rebuttal"):
+        logger.info("Rebuttal (Bull): %s", transcript["bull_rebuttal"][:120])
+    if transcript.get("bear_rebuttal"):
+        logger.info("Rebuttal (Bear): %s", transcript["bear_rebuttal"][:120])
+    if transcript.get("hold_rebuttal"):
+        logger.info("Rebuttal (Hold): %s", transcript["hold_rebuttal"][:120])
 
     result = _validate_and_execute(signal_result, report, risk, executor, trade_logger)
     result["transcript"] = {

@@ -84,6 +84,9 @@ class DebateState(TypedDict):
     bull_argument: str
     bear_argument: str
     hold_argument: str
+    bull_rebuttal: str
+    bear_rebuttal: str
+    hold_rebuttal: str
     final_signal_json: str
     error: str
 
@@ -126,6 +129,35 @@ HOLD_USER_PROMPT = (
     "If market truly has clear direction, acknowledge it."
 )
 
+# Persona instructions for the optional rebuttal round.
+# Each debater sees the other two's arguments and counters them.
+REBUTTAL_BULL_PROMPT = (
+    "Role: Bullish BTC Trader (Rebuttal)\n"
+    "Your opponents just made their cases. Find flaws in their logic. "
+    "Point out specific data they ignored or misrepresented. "
+    "If they cited a level that actually supports YOUR bullish case, highlight it. "
+    "Be aggressive but honest — concede if they made an unanswerable point. "
+    "100-150 words. Plain text only, no JSON."
+)
+
+REBUTTAL_BEAR_PROMPT = (
+    "Role: Bearish BTC Trader (Rebuttal)\n"
+    "Your opponents just made their cases. Find flaws in their logic. "
+    "Point out specific data they ignored or misrepresented. "
+    "If they cited a level that actually supports YOUR bearish case, highlight it. "
+    "Be aggressive but honest — concede if they made an unanswerable point. "
+    "100-150 words. Plain text only, no JSON."
+)
+
+REBUTTAL_HOLD_PROMPT = (
+    "Role: Cautious Risk Manager (Rebuttal)\n"
+    "Your opponents just made their cases for going LONG and SHORT. "
+    "Find flaws in BOTH directional arguments. "
+    "If both sides have merit, explain why the conflict itself justifies staying out. "
+    "If one side is clearly weaker, say so — that may support a directional lean. "
+    "100-150 words. Plain text only, no JSON."
+)
+
 JUDGE_SYSTEM_PROMPT = """\
 You are the Head Trader. Your team (Bull/Long, Bear/Short, Risk/Hold) debated. \
 Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, or MODIFY_TP. \
@@ -158,11 +190,25 @@ Step 1 — WEIGH THE DEBATE (only after completing Step 0):
 
 Guidelines:
 - Trust specific data references (prices, sizes) over rhetoric
+- Cross-reference debater claims against RAW MARKET DATA
 - Divergence = smaller size + tighter stop, NOT automatic HOLD
 - Confidence < 0.65 → skip trade
 - stop_loss mandatory for LONG/SHORT, min 0.5% from entry
 - If Step 0 found issues (missing SL/TP, stale orders), include the fix
   actions BEFORE any new entry actions from the debate.
+
+Step 1.5 — COUNTERFACTUAL CHECK (before finalizing any directional decision):
+  Before outputting LONG/SHORT, pause and ask yourself:
+  - "If I'm WRONG about this — what price level would prove it?"
+    → That level should BE your stop loss. Don't set SL arbitrarily.
+  - "Which debater had the WEAKEST argument, and did I properly discount it?"
+    → If one debater was unconvincing, their side deserves less weight.
+  - "If the market rips the OTHER way in 15 minutes — did I miss a signal?"
+    → Check the RAW MARKET DATA one more time for contrary evidence.
+  - "Am I deferring to the most eloquent debater, or the one with the best DATA?"
+    → Eloquence ≠ accuracy. Trust specific numbers over persuasive writing.
+  If the counterfactual argument is uncomfortably strong → reduce confidence
+  by 0.1-0.15 or output HOLD.
 
 Output TradingSignal JSON:
 - actions: ordered list of actions (preferred). Use for flip ["CLOSE", "SHORT"],
@@ -217,6 +263,62 @@ class SingleTurnAgent:
             return f"[{self.name} failed to respond: {e}]"
 
 
+# ─── Rebuttal Agent ───────────────────────────────────────────────────────
+
+
+class RebuttalAgent:
+    """A debate rebuttal agent that counters opponents' arguments.
+
+    Like SingleTurnAgent, market data goes in the system message for
+    KV-cache sharing. The user message contains persona instructions
+    plus the opponents' arguments to counter.
+    """
+
+    def __init__(self, name: str, persona_instruction: str):
+        from kimi_quant.llm import create_llm
+
+        self.name = name
+        self.persona_instruction = persona_instruction
+        self.llm = create_llm()
+
+    async def arun(
+        self,
+        market_prompt: str,
+        opponent_a_label: str,
+        opponent_a_arg: str,
+        opponent_b_label: str,
+        opponent_b_arg: str,
+    ) -> str:
+        """Run the rebuttal agent.
+
+        Args:
+            market_prompt: Full market data (shared prefix for KV-cache).
+            opponent_a_label: Human-readable label for first opponent.
+            opponent_a_arg: First opponent's full argument text.
+            opponent_b_label: Human-readable label for second opponent.
+            opponent_b_arg: Second opponent's full argument text.
+        """
+        try:
+            user_msg = (
+                f"{self.persona_instruction}\n\n"
+                f"Your opponents argued:\n\n"
+                f"--- {opponent_a_label} ---\n{opponent_a_arg}\n\n"
+                f"--- {opponent_b_label} ---\n{opponent_b_arg}\n\n"
+                f"Counter their weakest points with specific data references. "
+                f"If they made a strong point you can't refute, acknowledge it. "
+                f"100-150 words. Plain text only, no JSON."
+            )
+            messages = [
+                ("system", DEBATE_SHARED_SYSTEM + "\n\n" + market_prompt),
+                ("user", user_msg),
+            ]
+            response = await self.llm.ainvoke(messages)
+            return str(response.content)
+        except Exception as e:
+            logger.error("Rebuttal %s failed: %s", self.name, e)
+            return f"[{self.name} rebuttal failed: {e}]"
+
+
 # ─── Judge Agent with Structured Output ─────────────────────────────────────
 
 
@@ -244,6 +346,9 @@ class JudgeAgent:
     async def ajudge(
         self, account_summary: str, bull: str, bear: str, hold: str,
         market_prompt: str = "",
+        bull_rebuttal: str = "",
+        bear_rebuttal: str = "",
+        hold_rebuttal: str = "",
     ) -> TradingSignal | None:
         """Asynchronously judge the debate and produce a TradingSignal.
 
@@ -273,10 +378,25 @@ class JudgeAgent:
                 f"{bear}\n\n"
                 "## 😐 RISK MANAGER (HOLD Case)\n"
                 f"{hold}\n\n"
+            )
+            # Append rebuttal round if available
+            if bull_rebuttal or bear_rebuttal or hold_rebuttal:
+                debate_transcript += (
+                    "# === REBUTTAL ROUND ===\n\n"
+                    "## 🐂 BULL REBUTTAL\n"
+                    f"{bull_rebuttal}\n\n"
+                    "## 🐻 BEAR REBUTTAL\n"
+                    f"{bear_rebuttal}\n\n"
+                    "## 😐 HOLD REBUTTAL\n"
+                    f"{hold_rebuttal}\n\n"
+                )
+            debate_transcript += (
                 "# === YOUR DECISION ===\n"
                 "Weigh the arguments above against the account context and raw data. "
                 "Cross-check specific claims (prices, levels, funding rates) "
                 "against the RAW MARKET DATA section. "
+                "When rebuttals are present, note which side successfully "
+                "countered the other — the winner of the exchange deserves more weight. "
                 f"IMPORTANT: size must not exceed {size_limit} BTC. "
                 "Produce the final trading signal."
             )
@@ -366,10 +486,22 @@ class DebateStrategy:
         self.debate_timeout = debate_timeout
         self._history_path = history_path or DEFAULT_HISTORY_PATH
 
+        # Optional rebuttal round: debaters see each other's arguments
+        # and counter before the Judge rules.
+        self.rebuttal_enabled = config.debate_rebuttal_enabled
+        if self.rebuttal_enabled:
+            self.rebuttal_bull = RebuttalAgent("BullRebut", REBUTTAL_BULL_PROMPT)
+            self.rebuttal_bear = RebuttalAgent("BearRebut", REBUTTAL_BEAR_PROMPT)
+            self.rebuttal_hold = RebuttalAgent("HoldRebut", REBUTTAL_HOLD_PROMPT)
+            logger.info(
+                "Rebuttal round ENABLED — debaters will counter each other "
+                "before the Judge rules (+3 LLM calls/cycle)"
+            )
+
         self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
-        logger.info("DebateStrategy initialized: 4 agents, timeout=%ds",
-                     debate_timeout)
+        logger.info("DebateStrategy initialized: %d agents, timeout=%ds",
+                     7 if self.rebuttal_enabled else 4, debate_timeout)
 
     def close(self) -> None:
         """No-op (MemorySaver needs no cleanup)."""
@@ -378,7 +510,9 @@ class DebateStrategy:
     def _build_graph(self):
         """Construct the debate StateGraph with checkpointing.
 
-        Nodes: debate (parallel bull/bear/hold) → adjudicate (judge)
+        Nodes: debate (parallel bull/bear/hold)
+               → rebuttal (optional: debaters counter each other)
+               → adjudicate (judge)
         """
         builder = StateGraph(DebateState)
 
@@ -386,7 +520,14 @@ class DebateStrategy:
         builder.add_node("adjudicate", self._adjudicate_node)
 
         builder.set_entry_point("debate")
-        builder.add_edge("debate", "adjudicate")
+
+        if self.rebuttal_enabled:
+            builder.add_node("rebuttal", self._rebuttal_node)
+            builder.add_edge("debate", "rebuttal")
+            builder.add_edge("rebuttal", "adjudicate")
+        else:
+            builder.add_edge("debate", "adjudicate")
+
         builder.add_edge("adjudicate", END)
 
         return builder.compile(checkpointer=self.checkpointer)
@@ -441,6 +582,74 @@ class DebateStrategy:
             "bull_argument": bull_arg,
             "bear_argument": bear_arg,
             "hold_argument": hold_arg,
+            "bull_rebuttal": "",
+            "bear_rebuttal": "",
+            "hold_rebuttal": "",
+        }
+
+    async def _rebuttal_node(self, state: DebateState) -> DebateState:
+        """Rebuttal round: each debater counters the other two's arguments.
+
+        Like the debate phase, Hold runs first to warm the KV-cache,
+        then Bull + Bear run in parallel on the warm cache.
+        """
+        prompt = state["market_prompt"]
+        cycle_id = state.get("cycle_id", "?")
+        logger.info("Rebuttal [%s]: counters starting...", cycle_id)
+        start = datetime.now(timezone.utc)
+
+        async def _run_with_timeout(coro, name: str) -> str:
+            try:
+                return await asyncio.wait_for(coro, timeout=self.debate_timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Rebuttal %s timed out after %ds", name, self.debate_timeout)
+                return (
+                    f"[{name} rebuttal TIMEOUT after {self.debate_timeout}s — "
+                    f"proceed without this counter-argument.]"
+                )
+
+        bull_arg = state["bull_argument"]
+        bear_arg = state["bear_argument"]
+        hold_arg = state["hold_argument"]
+
+        # Hold rebuts Bull + Bear (cache warm-up)
+        hold_rebuttal = await _run_with_timeout(
+            self.rebuttal_hold.arun(
+                prompt,
+                "🐂 BULL (LONG case)", bull_arg,
+                "🐻 BEAR (SHORT case)", bear_arg,
+            ),
+            "HoldRebut",
+        )
+
+        # Bull + Bear rebut in parallel (cache hits)
+        bull_rebuttal, bear_rebuttal = await asyncio.gather(
+            _run_with_timeout(
+                self.rebuttal_bull.arun(
+                    prompt,
+                    "🐻 BEAR (SHORT case)", bear_arg,
+                    "😐 RISK MANAGER (HOLD case)", hold_arg,
+                ),
+                "BullRebut",
+            ),
+            _run_with_timeout(
+                self.rebuttal_bear.arun(
+                    prompt,
+                    "🐂 BULL (LONG case)", bull_arg,
+                    "😐 RISK MANAGER (HOLD case)", hold_arg,
+                ),
+                "BearRebut",
+            ),
+        )
+
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        logger.info("Rebuttal [%s] complete in %.1fs", cycle_id, elapsed)
+
+        return {
+            **state,
+            "bull_rebuttal": bull_rebuttal,
+            "bear_rebuttal": bear_rebuttal,
+            "hold_rebuttal": hold_rebuttal,
         }
 
     async def _adjudicate_node(self, state: DebateState) -> DebateState:
@@ -451,6 +660,9 @@ class DebateStrategy:
             state["bear_argument"],
             state["hold_argument"],
             state["market_prompt"],
+            state.get("bull_rebuttal", ""),
+            state.get("bear_rebuttal", ""),
+            state.get("hold_rebuttal", ""),
         )
 
         if signal is None:
@@ -519,6 +731,9 @@ class DebateStrategy:
             "bull_argument": "",
             "bear_argument": "",
             "hold_argument": "",
+            "bull_rebuttal": "",
+            "bear_rebuttal": "",
+            "hold_rebuttal": "",
             "final_signal_json": "",
             "error": "",
         }
@@ -567,6 +782,9 @@ class DebateStrategy:
             "bull": final_state["bull_argument"],
             "bear": final_state["bear_argument"],
             "hold": final_state["hold_argument"],
+            "bull_rebuttal": final_state.get("bull_rebuttal", ""),
+            "bear_rebuttal": final_state.get("bear_rebuttal", ""),
+            "hold_rebuttal": final_state.get("hold_rebuttal", ""),
         }
 
     def _save_cycle(self, final_state: dict) -> None:
@@ -577,6 +795,9 @@ class DebateStrategy:
             "bull_argument": final_state.get("bull_argument", ""),
             "bear_argument": final_state.get("bear_argument", ""),
             "hold_argument": final_state.get("hold_argument", ""),
+            "bull_rebuttal": final_state.get("bull_rebuttal", ""),
+            "bear_rebuttal": final_state.get("bear_rebuttal", ""),
+            "hold_rebuttal": final_state.get("hold_rebuttal", ""),
             "final_signal_json": final_state.get("final_signal_json", ""),
             "error": final_state.get("error", ""),
         }

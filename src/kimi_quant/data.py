@@ -377,6 +377,8 @@ class DataProvider:
 
         # Candle cache: {interval: (timestamp, candles_list)}
         self._candle_cache: dict[str, tuple[float, list[dict]]] = {}
+        # Previous cycle snapshot for cycle-over-cycle diff
+        self._previous_snapshot: dict[str, Any] = {}
 
         logger.info(
             "DataProvider initialized (testnet=%s, coin=%s, curl_cffi=%s)",
@@ -848,6 +850,158 @@ class DataProvider:
             "open_orders_raw": open_orders_raw,
         }
 
+    # ─── Cycle-over-cycle diff ──────────────────────────────────────────
+
+    def inject_cycle_diff(self, report: dict[str, Any]) -> None:
+        """Inject a cycle-over-cycle diff into the report for LLM context.
+
+        Captures current snapshot, builds diff against previous, stores
+        current for next cycle. The diff is placed in report['_cycle_diff']
+        and picked up by build_llm_prompt().
+        """
+        current = self._capture_snapshot(report)
+        diff = self._build_diff(current, self._previous_snapshot)
+        if diff:
+            report["_cycle_diff"] = diff
+        self._previous_snapshot = current
+
+    def _capture_snapshot(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Capture a compact snapshot of key metrics for cycle diffing."""
+        market = report.get("market")
+        order_book = report.get("order_book")
+        analysis = report.get("analysis")
+
+        snap: dict[str, Any] = {}
+        if market:
+            snap["mid_price"] = market.mid_price
+            snap["funding_rate"] = market.funding_rate
+            snap["day_change_pct"] = market.day_change_pct
+            snap["open_interest"] = market.open_interest
+            snap["spread_pct"] = market.spread_pct
+        if order_book:
+            snap["book_imbalance"] = order_book.imbalance
+        if analysis and analysis.timeframes:
+            snap["tf_trends"] = {
+                tf.interval: {
+                    "trend": tf.trend,
+                    "change_pct": tf.change_pct,
+                    "atr_pct": tf.atr_pct,
+                }
+                for tf in analysis.timeframes
+            }
+        return snap
+
+    def _build_diff(
+        self, current: dict[str, Any], previous: dict[str, Any]
+    ) -> str | None:
+        """Build a concise diff section comparing current vs previous cycle.
+
+        Returns None if no previous data is available.
+        """
+        if not previous:
+            return None
+
+        lines = ["# 📊 Since Last Cycle\n"]
+        has_change = False
+
+        # ── Price ──
+        cur_px = current.get("mid_price")
+        prev_px = previous.get("mid_price")
+        if cur_px and prev_px and cur_px != prev_px:
+            delta = cur_px - prev_px
+            delta_pct = (delta / prev_px) * 100
+            direction = "📈" if delta > 0 else "📉"
+            lines.append(
+                f"BTC: ${prev_px:.1f} → ${cur_px:.1f} "
+                f"({direction} {delta:+.1f} / {delta_pct:+.2f}%)"
+            )
+            has_change = True
+
+        # ── Funding ──
+        cur_fr = current.get("funding_rate")
+        prev_fr = previous.get("funding_rate")
+        if cur_fr is not None and prev_fr is not None:
+            fr_delta = (cur_fr - prev_fr) * 100  # convert to %
+            if abs(fr_delta) > 0.0001:  # meaningful change
+                lines.append(
+                    f"Funding: {prev_fr*100:.4f}% → {cur_fr*100:.4f}% "
+                    f"({fr_delta:+.4f}%)"
+                )
+                has_change = True
+
+        # ── 24h change ──
+        cur_day = current.get("day_change_pct")
+        prev_day = previous.get("day_change_pct")
+        if cur_day is not None and prev_day is not None:
+            day_delta = cur_day - prev_day
+            if abs(day_delta) > 0.1:
+                lines.append(f"24h change: {prev_day:+.2f}% → {cur_day:+.2f}%")
+                has_change = True
+
+        # ── Order book imbalance ──
+        cur_imb = current.get("book_imbalance")
+        prev_imb = previous.get("book_imbalance")
+        if cur_imb is not None and prev_imb is not None:
+            imb_delta = cur_imb - prev_imb
+            if abs(imb_delta) > 0.05:
+                new_side = "bid-heavy" if cur_imb > 0 else "ask-heavy"
+                lines.append(
+                    f"Book imbalance: {prev_imb:+.3f} → {cur_imb:+.3f} (now {new_side})"
+                )
+                has_change = True
+
+        # ── Spread ──
+        cur_sp = current.get("spread_pct")
+        prev_sp = previous.get("spread_pct")
+        if cur_sp is not None and prev_sp is not None:
+            sp_delta = cur_sp - prev_sp
+            if abs(sp_delta) > 0.001:
+                lines.append(f"Spread: {prev_sp:.4f}% → {cur_sp:.4f}%")
+                has_change = True
+
+        # ── Multi-TF trends ──
+        cur_tf = current.get("tf_trends", {})
+        prev_tf = previous.get("tf_trends", {})
+        tf_flips = []
+        for interval in ("4h", "1h", "15m", "5m"):
+            ct = cur_tf.get(interval, {})
+            pt = prev_tf.get(interval, {})
+            if ct and pt and ct["trend"] != pt["trend"]:
+                tf_flips.append(f"{interval}: {pt['trend']}→{ct['trend']}")
+        if tf_flips:
+            lines.append("⚠️  TREND FLIPS: " + " | ".join(tf_flips))
+            has_change = True
+
+        # ── ATR changes ──
+        atr_changes = []
+        for interval in ("4h", "1h", "15m", "5m"):
+            ct = cur_tf.get(interval, {})
+            pt = prev_tf.get(interval, {})
+            if ct and pt:
+                delta_atr = ct["atr_pct"] - pt["atr_pct"]
+                if abs(delta_atr) > 0.02:
+                    atr_changes.append(
+                        f"{interval} ATR: {pt['atr_pct']:.2f}%→{ct['atr_pct']:.2f}%"
+                    )
+        if atr_changes:
+            lines.append("ATR (volatility): " + " | ".join(atr_changes))
+            has_change = True
+
+        # ── OI ──
+        cur_oi = current.get("open_interest")
+        prev_oi = previous.get("open_interest")
+        if cur_oi and prev_oi and prev_oi > 0:
+            oi_delta_pct = (cur_oi - prev_oi) / prev_oi * 100
+            if abs(oi_delta_pct) > 0.5:
+                lines.append(
+                    f"OI: ${prev_oi:,.0f} → ${cur_oi:,.0f} ({oi_delta_pct:+.1f}%)"
+                )
+                has_change = True
+
+        if not has_change:
+            return None
+        return "\n".join(lines)
+
     @staticmethod
     def build_llm_prompt(report: dict[str, Any]) -> str:
         """Build the full LLM prompt from a report dict.
@@ -858,6 +1012,15 @@ class DataProvider:
         analysis = report.get("analysis")
         if analysis:
             prompt = analysis.to_llm_prompt()
+
+            # Inject cycle-over-cycle diff (focus LLM on what changed)
+            diff = report.get("_cycle_diff", "")
+            if diff:
+                # Insert diff right after the market snapshot, before TF analysis
+                prompt = prompt.replace(
+                    "\n# Multi-Timeframe Technical Analysis\n",
+                    f"\n{diff}\n\n# Multi-Timeframe Technical Analysis\n",
+                )
 
             # Inject ALL open orders from chain (not just tracker-known ones).
             # This lets the LLM see stale/manual orders and decide to cancel them.

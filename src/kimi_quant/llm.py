@@ -345,6 +345,17 @@ Step 1 — ANALYZE MARKET (only after completing Step 0):
   6. If you decided to modify SL/TP in Step 0, include those actions BEFORE
      any new entry actions in the `actions` array.
 
+Step 1.5 — COUNTERFACTUAL CHECK (before finalizing any directional decision):
+  Before outputting LONG/SHORT, pause and ask:
+  - "If I'm WRONG about this trade — what would prove me wrong?"
+    → That price level IS your stop loss. Make sure SL is at that level.
+  - "If I HOLD and the market moves hard — what did I miss?"
+    → If you can name a specific signal you'd regret ignoring, reconsider.
+  - "Am I trading what I SEE or what I WANT to see?"
+    → Bias check: is the evidence genuinely strong, or are you reaching?
+  If the counterfactual argument is uncomfortably strong → reduce confidence
+  by 0.1-0.15 or skip the trade entirely.
+
 Output JSON only (no markdown):
 - actions: ordered list of actions to execute sequentially. Use this for:
   - Single action: ["LONG"], ["SHORT"], ["CLOSE"], ["HOLD"], ["MODIFY_SL"], ["MODIFY_TP"]

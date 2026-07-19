@@ -95,6 +95,11 @@ class Config:
     judge_primary_llm: str = field(
         default_factory=lambda: os.getenv("JUDGE_PRIMARY_LLM", "")
     )  # "" = use PRIMARY_LLM; set to "kimi" or "deepseek" to override Judge model
+    debate_rebuttal_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "DEBATE_REBUTTAL_ENABLED", "false"
+        ).lower() == "true"
+    )  # enables a rebuttal round where debaters counter each other before Judge rules
     trading_interval_seconds: int = field(
         default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "600"))
     )
