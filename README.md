@@ -47,9 +47,11 @@
 ```
               ┌── 🐂 Bull Agent (论证做多) ──┐
 市场数据 ───┼── 🐻 Bear Agent (论证做空) ──┼── ⚖️ Judge ──→ TradingSignal ──→ 风控 ──→ 执行
-              └── 😐 Hold Agent (论证观望) ──┘
+              └── 😐 Hold Agent (论证观望) ──┘        ↑
+                                             完整市场数据 + 三方论证
 ```
 3 个 Agent 并行辩论 + 1 个裁判裁决，通过对抗验证减少单一模型偏见。4 次 LLM 调用/周期。
+**所有 4 个 Agent 看到相同的原始市场数据**（行情、K 线、订单簿、资金费率、风控约束）——Judge 可以在裁决时交叉验证辩手的论点。
 
 ### 决策工作流（Decision Workflow）
 
@@ -82,7 +84,7 @@
 
 **关键原则**：Step 0 的修复动作（如恢复丢失的 SL）优先级高于 Step 1 的新开仓动作。如果 Step 0 发现 SL 丢失且市场出现做多信号，LLM 应输出 `["MODIFY_SL", "LONG"]` 而非 `["LONG"]`——先保护仓位，再开新仓。
 
-这项设计通过 **System Prompt + User Prompt Instructions + Judge Prompt** 三层提示词共同强制，不需要额外代码逻辑。
+这项设计通过 **System Prompt + User Prompt Instructions + Judge Prompt** 三层提示词共同强制，不需要额外代码逻辑。在 Debate 模式下，Judge 与辩手共享相同的原始市场数据（通过 `RAW MARKET DATA` 区块），可直接验证辩手引用的价格和指标是否准确。
 
 ## 架构概览
 
@@ -110,13 +112,13 @@
 ### 数据流
 
 1. **DataProvider** — 行情数据走主网（`meta_and_asset_ctxs`，含 mark/oracle/funding/OI），多周期 K 线 TTL 缓存。同步查询链上全部挂单（`open_orders`）
-2. **策略引擎** — Single：单次 LLM 分析；Debate：三 Agent 辩论 + Judge 裁决（60s 超时）。两种模式均遵循 Step 0→Step 1 决策工作流
+2. **策略引擎** — Single：单次 LLM 分析；Debate：三 Agent 辩论 + Judge 裁决（60s 超时）。所有 4 个 Agent 接收相同的市场数据（行情、多周期 K 线、订单簿、资金费率、风控约束）；Judge 额外看到三方论证后可交叉验证。两种模式均遵循 Step 0→Step 1 决策工作流
 3. **RiskManager** — 七层风控校验 + `validate_sequence()` 多操作状态模拟（支持翻转 CLOSE+LONG/SHORT 风控通过）
 4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + SL/TP 价格追踪 + 多操作顺序执行（失败即停）+ 15/15 SDK 全覆盖
 5. **TradeLogger** — 盈亏分析 + LLM 表现反馈（自省循环）
 6. **OrderMonitor** — WebSocket 实时订阅订单状态变化（成交/部分成交/取消/清算），毫秒级同步到 PositionTracker，使 LLM 在下一周期看到最新状态
 7. **FlashReporter** — 消费 WS 事件 → Flash 模型生成中文自然语言通知 → 微信/飞书推送
-8. **上下文注入** — 每轮将账户余额、持仓、**全部链上挂单**（含孤儿订单）、tracker 追踪的 SL/TP 价格、**风控硬约束（熔断状态、保证金预算、风险预算、方向限制）** 注入 LLM prompt。**LLM 做决策前就知道边界在哪**——不会提出注定被拒的操作，节省无效 LLM 调用。**SL/TP 链上验证**——若 SL/TP 丢失，prompt 中显示 ⚠️ 告警并要求 LLM 优先修复
+8. **上下文注入** — 每轮将账户余额、持仓、**全部链上挂单**（含孤儿订单）、tracker 追踪的 SL/TP 价格、**风控硬约束（熔断状态、保证金预算、风险预算、方向限制）** 注入 LLM prompt。**LLM 做决策前就知道边界在哪**——不会提出注定被拒的操作，节省无效 LLM 调用。**SL/TP 链上验证**——若 SL/TP 丢失，prompt 中显示 ⚠️ 告警并要求 LLM 优先修复。**Debate 模式下，完整市场数据同时注入 Bull/Bear/Hold/Judge 四个 Agent**，Judge 可交叉验证辩手引用的具体数据
 9. **自适应间隔** — LLM 建议下次唤醒时间（5min-3h），横盘省费/关键位盯紧
 
 ### 技术栈
@@ -1038,20 +1040,20 @@ TradeExecutor 启动时自动查询链上状态：
 | 🐂 Bull | 激进多头分析师 | 寻找做多证据：支撑位、bid wall、负资金费率 |
 | 🐻 Bear | 怀疑派空头分析师 | 寻找做空证据：阻力位、ask wall、正资金费率 |
 | 😐 Hold | 谨慎风控官 | 寻找观望理由：信号矛盾、波动过大、无明确方向 |
-| ⚖️ Judge | 首席交易官 | 综合多周期趋势裁决，1h/4h 权重 > 5m/15m |
+| ⚖️ Judge | 首席交易官 | 综合多周期趋势裁决，可交叉验证辩手论点与原始数据；1h/4h 权重 > 5m/15m |
 
 ### 决策流程
 
 1. **Phase 1 — 缓存预热**：Hold Agent 先跑，其 prefill 阶段将行情数据写入 DeepSeek KV-cache
 2. **Phase 2 — 并行命中**：Bull + Bear 并发跑，两份请求的前缀（行情数据）命中缓存，仅对 ~50 token 的角色指令计费
-3. Judge **综合多周期趋势**裁决（1h/4h 趋势权重 > 5m/15m，分歧时不默认 HOLD）
-4. Judge 输出结构化 TradingSignal → 风控 → 执行
+3. **Judge 收到完整信息**：Judge 的 prompt 包含三个区块 — Account Context（账户摘要 + 风控约束）→ **Raw Market Data（与辩手相同的原始行情数据）** → Debate Transcript（三方论证全文）。可交叉验证辩手引用的价格、指标、费率
+4. Judge 综合原始数据与辩论论证裁决，输出结构化 TradingSignal → 风控 → 执行
 
-> **前缀缓存**：三个 Agent 接收完全相同的行情数据。将其置于 prompt 最前面（system message），DeepSeek V3 的后端自动复用第一个请求的 KV-cache。Phase 2 的两个 Agent 输入 token 费用降低 ~95%，整个 Debate 输入 token 省 ~63%。见[费用优化](#费用优化)。
+> **前缀缓存**：三个辩手 Agent 接收完全相同的行情数据。将其置于 prompt 最前面（system message），DeepSeek V3 的后端自动复用第一个请求的 KV-cache。Phase 2 的两个 Agent 输入 token 费用降低 ~95%，整个 Debate 输入 token 省 ~63%。Judge 额外接收完整市场数据（无缓存共享，但可通过精简 prompt 控制长度）。
 
 ### Judge 决策框架
 
-Judge 现在接收账户上下文（余额、可用保证金、当前持仓、挂单 SL/TP 价格）和交易约束（最大仓位、杠杆），在此基础上裁决。
+Judge 接收完整信息——账户上下文（余额、可用保证金、当前持仓、挂单 SL/TP 价格）、交易约束（最大仓位、杠杆）、**原始市场数据（行情、K 线、订单簿、资金费率——与辩手完全相同）**、以及三方辩论论证。可在裁决时直接交叉验证辩手引用的价格和指标。
 
 | 市场状态 | Judge 决策倾向 |
 |----------|---------------|
@@ -1207,9 +1209,9 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 三个辩论 Agent 接收相同的行情数据（~1500 tokens）。系统已做两项优化：
 
 1. **前缀缓存**：行情数据放在 prompt 最前面，DeepSeek V3 自动复用 KV-cache。Hold 先跑预热缓存，Bull + Bear 并发命中——后两个 Agent 只对 ~50 token 角色指令计费。
-2. **Judge 精简输入**：Judge 只收辩论摘要（不含原始行情），节省 ~450 token/周期。
+2. **Judge 统一信息**：Judge 看到与辩手相同的原始市场数据（通过 `RAW MARKET DATA` 区块），确保能交叉验证。此区块与辩手的行情数据内容相同，增加了 Judge 的 prompt 长度，但换来了更可靠的裁决质量。
 
-整体效果：Debate 的 4 次调用等效 ~2.5 次 Single 调用的输入 token 量。
+整体效果：Debate 的 4 次调用等效 ~3 次 Single 调用的输入 token 量。
 
 ### Q: 如何切换主/备模型？
 

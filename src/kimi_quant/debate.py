@@ -143,6 +143,11 @@ Step 0 — ASSESS EXISTING STATE FIRST (before weighing the debate):
   c. Are there stale orders on chain? Clean them up if needed.
   d. Are SL/TP levels appropriate for current ATR? Adjust if not.
 
+You now have access to the RAW MARKET DATA section below the account context.
+Cross-check the debaters' claims against the actual prices, levels, and
+indicators shown there. When a debater cites a specific price or level,
+verify it against the raw data before trusting it.
+
 Step 1 — WEIGH THE DEBATE (only after completing Step 0):
   Decision framework (higher TF = more weight: 4h > 1h > 15m > 5m):
   - 1h+4h aligned + strong argument → confidence 0.75+
@@ -232,13 +237,15 @@ class JudgeAgent:
         )
 
     async def ajudge(
-        self, account_summary: str, bull: str, bear: str, hold: str
+        self, account_summary: str, bull: str, bear: str, hold: str,
+        market_prompt: str = "",
     ) -> TradingSignal | None:
         """Asynchronously judge the debate and produce a TradingSignal.
 
-        The account summary and trading constraints are included so the Judge
-        knows the actual account state and position size limits — without this,
-        the Judge can propose sizes far beyond what the account can afford.
+        The account summary, trading constraints, and raw market data are
+        included so the Judge sees the same data the debaters saw — prices,
+        levels, order book, multi-timeframe trends, risk context — and can
+        cross-reference their claims against the source data.
         """
         try:
             size_limit = config.max_position_size
@@ -252,6 +259,8 @@ class JudgeAgent:
                 "# === ACCOUNT CONTEXT ===\n"
                 f"{account_summary}\n"
                 f"Trading constraints: {constraints}\n\n"
+                "# === RAW MARKET DATA ===\n"
+                f"{market_prompt}\n\n"
                 "# === DEBATE TRANSCRIPT ===\n\n"
                 "## 🐂 BULL ANALYST (LONG Case)\n"
                 f"{bull}\n\n"
@@ -260,10 +269,9 @@ class JudgeAgent:
                 "## 😐 RISK MANAGER (HOLD Case)\n"
                 f"{hold}\n\n"
                 "# === YOUR DECISION ===\n"
-                "Weigh the arguments above against the account context. "
-                "The debaters have already referenced all relevant market data "
-                "(prices, levels, funding, order book, multi-timeframe trends) "
-                "in their arguments. "
+                "Weigh the arguments above against the account context and raw data. "
+                "Cross-check specific claims (prices, levels, funding rates) "
+                "against the RAW MARKET DATA section. "
                 f"IMPORTANT: size must not exceed {size_limit} BTC. "
                 "Produce the final trading signal."
             )
@@ -437,6 +445,7 @@ class DebateStrategy:
             state["bull_argument"],
             state["bear_argument"],
             state["hold_argument"],
+            state["market_prompt"],
         )
 
         if signal is None:
