@@ -165,8 +165,13 @@ DEEPSEEK_API_KEY=sk-your-deepseek-key
 # 方案 2: DeepSeek 主 → Kimi 备 (省钱，费用约 Kimi 的 1/10)
 PRIMARY_LLM=deepseek
 
-# 方案 3: 仅 Kimi (不配 DeepSeek key 即可)
-# 方案 4: 仅 DeepSeek (不配 Kimi key 即可)
+# 方案 3: 辩论模式 — 辩手弱模型 + Judge 强模型 (🏆 推荐)
+# 辩手执行定向搜索（只需找证据），Judge 做综合裁决（需要强推理）
+PRIMARY_LLM=deepseek        # Bull/Bear/Hold 用便宜的 DeepSeek（3 次调用）
+JUDGE_PRIMARY_LLM=kimi       # Judge 用强推理的 Kimi K3（1 次调用）
+
+# 方案 4: 仅 Kimi (不配 DeepSeek key 即可)
+# 方案 5: 仅 DeepSeek (不配 Kimi key 即可)
 ```
 
 ### 推理强度控制
@@ -195,6 +200,44 @@ REASONING_EFFORT=off      # 关闭推理，大幅节省 token
 > **结构化 JSON 输出**：使用 `response_format: json_object`（LangChain `json_mode`）。这是 DeepSeek 官方唯一支持的结构化输出方式（`json_schema` 和 `function_calling` 均返回 400）。Kimi 也兼容。Schema 通过 system prompt 传递给模型。
 >
 > ⚠️ **Kimi K3 温度限制**：Kimi K3 是推理模型，**只接受 `temperature=1`**。程序会自动将 `LLM_TEMPERATURE` 覆盖为 1.0（仅对 Kimi），无需手动修改配置。DeepSeek 不受影响。
+
+### Debate 模式：独立 Judge 模型（辩弱 Judge 强）
+
+Debate 模式下，4 个 Agent 的认知负荷不对称：
+
+| | 🐂🐻😐 辩手 (×3) | ⚖️ Judge (×1) |
+|---|---|---|
+| **任务** | 单一视角定向搜索（只看多/只看空/只看风险） | 综合三方论证 + 对照原始数据 + 多时间框架权衡 + 账户约束 → 最终决策 |
+| **对偏差的敏感度** | 故意有偏（角色设定），偏差是 feature | 必须识别并抵消辩手偏差 |
+| **出错代价** | 低 — 一个辩手弱，另两个可补充 | 高 — Judge 错 = 交易决策错 |
+| **适合的模型** | 便宜快速的弱模型 | 强推理模型 |
+
+**推荐配置**：辩手用便宜的 DeepSeek，Judge 用强推理的 Kimi K3。
+
+```bash
+# .env
+PRIMARY_LLM=deepseek        # Bull/Bear/Hold 用 DeepSeek（3 次调用）
+JUDGE_PRIMARY_LLM=kimi       # Judge 用 Kimi K3（1 次调用）
+```
+
+容灾：Judge 的 Kimi 挂了 → 自动降级到 DeepSeek。辩手不受影响。
+
+费用对比（10min 间隔，Debate 模式月成本）：
+
+| 方案 | 辩手×3 | Judge×1 | 月成本 | 决策质量 |
+|------|--------|---------|--------|:--:|
+| 全 Kimi | Kimi | Kimi | ~¥450 | 高 |
+| 全 DeepSeek | DeepSeek | DeepSeek | ~¥60 | 中 |
+| **辩弱 Judge 强** | DeepSeek | Kimi | **~¥160** | **高** ✅ |
+
+比全 Kimi 省 **65%**，Judge 决策质量不受影响——最终裁决依赖推理综合能力而非辩手的文笔。
+
+启动日志会体现独立配置：
+
+```
+LLM: deepseek primary → fallback: kimi        ← 辩手
+Judge LLM: kimi primary → fallback: deepseek   ← Judge
+```
 
 ## 自适应唤醒间隔
 
@@ -702,6 +745,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `LLM_TEMPERATURE` | `0.1` | LLM 温度 (0-2)。**注意**：Kimi K3 只支持 1.0，程序自动覆盖 |
 | `LLM_MAX_TOKENS` | `2048` | 最大输出 token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
+| `JUDGE_PRIMARY_LLM` | (同 `PRIMARY_LLM`) | Judge 专用主模型：`kimi` 或 `deepseek`。留空则与辩手相同。推荐 `kimi`（强推理裁决） |
 | **Hyperliquid** | | |
 | `HYPERLIQUID_PRIVATE_KEY` | — | 钱包私钥（实盘必填） |
 | `HYPERLIQUID_TESTNET` | `true` | `true`=测试网, `false`=主网 |
@@ -1190,14 +1234,16 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 
 | 配置 | 月成本 | vs Single |
 |------|--------|-----------|
-| DeepSeek V3 | ~¥60 | 1.5x（缓存省 63% 输入 token） |
-| Kimi K3 | ~¥450 | 1.4x |
+| 全 DeepSeek V3 | ~¥60 | 1.5x（缓存省 63% 输入 token） |
+| 辩弱 Judge 强 (🏆) | ~¥160 | 1.6x（Judge 用 Kimi 保证质量） |
+| 全 Kimi K3 | ~¥450 | 1.4x |
 
 **省钱三板斧**：
 
 | 策略 | .env 配置 | 效果 |
 |------|----------|------|
 | 用 DeepSeek 主力 | `PRIMARY_LLM=deepseek` | 月成本 ¥330→¥40 |
+| 辩弱 Judge 强 | `PRIMARY_LLM=deepseek` + `JUDGE_PRIMARY_LLM=kimi` | 比全 Kimi 省 65%，质量不变 |
 | 关推理 | `REASONING_EFFORT=off` | 输出费用再降 75% |
 | 加大间隔 | `TRADING_INTERVAL=900` | 成本再降 1/3 |
 | 调高最低间隔 | `MIN_INTERVAL=600` | 防止 LLM 频繁唤醒（默认 300s） |
@@ -1215,11 +1261,14 @@ DataProvider initialized (testnet=False, coin=BTC, curl_cffi=True)
 
 ### Q: 如何切换主/备模型？
 
-一个环境变量：
-
 ```bash
+# 全局主模型
 PRIMARY_LLM=kimi      # Kimi 主力，DeepSeek 备份（默认）
 PRIMARY_LLM=deepseek  # DeepSeek 主力，Kimi 备份（省钱）
+
+# Debate 模式：Judge 独立主模型（留空则同 PRIMARY_LLM）
+JUDGE_PRIMARY_LLM=kimi      # Judge 用 Kimi，辩手用 PRIMARY_LLM
+JUDGE_PRIMARY_LLM=deepseek  # Judge 用 DeepSeek，辩手用 PRIMARY_LLM
 ```
 
 只需配好两个模型的 API Key，主模型挂了自动切备机。不需改任何代码。见 [LLM 模型配置](#llm-模型配置)。

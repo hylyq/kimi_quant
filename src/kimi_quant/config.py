@@ -92,6 +92,9 @@ class Config:
     judge_temperature: float = field(
         default_factory=lambda: float(os.getenv("JUDGE_TEMPERATURE", "0.05"))
     )
+    judge_primary_llm: str = field(
+        default_factory=lambda: os.getenv("JUDGE_PRIMARY_LLM", "")
+    )  # "" = use PRIMARY_LLM; set to "kimi" or "deepseek" to override Judge model
     trading_interval_seconds: int = field(
         default_factory=lambda: int(os.getenv("TRADING_INTERVAL", "600"))
     )

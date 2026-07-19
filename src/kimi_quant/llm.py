@@ -117,6 +117,7 @@ def _resolve_chain(
 def create_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
+    primary: str | None = None,
 ) -> ChatOpenAI:
     """Create a ChatOpenAI with automatic fallback chain.
 
@@ -126,6 +127,8 @@ def create_llm(
     Args:
         temperature: Override default temperature.
         max_tokens: Override default max_tokens.
+        primary: Override PRIMARY_LLM for this instance (None = use default).
+            e.g., "kimi" or "deepseek". Empty string also falls back to default.
 
     Returns:
         A ChatOpenAI wrapped with fallback chain.
@@ -133,13 +136,15 @@ def create_llm(
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
     registry = _build_model_registry(temp, tokens)
-    return _resolve_chain(registry, config.primary_llm)
+    primary_name = primary or config.primary_llm
+    return _resolve_chain(registry, primary_name)
 
 
 def create_structured_llm(
     schema: type[BaseModel],
     temperature: float | None = None,
     max_tokens: int | None = None,
+    primary: str | None = None,
 ):
     """Create a structured-output LLM with automatic fallback chain.
 
@@ -147,7 +152,12 @@ def create_structured_llm(
     output mode supported by DeepSeek. json_schema and function_calling
     both return 400 on DeepSeek. Kimi also supports json_object.
 
-    Primary model is determined by PRIMARY_LLM env var (default: "kimi").
+    Args:
+        schema: Pydantic model for structured output.
+        temperature: Override default temperature.
+        max_tokens: Override default max_tokens.
+        primary: Override PRIMARY_LLM for this instance (None = use default).
+            e.g., "kimi" or "deepseek". Empty string also falls back to default.
     """
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
@@ -160,7 +170,8 @@ def create_structured_llm(
         name: llm.with_structured_output(schema, method="json_mode")
         for name, llm in registry.items()
     }
-    return _resolve_chain(structured_registry, config.primary_llm)
+    primary_name = primary or config.primary_llm
+    return _resolve_chain(structured_registry, primary_name)
 
 
 class TradingSignal(BaseModel):

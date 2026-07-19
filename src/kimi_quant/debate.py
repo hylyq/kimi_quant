@@ -230,10 +230,15 @@ class JudgeAgent:
     def __init__(self):
         from kimi_quant.llm import create_structured_llm
 
+        # Judge can use a different primary model from the debaters.
+        # Set JUDGE_PRIMARY_LLM in .env to override (e.g., "deepseek").
+        # Fallback chain always includes all available models (kimi + deepseek).
+        judge_primary = config.judge_primary_llm or None  # "" → None → use default
         self.structured_llm = create_structured_llm(
             TradingSignal,
             temperature=config.judge_temperature,
             max_tokens=4096,  # Judge needs more room for synthesizing 3 arguments
+            primary=judge_primary,
         )
 
     async def ajudge(
