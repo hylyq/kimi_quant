@@ -860,6 +860,7 @@ class DataProvider:
         and picked up by build_llm_prompt().
         """
         current = self._capture_snapshot(report)
+        current["_ts"] = time.time()
         diff = self._build_diff(current, self._previous_snapshot)
         if diff:
             report["_cycle_diff"] = diff
@@ -901,7 +902,20 @@ class DataProvider:
         if not previous:
             return None
 
-        lines = ["# 📊 Since Last Cycle\n"]
+        # Elapsed time — important context since LLM controls wake interval
+        prev_ts = previous.get("_ts")
+        cur_ts = current.get("_ts")
+        elapsed_str = ""
+        if prev_ts and cur_ts:
+            elapsed_s = cur_ts - prev_ts
+            if elapsed_s < 120:
+                elapsed_str = f" ({elapsed_s:.0f}s ago)"
+            elif elapsed_s < 7200:
+                elapsed_str = f" ({elapsed_s/60:.1f}min ago)"
+            else:
+                elapsed_str = f" ({elapsed_s/3600:.1f}h ago)"
+
+        lines = [f"# 📊 Since Last Cycle{elapsed_str}\n"]
         has_change = False
 
         # ── Price ──
