@@ -197,18 +197,28 @@ Guidelines:
 - If Step 0 found issues (missing SL/TP, stale orders), include the fix
   actions BEFORE any new entry actions from the debate.
 
-Step 1.5 — COUNTERFACTUAL CHECK (before finalizing any directional decision):
-  Before outputting LONG/SHORT, pause and ask yourself:
-  - "If I'm WRONG about this — what price level would prove it?"
-    → That level should BE your stop loss. Don't set SL arbitrarily.
-  - "Which debater had the WEAKEST argument, and did I properly discount it?"
-    → If one debater was unconvincing, their side deserves less weight.
-  - "If the market rips the OTHER way in 15 minutes — did I miss a signal?"
-    → Check the RAW MARKET DATA one more time for contrary evidence.
-  - "Am I deferring to the most eloquent debater, or the one with the best DATA?"
-    → Eloquence ≠ accuracy. Trust specific numbers over persuasive writing.
-  If the counterfactual argument is uncomfortably strong → reduce confidence
-  by 0.1-0.15 or output HOLD.
+Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing):
+
+  1. INVALIDATION LEVEL: "My thesis is wrong if BTC crosses $______."
+     → That price IS your stop loss. Set SL there, not arbitrarily.
+
+  2. DEBATER CREDIBILITY: "Which debater had the weakest argument with the
+     fewest data references?" → Discount their side. Eloquence ≠ accuracy.
+     Trust specific numbers over persuasive writing.
+
+  3. ATR CHECK: "1h ATR = X.X%. SL distance must be ≥ max(1.5× ATR, 0.5%)."
+     → If your SL is too tight at that distance, reduce size or skip.
+
+  4. 15-MIN REVERSAL: "If the market rips the OTHER way in 15 minutes,
+     did I miss a signal in the RAW MARKET DATA?" → Check one more time.
+
+  5. BIAS AUDIT: Score yourself honestly:
+     - Evidence from data (0-10): ___
+     - Deferring to eloquence over data (0-10): ___
+     → If eloquence > evidence, reduce confidence by 0.15 or output HOLD.
+
+  If the combined check raises serious doubts → HOLD is the correct decision.
+  There will ALWAYS be another trade.
 
 Output TradingSignal JSON:
 - actions: ordered list of actions (preferred). Use for flip ["CLOSE", "SHORT"],
@@ -444,6 +454,14 @@ class JudgeAgent:
                 "countered the other — the winner of the exchange deserves more weight. "
                 f"IMPORTANT: size must not exceed {size_limit} BTC. "
                 "Produce the final trading signal."
+            )
+            # Constraint recap at VERY END (recency effect)
+            debate_transcript += (
+                f"\n\n# ⚠️ HARD CONSTRAINTS\n"
+                f"- Max position: {size_limit} BTC | Min confidence: {config.min_confidence:.2f}\n"
+                f"- SL REQUIRED for LONG/SHORT (min 0.5% from entry)\n"
+                f"- Max leverage: {max_lev}x\n"
+                f"- Output JSON only, no markdown."
             )
             if extra_context:
                 debate_transcript += "\n" + extra_context
@@ -828,6 +846,19 @@ class DebateStrategy:
         prompt = self.build_market_prompt(market_data)
         account_summary = self._build_account_summary(market_data)
 
+        # Prepend account + risk context to the shared market prompt so
+        # debaters see current position state and constraints — not just the
+        # Judge. This enables position-aware arguments (e.g. "add to existing
+        # long" rather than generic "go long").
+        account_ctx = (
+            "# 👤 Current Position & Account\n"
+            f"{account_summary}\n"
+        )
+        risk_ctx = market_data.get("risk_context", "")
+        if risk_ctx:
+            account_ctx += "\n" + risk_ctx
+        prompt = account_ctx + "\n" + prompt
+
         cycle_id = datetime.now(timezone.utc).isoformat()
 
         initial_state: DebateState = {
@@ -937,7 +968,7 @@ class DebateStrategy:
             actions = original_signal.get_actions()
             correction_block = f"""
 
-## ⚠️ CORRECTION REQUIRED — LAST CHANCE
+## 🔧 Signal Adjustment Required
 
 Your previous signal was REJECTED by risk control:
 
@@ -949,15 +980,17 @@ Your previous signal was REJECTED by risk control:
 
 **Rejection reason:** {rejection_reason}
 
-Read the rejection reason carefully — it tells you exactly what went wrong.
+Please adjust your signal. Here are your options (pick the ONE that applies):
 
-- If the issue can be fixed by adjusting prices, size, or confidence →
-  make the necessary change and re-submit.
-- If the rejection is a hard block (circuit breaker active, daily drawdown
-  cap hit, or an uncorrectable state) → output HOLD with confidence 0.0.
-  Do NOT try to work around it with a different action.
+  A. SIZE TOO LARGE → reduce size to fit within the margin or risk budget.
+  B. SL TOO TIGHT → widen stop loss to ≥ 0.5% from entry, or ≥ 1.5× ATR.
+  C. MARGIN EXCEEDED → reduce size so that notional / leverage ≤ 95% available.
+  D. HARD BLOCK (circuit breaker, daily drawdown cap, or uncorrectable) →
+     output HOLD with confidence=0.0. Do NOT try to work around the block.
+  E. DIRECTION ERROR (LONG while long, CLOSE with no position) →
+     use the correct action for the current position state.
 
-This is your only chance to correct this cycle. Do not repeat the same error."""
+Keep everything else the same — only fix what was rejected."""
 
             logger.info("Requesting risk correction from Judge...")
             signal = await self.judge.ajudge(

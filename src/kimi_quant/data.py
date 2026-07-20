@@ -13,6 +13,7 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, TypeVar
 
 from hyperliquid.info import Info
@@ -95,6 +96,144 @@ def retry_api_call(
     # Should be unreachable — retries exhausted on transient errors
     assert last_error is not None
     raise last_error
+
+
+# ─── Time Context ───────────────────────────────────────────────────────
+
+
+def _build_time_context() -> str:
+    """Build a time/calendar context section for the LLM prompt.
+
+    Gives the LLM awareness of:
+      - Current UTC and Beijing time
+      - Day of week (weekend vs weekday liquidity)
+      - Trading session (Asia / EU-US overlap / US only / Weekend)
+    """
+    now = datetime.now(timezone.utc)
+    bjt = now + timedelta(hours=8)
+    weekday = now.strftime("%A")
+    is_weekend = now.weekday() >= 5  # Saturday=5, Sunday=6
+
+    utc_str = now.strftime("%Y-%m-%d %H:%M")
+    bjt_str = bjt.strftime("%H:%M")
+
+    # Session classification based on UTC hour
+    hour = now.hour
+    if is_weekend:
+        session = "Weekend — LOW liquidity, expect choppy/range-bound"
+    elif 7 <= hour < 12:
+        session = "EU morning / Asia close — MODERATE liquidity"
+    elif 12 <= hour < 15:
+        session = "EU/US overlap — HIGH liquidity, strongest moves"
+    elif 15 <= hour < 21:
+        session = "US session — HIGH liquidity"
+    elif 21 <= hour < 24:
+        session = "US close / Asia open — MODERATE liquidity"
+    else:
+        session = "Asia session — LOW-MODERATE liquidity"
+
+    lines = [
+        "# ⏰ Time Context",
+        f"UTC: {utc_str} | Beijing: {bjt_str} | {weekday}",
+        f"Session: {session}",
+    ]
+
+    if is_weekend:
+        lines.append(
+            "⚠️ Weekend: lower liquidity, wider spreads, higher risk of false breakouts. "
+            "Reduce size and widen stops."
+        )
+
+    return "\n".join(lines)
+
+
+def _build_volatility_regime(timeframes: list) -> str:
+    """Classify the current volatility regime from multi-TF ATR data.
+
+    Returns a formatted section for the LLM prompt with regime-specific
+    guidance on stop loss width and position sizing.
+
+    Regime thresholds (4h ATR%):
+      HIGH:   > 0.7%  → wider stops, smaller size, expect whipsaws
+      NORMAL: 0.3%–0.7% → standard parameters
+      LOW:    ≤ 0.3%  → tighter stops possible, but watch for breakout expansion
+    """
+    if not timeframes:
+        return ""
+
+    # Find 4h and 1h ATR for regime classification
+    atr_4h = None
+    atr_1h = None
+    for tf in timeframes:
+        if tf.interval == "4h":
+            atr_4h = tf.atr_pct
+        elif tf.interval == "1h":
+            atr_1h = tf.atr_pct
+
+    if atr_4h is None and atr_1h is None:
+        return ""
+
+    # Use 4h ATR as primary, fall back to 1h
+    primary_atr = atr_4h if atr_4h is not None else atr_1h
+    secondary_atr = atr_1h if atr_1h is not None else atr_4h
+
+    if primary_atr > 0.7:
+        regime = "HIGH"
+        guidance = (
+            "Wider stops required (≥ 1.5× ATR). Reduce position size to 50-75% of max. "
+            "Expect whipsaws and false breakouts — wait for confirmed closes."
+        )
+    elif primary_atr > 0.3:
+        regime = "NORMAL"
+        guidance = (
+            "Standard parameters apply. SL ≥ 1.2× 1h ATR. "
+            "Normal position sizing."
+        )
+    else:
+        regime = "LOW"
+        guidance = (
+            "Tighter stops possible (but still ≥ 0.5% min). "
+            "⚠️ Low vol often precedes breakout expansion — be ready for regime change."
+        )
+
+    lines = [
+        "# 📊 Volatility Regime",
+        f"4h ATR: {atr_4h:.2f}%" if atr_4h is not None else "4h ATR: N/A",
+        f"1h ATR: {atr_1h:.2f}%" if atr_1h is not None else "1h ATR: N/A",
+        f"→ Regime: {regime}",
+        f"Guidance: {guidance}",
+        f"Minimum SL distance: {max(0.5, (secondary_atr or 0.5) * 1.2):.2f}%",
+    ]
+    return "\n".join(lines)
+
+
+def _build_constraint_recap(
+    max_size: float,
+    min_conf: float,
+    max_lev: int,
+    min_sl_dist: float,
+    breaker_active: bool = False,
+    breaker_msg: str = "",
+) -> str:
+    """Build a short constraint recap for the END of the prompt (recency effect).
+
+    These are the same constraints already present in the full prompt —
+    repeated here so they're fresh in the LLM's context right before
+    it generates the output JSON.
+    """
+    lines = [
+        "# ⚠️ HARD CONSTRAINTS (repeated from above)",
+        f"- Max position: {max_size} BTC | Min confidence: {min_conf:.2f}",
+        f"- SL REQUIRED for LONG/SHORT | Min SL distance: {min_sl_dist:.1%} of entry",
+        f"- Max leverage: {max_lev}x",
+    ]
+    if breaker_active:
+        lines.append(
+            f"- ⛔ CIRCUIT BREAKER ACTIVE: {breaker_msg} — "
+            f"LONG/SHORT will be REJECTED, use HOLD/CLOSE/MODIFY_SL/MODIFY_TP only"
+        )
+    lines.append("- Output JSON only, no markdown formatting.")
+    return "\n".join(lines)
 
 
 # ─── Data Structures ────────────────────────────────────────────────────
@@ -257,7 +396,9 @@ class MarketAnalysis:
 
     def to_llm_prompt(self) -> str:
         """Build the full LLM prompt from all analysis components."""
-        parts = ["# Market Data Snapshot\n"]
+        parts = [_build_time_context(), "\n"]
+
+        parts.append("# Market Data Snapshot\n")
 
         if self.snapshot is not None:
             parts.append(self.snapshot.to_summary())
@@ -268,6 +409,10 @@ class MarketAnalysis:
         if self.timeframes:
             for tf in self.timeframes:
                 parts.append(tf.to_summary())
+            # Append volatility regime classification
+            regime = _build_volatility_regime(self.timeframes)
+            if regime:
+                parts.append("\n" + regime)
         else:
             parts.append("  (Candle data unavailable — testnet or API error)")
 
@@ -1051,6 +1196,11 @@ class DataProvider:
             if orders:
                 prompt += "\n# Tracked Orders (known SL/TP)\n" + orders + "\n"
 
+            # Inject position memory — thesis, holding duration, MAE/MFE
+            pos_mem = report.get("position_memory", "")
+            if pos_mem:
+                prompt += "\n" + pos_mem + "\n"
+
             # Inject SL/TP verification status — alerts LLM if orders are missing
             sl_tp_status = report.get("sl_tp_status", {})
             if sl_tp_status.get("sl_missing"):
@@ -1072,10 +1222,34 @@ class DataProvider:
             if risk_ctx:
                 prompt += "\n" + risk_ctx
 
+            # Inject last-cycle feedback for decision→outcome loop
+            last_fb = report.get("last_cycle_feedback", "")
+            if last_fb:
+                prompt += "\n" + last_fb
+
+            # Inject lessons learned from past trades
+            lessons = report.get("lessons_context", "")
+            if lessons:
+                prompt += "\n" + lessons
+
             # Inject performance context if present
             perf = report.get("performance_context", "")
             if perf:
                 prompt += "\n" + perf
+
+            # Constraint recap at the VERY END (recency effect — LLM sees
+            # these right before generating its output JSON)
+            risk_ctx = report.get("risk_context", "")
+            breaker_active = "CIRCUIT BREAKER ACTIVE" in risk_ctx
+            recap = _build_constraint_recap(
+                max_size=config.max_position_size,
+                min_conf=config.min_confidence,
+                max_lev=config.max_leverage,
+                min_sl_dist=0.005,  # Must match RiskManager.MIN_SL_DISTANCE (can't import: circular)
+                breaker_active=breaker_active,
+                breaker_msg="NEW POSITIONS BLOCKED" if breaker_active else "",
+            )
+            prompt += "\n" + recap
             return prompt
 
         # Fallback: old-style prompt

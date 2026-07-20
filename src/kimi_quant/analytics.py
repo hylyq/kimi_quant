@@ -347,6 +347,76 @@ class TradeLogger:
 
         return "\n".join(lines)
 
+    def get_lessons_context(self) -> str:
+        """Build a lessons-learned summary from recent closed trades.
+
+        Analyzes patterns in the last 10 trades and produces actionable
+        guidance for the LLM (e.g., repeated stop-outs at resistance,
+        TP hit too early in trends).
+
+        Returns empty string if < 3 trades exist.
+        """
+        real_trades = [t for t in self._closed if not t.dry_run]
+        if len(real_trades) < 3:
+            return ""
+
+        recent = real_trades[-10:]
+        lessons: list[str] = []
+
+        # 1. Consecutive stop-outs
+        sl_losses = [t for t in recent[-5:] if t.close_reason == "stop_loss"]
+        if len(sl_losses) >= 2:
+            lessons.append(
+                f"⚠️  {len(sl_losses)} recent stop-outs. "
+                f"SL may be too tight for current volatility — "
+                f"consider widening SL or reducing position size."
+            )
+
+        # 2. TP hit early (market ran further)
+        tp_wins = [t for t in recent[-5:] if t.close_reason == "take_profit"]
+        if tp_wins and len(tp_wins) >= 2:
+            lessons.append(
+                "💡 Multiple TP hits — trend may be stronger than expected. "
+                "Consider using trailing stops instead of fixed TP, or "
+                "scaling out (close partial at TP, let remainder run)."
+            )
+
+        # 3. Win rate by side
+        longs = [t for t in recent if t.side == "long"]
+        shorts = [t for t in recent if t.side == "short"]
+        if longs:
+            lr = sum(1 for t in longs if t.is_win) / len(longs)
+            if lr < 0.4 and len(longs) >= 2:
+                lessons.append(
+                    f"⚠️  Long win rate: {lr:.0%} ({sum(1 for t in longs if t.is_win)}/{len(longs)}). "
+                    f"Reassess long entry criteria."
+                )
+        if shorts:
+            sr = sum(1 for t in shorts if t.is_win) / len(shorts)
+            if sr < 0.4 and len(shorts) >= 2:
+                lessons.append(
+                    f"⚠️  Short win rate: {sr:.0%} ({sum(1 for t in shorts if t.is_win)}/{len(shorts)}). "
+                    f"Reassess short entry criteria."
+                )
+
+        # 4. Net P&L trend
+        if len(recent) >= 5:
+            recent_pnl = sum(t.net_pnl for t in recent[-5:])
+            if recent_pnl < 0:
+                lessons.append(
+                    f"📉 Net P&L last 5 trades: ${recent_pnl:+.2f}. "
+                    f"Be more selective — only trade when confidence is high."
+                )
+
+        if not lessons:
+            return ""
+
+        lines = ["\n# 📚 Recent Lessons (from closed trades)\n"]
+        for i, lesson in enumerate(lessons, 1):
+            lines.append(f"{i}. {lesson}")
+
+        return "\n".join(lines)
+
     # ─── Persistence ─────────────────────────────────────────────────────
 
     def _append_to_file(self, trade: TradeRecord) -> None:

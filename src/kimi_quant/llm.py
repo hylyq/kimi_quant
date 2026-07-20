@@ -311,12 +311,13 @@ class TradingSignal(BaseModel):
 def build_market_prompt(market_data: dict[str, Any]) -> str:
     """Build a structured prompt from market data (shared by single & debate modes)."""
     from kimi_quant.config import config as _config
+    from kimi_quant.data import _build_time_context as _time_ctx
 
     market = market_data.get("market")
     order_book = market_data.get("order_book")
     account = market_data.get("account")
 
-    prompt_parts = ["# Market Data Snapshot\n"]
+    prompt_parts = [_time_ctx(), "\n", "# Market Data Snapshot\n"]
 
     if market:
         prompt_parts.append(market.to_summary())
@@ -386,20 +387,31 @@ Step 1 — ANALYZE MARKET (only after completing Step 0):
   2. Order book: bid walls = support, ask walls = resistance. Thin books = noise.
   3. Funding: very positive → crowded longs (reversal risk); negative → shorts paying (squeeze risk).
   4. Multi-TF confluence → higher confidence. Divergence → follow higher TF, reduce size.
-  5. When uncertain, HOLD. Confidence < 0.7 → skip trade.
+  5. When uncertain, HOLD. Confidence must EXCEED the breakeven win-rate from
+     the EV Check section (usually 30-40%). A trade with R:R < 1:1.5 needs
+     confidence > 45% just to break even. Confidence < 0.7 → skip trade.
   6. If you decided to modify SL/TP in Step 0, include those actions BEFORE
      any new entry actions in the `actions` array.
 
-Step 1.5 — COUNTERFACTUAL CHECK (before finalizing any directional decision):
-  Before outputting LONG/SHORT, pause and ask:
-  - "If I'm WRONG about this trade — what would prove me wrong?"
-    → That price level IS your stop loss. Make sure SL is at that level.
-  - "If I HOLD and the market moves hard — what did I miss?"
-    → If you can name a specific signal you'd regret ignoring, reconsider.
-  - "Am I trading what I SEE or what I WANT to see?"
-    → Bias check: is the evidence genuinely strong, or are you reaching?
-  If the counterfactual argument is uncomfortably strong → reduce confidence
-  by 0.1-0.15 or skip the trade entirely.
+Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing):
+
+  1. INVALIDATION LEVEL: "My thesis is wrong if BTC crosses $______."
+     → That price IS your stop loss. Set SL there, not arbitrarily.
+
+  2. ATR CHECK: "1h ATR = X.X%. SL distance must be ≥ max(1.5× ATR, 0.5%)."
+     → If your SL is too tight at that distance, reduce size or skip.
+
+  3. 15-MIN REVERSAL: "If BTC moves 2% against me in the next 15 minutes,
+     what signal did I miss or ignore?" → Check the RAW DATA one more time
+     for contrary evidence. If you can't answer this confidently, HOLD.
+
+  4. BIAS AUDIT: Score yourself honestly:
+     - Evidence from data (0-10): ___
+     - Hope/trying to find a trade (0-10): ___
+     → If hope > data, reduce confidence by 0.15 or output HOLD.
+
+  If the combined check raises serious doubts → HOLD is the correct decision.
+  There will ALWAYS be another trade.
 
 Output JSON only (no markdown):
 - actions: ordered list of actions to execute sequentially. Use this for:
@@ -485,7 +497,7 @@ Output JSON only (no markdown):
             actions = original_signal.get_actions()
             correction_block = f"""
 
-## ⚠️ CORRECTION REQUIRED — LAST CHANCE
+## 🔧 Signal Adjustment Required
 
 Your previous signal was REJECTED by risk control:
 
@@ -497,15 +509,17 @@ Your previous signal was REJECTED by risk control:
 
 **Rejection reason:** {rejection_reason}
 
-Read the rejection reason carefully — it tells you exactly what went wrong.
+Please adjust your signal. Here are your options (pick the ONE that applies):
 
-- If the issue can be fixed by adjusting prices, size, or confidence →
-  make the necessary change and re-submit.
-- If the rejection is a hard block (circuit breaker active, daily drawdown
-  cap hit, or an uncorrectable state) → output HOLD with confidence 0.0.
-  Do NOT try to work around it with a different action.
+  A. SIZE TOO LARGE → reduce size to fit within the margin or risk budget.
+  B. SL TOO TIGHT → widen stop loss to ≥ 0.5% from entry, or ≥ 1.5× ATR.
+  C. MARGIN EXCEEDED → reduce size so that notional / leverage ≤ 95% available.
+  D. HARD BLOCK (circuit breaker, daily drawdown cap, or uncorrectable) →
+     output HOLD with confidence=0.0. Do NOT try to work around the block.
+  E. DIRECTION ERROR (LONG while long, CLOSE with no position) →
+     use the correct action for the current position state.
 
-This is your only chance to correct this cycle. Do not repeat the same error."""
+Keep everything else the same — only fix what was rejected."""
 
             messages = [
                 ("system", self.SYSTEM_PROMPT),

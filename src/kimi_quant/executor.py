@@ -77,6 +77,13 @@ class PositionTracker:
     sl_price: float = 0.0  # current stop loss trigger price
     tp_price: float = 0.0  # current take profit trigger price
 
+    # ── Position Memory (for LLM Step 0 thesis validation) ────────────
+    entry_time: str = ""           # ISO timestamp when position was opened
+    entry_reason: str = ""         # LLM's reasoning at time of entry
+    entry_confidence: float = 0.0  # confidence at time of entry
+    peak_favorable: float = 0.0    # best uPNL (positive = in profit, tracking MAE)
+    peak_adverse: float = 0.0      # worst uPNL (tracking MFE — how far against)
+
     # How many cycles has the limit order been resting?
     resting_cycles: int = 0
     max_resting_cycles: int = 3  # cancel limit order after this many unfilled cycles
@@ -113,6 +120,12 @@ class PositionTracker:
             self.sl_price = 0.0
             self.tp_price = 0.0
             self.resting_cycles = 0
+            # Reset position memory
+            self.entry_time = ""
+            self.entry_reason = ""
+            self.entry_confidence = 0.0
+            self.peak_favorable = 0.0
+            self.peak_adverse = 0.0
 
     def update_from_open(
         self,
@@ -122,8 +135,12 @@ class PositionTracker:
         oids: dict[str, int | None],
         sl_price: float = 0.0,
         tp_price: float = 0.0,
+        entry_reason: str = "",
+        entry_confidence: float = 0.0,
     ) -> None:
-        """Record a new position/order intent."""
+        """Record a new position/order intent with entry thesis for Step 0 validation."""
+        from datetime import datetime, timezone
+
         with self._lock:
             self.coin = config.trading_pair
             self.side = side
@@ -137,6 +154,12 @@ class PositionTracker:
             # Start as "resting" — will be promoted to "active" when chain confirms
             self.state = "resting"
             self.resting_cycles = 0
+            # Store entry thesis for future cycle Step 0 validation
+            self.entry_time = datetime.now(timezone.utc).isoformat()
+            self.entry_reason = entry_reason
+            self.entry_confidence = entry_confidence
+            self.peak_favorable = 0.0
+            self.peak_adverse = 0.0
 
     def confirm_active(self, chain_entry_price: float, chain_size: float) -> None:
         """Chain confirms position exists — promote to active."""
@@ -161,6 +184,20 @@ class PositionTracker:
         with self._lock:
             if self.state == "resting":
                 self.resting_cycles += 1
+
+    def update_pnl_extremes(self, unrealized_pnl: float) -> None:
+        """Track best/worst uPNL seen during this position's life (MAE/MFE).
+
+        Called each cycle from main loop so the LLM can see how far the
+        position has gone in its favor (MFE) and against it (MAE).
+        """
+        with self._lock:
+            if self.state != "active":
+                return
+            if unrealized_pnl > self.peak_favorable:
+                self.peak_favorable = unrealized_pnl
+            if unrealized_pnl < self.peak_adverse:
+                self.peak_adverse = unrealized_pnl
 
     # ─── WebSocket Event Sync ─────────────────────────────────────────
 
@@ -297,6 +334,60 @@ class PositionTracker:
             f"Open orders for {self.side.upper()} {self.size:.4f} {self.coin}: "
             + ", ".join(parts)
         )
+
+    def to_position_memory(self, unrealized_pnl: float = 0.0) -> str:
+        """Build the Position Memory section for the LLM prompt.
+
+        Gives the LLM full context for Step 0 thesis validation:
+        why the position was opened, how long it's been held, and
+        how far price has moved in favor/against.
+
+        Returns empty string if no active position with memory.
+        """
+        if self.state != "active" or not self.entry_time or not self.entry_reason:
+            return ""
+
+        from datetime import datetime, timezone
+
+        try:
+            opened_at = datetime.fromisoformat(self.entry_time)
+            elapsed = datetime.now(timezone.utc) - opened_at.replace(
+                tzinfo=timezone.utc
+            )
+            if elapsed.total_seconds() < 60:
+                duration = f"{elapsed.total_seconds():.0f}s"
+            elif elapsed.total_seconds() < 3600:
+                duration = f"{elapsed.total_seconds() / 60:.0f}min"
+            else:
+                hours = elapsed.total_seconds() / 3600
+                duration = f"{hours:.1f}h"
+        except (ValueError, TypeError):
+            duration = "unknown"
+
+        notional = self.entry_price * self.size if self.entry_price > 0 else 0
+        u_pnl_pct = (
+            (unrealized_pnl / notional * 100) if notional > 0 else 0.0
+        )
+
+        lines = [
+            "# 📌 Position Memory",
+            f"Holding: {self.side.upper()} {self.size:.4f} {self.coin} @ ${self.entry_price:.1f}",
+            f"Opened: {duration} ago | Entry confidence: {self.entry_confidence:.2f}",
+            f"Entry thesis: \"{self.entry_reason[:200]}\"",
+            f"Current uPNL: ${unrealized_pnl:+.2f} ({u_pnl_pct:+.2f}%)",
+        ]
+        if self.peak_favorable > 0 or self.peak_adverse < 0:
+            lines.append(
+                f"Best: ${self.peak_favorable:+.2f} | Worst: ${self.peak_adverse:+.2f}"
+            )
+        lines.append(
+            "\n⚠️  Step 0 — THESIS VALIDATION: "
+            "Has the original entry thesis held? "
+            "If the market has negated this thesis, CLOSE the position. "
+            "If it's working, consider MODIFY_SL to lock in profit."
+        )
+
+        return "\n".join(lines)
 
 
 def _extract_errors(result: Any, num_orders: int) -> list[str]:
@@ -738,6 +829,8 @@ class TradeExecutor:
                 side, size, signal.entry_price, {},
                 sl_price=signal.stop_loss or 0.0,
                 tp_price=signal.take_profit or 0.0,
+                entry_reason=signal.reasoning or "",
+                entry_confidence=signal.confidence,
             )
             self.tracker.state = "active"  # in dry-run, pretend filled instantly
             return {
@@ -792,6 +885,8 @@ class TradeExecutor:
                 side, size, signal.entry_price, oids,
                 sl_price=signal.stop_loss or 0.0,
                 tp_price=signal.take_profit or 0.0,
+                entry_reason=signal.reasoning or "",
+                entry_confidence=signal.confidence,
             )
 
             # Determine if market order (should fill instantly) vs limit

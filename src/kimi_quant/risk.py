@@ -302,6 +302,41 @@ class RiskManager:
             lines.append("  → CLOSE → REJECTED (nothing to close)")
             lines.append("  → MODIFY_SL / MODIFY_TP → REJECTED (no position)")
 
+        # ── Expected Value Guidance ────────────────────────────────────
+        lines.append("")
+        lines.append("## Expected Value (EV) Check")
+        lines.append("Before proposing a trade, compute the implied breakeven win-rate:")
+        if mid_price > 0:
+            # Show an example: assume 1% SL distance, pick a 2:1 reward:risk TP
+            example_sl = mid_price * 0.99
+            example_tp = mid_price * 1.02
+            if current_side == "short":
+                example_sl = mid_price * 1.01
+                example_tp = mid_price * 0.98
+            risk_pct = 1.0  # 1% SL
+            reward_pct = 2.0  # 2% TP
+            rr = reward_pct / risk_pct
+            breakeven = 1.0 / (1.0 + rr)
+            lines.append(
+                f"Example: Entry=${mid_price:.0f}, SL=${example_sl:.0f} "
+                f"({risk_pct:.0f}% risk), TP=${example_tp:.0f} "
+                f"({reward_pct:.0f}% reward)"
+            )
+            lines.append(
+                f"R:R = 1:{rr:.1f} → Breakeven win-rate = "
+                f"1/(1+{rr:.1f}) = {breakeven:.1%}"
+            )
+            lines.append(
+                f"Your confidence ({self.min_confidence:.2f} min) "
+                f"must EXCEED {breakeven:.1%} for positive EV. "
+                f"If R:R < 1:1.5, the trade needs very high confidence."
+            )
+        lines.append(
+            "Formula: breakeven = 1 / (1 + reward/risk). "
+            "Your confidence MUST exceed this or the trade has negative EV.\n"
+            "CHECK: |entry - SL| = risk per unit. |TP - entry| = reward per unit."
+        )
+
         return "\n".join(lines)
 
     # ─── Individual Checks ────────────────────────────────────────────────

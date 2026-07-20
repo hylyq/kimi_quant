@@ -50,6 +50,53 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 
+# ─── Last-Cycle Feedback ────────────────────────────────────────────────────
+
+
+def _build_last_cycle_feedback(prev: dict | None) -> str:
+    """Build a feedback section from the previous cycle's result for LLM context.
+
+    Closes the decision→outcome loop: tells the LLM what it decided last time
+    and whether the market validated or negated that decision.
+    """
+    if not prev:
+        return ""
+
+    action = prev.get("signal", "HOLD")
+    confidence = prev.get("confidence", 0)
+    reason = prev.get("reasoning", "no reasoning recorded")
+    status = prev.get("status", "unknown")
+
+    lines = [
+        "# 📋 Last Cycle Feedback",
+        f"Decision: {action} (confidence={confidence:.2f})",
+        f"Reasoning: \"{reason[:200]}\"",
+    ]
+
+    if status == "executed":
+        lines.append("Outcome: Signal EXECUTED — position is now active or modified.")
+        lines.append(
+            "Check the Position Memory section above to assess whether the "
+            "thesis is playing out."
+        )
+    elif status == "rejected":
+        lines.append(
+            f"Outcome: Signal REJECTED by risk control. "
+            f"Do NOT repeat the same proposal. Address the rejection reason."
+        )
+    elif status == "hold":
+        lines.append(
+            "Outcome: You chose to HOLD. Review the cycle-over-cycle diff above "
+            "— has the situation changed enough to justify a new entry?"
+        )
+    elif status == "failed":
+        lines.append("Outcome: Execution FAILED. Check error details and retry if appropriate.")
+    else:
+        lines.append(f"Outcome: {status}")
+
+    return "\n".join(lines)
+
+
 # ─── Single-Agent Strategy ──────────────────────────────────────────────────
 
 
@@ -59,6 +106,7 @@ def run_once_single(
     risk: RiskManager,
     executor: TradeExecutor,
     trade_logger: TradeLogger,
+    last_cycle: dict | None = None,
 ) -> dict:
     """Single-agent analysis → risk check → execute."""
     logger.info("=" * 50)
@@ -91,6 +139,11 @@ def run_once_single(
     perf_ctx = trade_logger.get_llm_context()
     if perf_ctx:
         report["performance_context"] = perf_ctx
+
+    # Inject lessons learned from past trades
+    lessons_ctx = trade_logger.get_lessons_context()
+    if lessons_ctx:
+        report["lessons_context"] = lessons_ctx
 
     # Inject open orders so LLM knows existing SL/TP levels
     orders_summary = executor.tracker.to_orders_summary()
@@ -126,8 +179,19 @@ def run_once_single(
     )
     report["risk_context"] = risk_context
 
+    # Inject position memory so LLM can validate entry thesis (Step 0)
+    if executor.tracker.has_position() and account:
+        report["position_memory"] = executor.tracker.to_position_memory(
+            unrealized_pnl=account.unrealized_pnl
+        )
+
     # Inject cycle-over-cycle diff so LLM sees what changed
     data.inject_cycle_diff(report)
+
+    # Inject last-cycle feedback for decision→outcome loop
+    fb = _build_last_cycle_feedback(last_cycle)
+    if fb:
+        report["last_cycle_feedback"] = fb
 
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
@@ -155,6 +219,7 @@ def run_once_debate(
     risk: RiskManager,
     executor: TradeExecutor,
     trade_logger: TradeLogger,
+    last_cycle: dict | None = None,
 ) -> dict:
     """Multi-agent debate → risk check → execute."""
     logger.info("=" * 50)
@@ -187,6 +252,11 @@ def run_once_debate(
     perf_ctx = trade_logger.get_llm_context()
     if perf_ctx:
         report["performance_context"] = perf_ctx
+
+    # Inject lessons learned from past trades
+    lessons_ctx = trade_logger.get_lessons_context()
+    if lessons_ctx:
+        report["lessons_context"] = lessons_ctx
 
     # Inject open orders so debaters know existing SL/TP levels
     orders_summary = executor.tracker.to_orders_summary()
@@ -221,8 +291,19 @@ def run_once_debate(
     )
     report["risk_context"] = risk_context
 
+    # Inject position memory so debaters and Judge can validate entry thesis (Step 0)
+    if executor.tracker.has_position() and account:
+        report["position_memory"] = executor.tracker.to_position_memory(
+            unrealized_pnl=account.unrealized_pnl
+        )
+
     # Inject cycle-over-cycle diff so debaters and Judge see what changed
     data.inject_cycle_diff(report)
+
+    # Inject last-cycle feedback for decision→outcome loop
+    fb = _build_last_cycle_feedback(last_cycle)
+    if fb:
+        report["last_cycle_feedback"] = fb
 
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)
@@ -332,6 +413,10 @@ def _validate_and_execute(
                         risk.record_loss(last.net_pnl)
 
     logger.info("Position: %s", executor.tracker.to_summary())
+
+    # Track MAE/MFE for position memory context
+    if account and executor.tracker.has_position():
+        executor.tracker.update_pnl_extremes(account.unrealized_pnl)
 
     # Set initial balance for drawdown tracking on first cycle
     if risk.initial_balance is None and account_balance and account_balance > 0:
@@ -658,6 +743,7 @@ def run_loop():
     # ── Main Loop ────────────────────────────────────────────────────────
     cycle_count = 0
     next_interval = config.trading_interval_seconds
+    last_cycle: dict | None = None  # carries last cycle's result for feedback loop
 
     MIN_INTERVAL = config.min_interval      # default 300s (5 min) — cost control
     MAX_INTERVAL = config.max_interval      # default 10800s (3h) — don't drift too far
@@ -670,10 +756,12 @@ def run_loop():
         try:
             if mode == "debate":
                 assert strategy is not None
-                result = run_once_debate(strategy, data, risk, executor, trade_logger)
+                result = run_once_debate(strategy, data, risk, executor, trade_logger,
+                                         last_cycle=last_cycle)
             else:
                 assert llm is not None
-                result = run_once_single(llm, data, risk, executor, trade_logger)
+                result = run_once_single(llm, data, risk, executor, trade_logger,
+                                         last_cycle=last_cycle)
 
             result["cycle"] = cycle_count
             result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -686,6 +774,9 @@ def run_loop():
                 "Cycle %d complete: mode=%s status=%s signal=%s confidence=%.2f",
                 cycle_count, mode, status, sig, conf,
             )
+
+            # Store for next cycle's feedback loop
+            last_cycle = result
 
             # Adaptive interval: LLM decides when to wake next
             llm_interval = result.get("next_interval")
