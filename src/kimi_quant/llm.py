@@ -10,7 +10,7 @@ import logging
 from typing import Any
 
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from kimi_quant.config import config
 
@@ -296,6 +296,22 @@ class TradingSignal(BaseModel):
             "Default recommendation: leave null unless you have a strong reason."
         ),
     )
+
+    @model_validator(mode='after')
+    def reconcile_action_with_actions(self):
+        """Keep `action` consistent with `actions` when the array form is used.
+
+        The Judge prompt asks for both fields (actions=preferred, action=legacy).
+        LLMs occasionally set ``actions=["LONG"]`` while leaving ``action="HOLD"``
+        (because they interpret ``action`` as "current state" rather than "decision").
+
+        This validator eliminates the inconsistency: when ``actions`` is set,
+        ``action`` is derived from it so logs and debugging always see the same
+        value regardless of which field they read.
+        """
+        if self.actions:
+            object.__setattr__(self, 'action', '/'.join(self.actions))
+        return self
 
     def get_actions(self) -> list[str]:
         """Return the ordered list of actions to execute.
