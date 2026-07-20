@@ -35,6 +35,31 @@ logger = logging.getLogger(__name__)
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
 
+def _round_to_tick(price: float, tick_size: float) -> float:
+    """Round a price to the nearest valid tick size.
+
+    Hyperliquid requires all prices (limit_px, triggerPx) to be divisible
+    by the asset's tick size. BTC typically uses 0.5.
+
+    Two-step rounding prevents floating-point drift:
+      1. Snap to nearest tick multiple (e.g. 65906.8 → 65907.0 for tick=0.5)
+      2. Re-round to tick's decimal precision to prevent IEEE 754 drift
+         (e.g. tick=0.1 → final round to 1 decimal; tick=0.01 → 2 decimals)
+    """
+    if tick_size <= 0:
+        return price
+
+    import math
+
+    # Step 1: snap to nearest tick
+    result = round(price / tick_size) * tick_size
+
+    # Step 2: re-round to tick's native decimal precision
+    # tick=0.5 → decimals=1, tick=0.1 → decimals=1, tick=0.01 → decimals=2
+    decimals = max(0, math.ceil(-math.log10(tick_size)))
+    return round(result, decimals)
+
+
 def _is_trigger_order(order: dict) -> bool:
     """Check whether an open order is a trigger/TPSL order.
 
@@ -467,6 +492,7 @@ class TradeExecutor:
             self.exchange = None
             self.info = None
             self.address = "0x_dry_run"
+            self._tick_size = 0.5  # BTC default for dry-run
             logger.info("TradeExecutor initialized in DRY RUN mode")
         else:
             if not config.hl_private_key:
@@ -481,11 +507,17 @@ class TradeExecutor:
             self.exchange = Exchange(wallet=account, base_url=base_url)
             self.info = Info(base_url=base_url, skip_ws=True)
             self.address = account.address
+
+            # Fetch tick size for price validation BEFORE any order is built
+            self._tick_size = self._fetch_tick_size()
+
             logger.info(
-                "TradeExecutor initialized (address=%s, testnet=%s, curl_cffi=%s)",
+                "TradeExecutor initialized (address=%s, testnet=%s, curl_cffi=%s, "
+                "tick=%.1f)",
                 self.address,
                 config.hl_testnet,
                 _cf_requests_exec is not None,
+                self._tick_size,
             )
 
             # Recover state from chain
@@ -587,6 +619,37 @@ class TradeExecutor:
             logger.info("Startup recovery: %s", self.tracker.to_summary())
         else:
             logger.info("Startup recovery: no active position found")
+
+    def _fetch_tick_size(self) -> float:
+        """Fetch the price tick size for the trading pair from exchange metadata.
+
+        Hyperliquid requires all order prices to be divisible by the
+        asset's tick size (pxTick). For BTC this is typically 0.5.
+
+        Falls back to 0.5 if the metadata query fails.
+        """
+        from kimi_quant.data import retry_api_call as _retry
+
+        try:
+            meta, _ = _retry(
+                lambda: self.info.meta_and_asset_ctxs(),
+                description="meta (tick_size)",
+            )
+            for asset in meta.get("universe", []):
+                if asset.get("name") == self.coin:
+                    tick = float(asset.get("pxTick", 0))
+                    if tick > 0:
+                        logger.info("Tick size for %s: %.1f", self.coin, tick)
+                        return tick
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch tick size from exchange (%s) — "
+                "falling back to 0.5 for %s",
+                e, self.coin,
+            )
+
+        logger.info("Tick size for %s: 0.5 (default)", self.coin)
+        return 0.5
 
     # ─── Main entry point ────────────────────────────────────────────────
 
@@ -938,7 +1001,7 @@ class TradeExecutor:
                 "coin": self.coin,
                 "is_buy": is_buy,
                 "sz": size,
-                "limit_px": signal.entry_price,
+                "limit_px": _round_to_tick(signal.entry_price, self._tick_size),
                 "order_type": {"limit": {"tif": "Gtc"}},
                 "reduce_only": False,
             })
@@ -956,21 +1019,22 @@ class TradeExecutor:
                 "coin": self.coin,
                 "is_buy": is_buy,
                 "sz": size,
-                "limit_px": round(px, 1),
+                "limit_px": _round_to_tick(px, self._tick_size),
                 "order_type": {"limit": {"tif": "Ioc"}},
                 "reduce_only": False,
             })
 
         # Order 1: Stop Loss (trigger, market execution)
         if signal.stop_loss:
+            sl_px = _round_to_tick(signal.stop_loss, self._tick_size)
             orders.append({
                 "coin": self.coin,
                 "is_buy": not is_buy,
                 "sz": size,
-                "limit_px": signal.stop_loss,
+                "limit_px": sl_px,
                 "order_type": {
                     "trigger": {
-                        "triggerPx": signal.stop_loss,
+                        "triggerPx": sl_px,
                         "isMarket": True,
                         "tpsl": "sl",
                     }
@@ -980,14 +1044,15 @@ class TradeExecutor:
 
         # Order 2: Take Profit (trigger, market execution)
         if signal.take_profit:
+            tp_px = _round_to_tick(signal.take_profit, self._tick_size)
             orders.append({
                 "coin": self.coin,
                 "is_buy": not is_buy,
                 "sz": size,
-                "limit_px": signal.take_profit,
+                "limit_px": tp_px,
                 "order_type": {
                     "trigger": {
-                        "triggerPx": signal.take_profit,
+                        "triggerPx": tp_px,
                         "isMarket": True,
                         "tpsl": "tp",
                     }
@@ -1122,9 +1187,10 @@ class TradeExecutor:
         self, oid: int, new_price: float, is_buy: bool, size: float
     ) -> dict:
         """Move stop loss to new price."""
+        px = _round_to_tick(new_price, self._tick_size)
         return self.modify_order(
-            oid=oid, is_buy=is_buy, size=size, limit_px=new_price,
-            order_type={"trigger": {"triggerPx": new_price, "isMarket": True, "tpsl": "sl"}},
+            oid=oid, is_buy=is_buy, size=size, limit_px=px,
+            order_type={"trigger": {"triggerPx": px, "isMarket": True, "tpsl": "sl"}},
             reduce_only=True,
         )
 
@@ -1132,9 +1198,10 @@ class TradeExecutor:
         self, oid: int, new_price: float, is_buy: bool, size: float
     ) -> dict:
         """Move take profit to new price."""
+        px = _round_to_tick(new_price, self._tick_size)
         return self.modify_order(
-            oid=oid, is_buy=is_buy, size=size, limit_px=new_price,
-            order_type={"trigger": {"triggerPx": new_price, "isMarket": True, "tpsl": "tp"}},
+            oid=oid, is_buy=is_buy, size=size, limit_px=px,
+            order_type={"trigger": {"triggerPx": px, "isMarket": True, "tpsl": "tp"}},
             reduce_only=True,
         )
 
@@ -1177,6 +1244,7 @@ class TradeExecutor:
                     "reason": f"No active position (state={self.tracker.state})"}
 
         sl_oid = self.tracker.sl_oid
+        new_sl = _round_to_tick(new_sl, self._tick_size)
 
         if self.dry_run:
             self.tracker.sl_price = new_sl
@@ -1210,6 +1278,7 @@ class TradeExecutor:
                     "reason": f"No active position (state={self.tracker.state})"}
 
         tp_oid = self.tracker.tp_oid
+        new_tp = _round_to_tick(new_tp, self._tick_size)
 
         if self.dry_run:
             self.tracker.tp_price = new_tp

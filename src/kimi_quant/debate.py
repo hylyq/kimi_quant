@@ -908,9 +908,9 @@ class DebateStrategy:
             }
 
         logger.info(
-            "Final verdict [%s]: action=%s confidence=%.2f reasoning=%s",
+            "Final verdict [%s]: actions=%s confidence=%.2f reasoning=%s",
             cycle_id,
-            signal.action,
+            signal.get_actions(),
             signal.confidence,
             signal.reasoning[:100],
         )
