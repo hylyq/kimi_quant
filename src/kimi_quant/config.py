@@ -113,6 +113,13 @@ class Config:
         default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true"
     )
 
+    # --- Risk Correction ---
+    risk_correction_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "RISK_CORRECTION_ENABLED", "true"
+        ).lower() == "true"
+    )  # When risk rejects a signal, give the LLM one chance to correct it
+
     # --- Cache ---
     cache_warmup_delay: float = field(
         default_factory=lambda: float(os.getenv("CACHE_WARMUP_DELAY", "2.0"))

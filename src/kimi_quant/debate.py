@@ -389,6 +389,7 @@ class JudgeAgent:
         bull_rebuttal: str = "",
         bear_rebuttal: str = "",
         hold_rebuttal: str = "",
+        extra_context: str = "",
     ) -> TradingSignal | None:
         """Asynchronously judge the debate and produce a TradingSignal.
 
@@ -396,6 +397,10 @@ class JudgeAgent:
         included so the Judge sees the same data the debaters saw — prices,
         levels, order book, multi-timeframe trends, risk context — and can
         cross-reference their claims against the source data.
+
+        Args:
+            extra_context: Optional text appended after the debate transcript
+                (used for risk correction feedback — "last chance" prompts).
         """
         try:
             size_limit = config.max_position_size
@@ -440,6 +445,8 @@ class JudgeAgent:
                 f"IMPORTANT: size must not exceed {size_limit} BTC. "
                 "Produce the final trading signal."
             )
+            if extra_context:
+                debate_transcript += "\n" + extra_context
             messages = [
                 ("system", JUDGE_SYSTEM_PROMPT),
                 ("user", debate_transcript),
@@ -768,6 +775,32 @@ class DebateStrategy:
         from kimi_quant.data import DataProvider
         return DataProvider.build_llm_prompt(market_data)
 
+    @staticmethod
+    def _build_account_summary(market_data: dict[str, Any]) -> str:
+        """Build account summary with open orders and SL/TP status injected.
+
+        Shared by analyze() and correct_judge() so the Judge always sees
+        the same enriched account context regardless of code path.
+        """
+        account = market_data.get("account")
+        summary = account.to_summary() if account else "No position"
+
+        orders_summary = market_data.get("open_orders_summary", "")
+        if orders_summary:
+            summary += "\n" + orders_summary
+
+        sl_tp_status = market_data.get("sl_tp_status", {})
+        if sl_tp_status.get("sl_missing"):
+            summary += (
+                "\n⚠️ STOP LOSS MISSING from exchange — position is unprotected!"
+            )
+        if sl_tp_status.get("tp_missing"):
+            summary += (
+                "\n⚠️ TAKE PROFIT MISSING from exchange!"
+            )
+
+        return summary
+
     # ─── Public API ──────────────────────────────────────────────────────
 
     def _make_config(self, thread_id: str | None = None) -> dict:
@@ -793,22 +826,7 @@ class DebateStrategy:
             (signal, debate_transcript). Signal is None on failure.
         """
         prompt = self.build_market_prompt(market_data)
-        account = market_data.get("account")
-        account_summary = account.to_summary() if account else "No position"
-
-        # Inject open orders context so the Judge can see SL/TP state
-        orders_summary = market_data.get("open_orders_summary", "")
-        if orders_summary:
-            account_summary += "\n" + orders_summary
-        sl_tp_status = market_data.get("sl_tp_status", {})
-        if sl_tp_status.get("sl_missing"):
-            account_summary += (
-                "\n⚠️ STOP LOSS MISSING from exchange — position is unprotected!"
-            )
-        if sl_tp_status.get("tp_missing"):
-            account_summary += (
-                "\n⚠️ TAKE PROFIT MISSING from exchange!"
-            )
+        account_summary = self._build_account_summary(market_data)
 
         cycle_id = datetime.now(timezone.utc).isoformat()
 
@@ -898,6 +916,90 @@ class DebateStrategy:
     ) -> tuple[TradingSignal | None, dict[str, str]]:
         """Synchronous wrapper for analyze()."""
         return asyncio.run(self.analyze(market_data, thread_id=thread_id))
+
+    async def correct_judge(
+        self,
+        market_data: dict[str, Any],
+        original_signal: TradingSignal,
+        rejection_reason: str,
+        transcript: dict[str, str],
+    ) -> TradingSignal | None:
+        """Ask the Judge to correct a rejected signal (no re-debate needed).
+
+        Only the Judge is re-invoked with the original debate arguments plus
+        a correction block. The debaters are not re-run since market data
+        hasn't changed — only the final decision needs adjustment.
+        """
+        try:
+            prompt = self.build_market_prompt(market_data)
+            account_summary = self._build_account_summary(market_data)
+
+            actions = original_signal.get_actions()
+            correction_block = f"""
+
+## ⚠️ CORRECTION REQUIRED — LAST CHANCE
+
+Your previous signal was REJECTED by risk control:
+
+  Actions: {actions}
+  Entry: ${original_signal.entry_price or 'market'}
+  Stop Loss: ${original_signal.stop_loss or 'not set'}
+  Take Profit: ${original_signal.take_profit or 'not set'}
+  Confidence: {original_signal.confidence:.2f}
+
+**Rejection reason:** {rejection_reason}
+
+Read the rejection reason carefully — it tells you exactly what went wrong.
+
+- If the issue can be fixed by adjusting prices, size, or confidence →
+  make the necessary change and re-submit.
+- If the rejection is a hard block (circuit breaker active, daily drawdown
+  cap hit, or an uncorrectable state) → output HOLD with confidence 0.0.
+  Do NOT try to work around it with a different action.
+
+This is your only chance to correct this cycle. Do not repeat the same error."""
+
+            logger.info("Requesting risk correction from Judge...")
+            signal = await self.judge.ajudge(
+                account_summary,
+                transcript.get("bull", ""),
+                transcript.get("bear", ""),
+                transcript.get("hold", ""),
+                prompt,
+                transcript.get("bull_rebuttal", ""),
+                transcript.get("bear_rebuttal", ""),
+                transcript.get("hold_rebuttal", ""),
+                extra_context=correction_block,
+            )
+
+            if signal is None:
+                logger.error("Judge correction returned None")
+                return None
+
+            logger.info(
+                "Judge correction received: actions=%s confidence=%.2f reasoning=%s",
+                signal.get_actions(),
+                signal.confidence,
+                signal.reasoning[:80] if signal.reasoning else "",
+            )
+
+            return signal
+
+        except Exception as e:
+            logger.error("Judge correction failed: %s", e, exc_info=True)
+            return None
+
+    def correct_judge_sync(
+        self,
+        market_data: dict[str, Any],
+        original_signal: TradingSignal,
+        rejection_reason: str,
+        transcript: dict[str, str],
+    ) -> TradingSignal | None:
+        """Synchronous wrapper for correct_judge()."""
+        return asyncio.run(
+            self.correct_judge(market_data, original_signal, rejection_reason, transcript)
+        )
 
     def get_history(
         self, thread_id: str | None = None

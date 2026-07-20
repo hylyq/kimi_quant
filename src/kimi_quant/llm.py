@@ -467,3 +467,64 @@ Output JSON only (no markdown):
             logger.error("LLM analysis failed: %s", e, exc_info=True)
             return None
 
+    def correct(
+        self,
+        market_data: dict[str, Any],
+        original_signal: TradingSignal,
+        rejection_reason: str,
+    ) -> TradingSignal | None:
+        """Ask the LLM to correct a signal rejected by risk control.
+
+        Sends the original signal + rejection reason back to the model with
+        a "last chance" instruction. Returns a corrected TradingSignal or
+        None if the LLM call fails.
+        """
+        try:
+            prompt = self.build_prompt(market_data)
+
+            actions = original_signal.get_actions()
+            correction_block = f"""
+
+## ⚠️ CORRECTION REQUIRED — LAST CHANCE
+
+Your previous signal was REJECTED by risk control:
+
+  Actions: {actions}
+  Entry: ${original_signal.entry_price or 'market'}
+  Stop Loss: ${original_signal.stop_loss or 'not set'}
+  Take Profit: ${original_signal.take_profit or 'not set'}
+  Confidence: {original_signal.confidence:.2f}
+
+**Rejection reason:** {rejection_reason}
+
+Read the rejection reason carefully — it tells you exactly what went wrong.
+
+- If the issue can be fixed by adjusting prices, size, or confidence →
+  make the necessary change and re-submit.
+- If the rejection is a hard block (circuit breaker active, daily drawdown
+  cap hit, or an uncorrectable state) → output HOLD with confidence 0.0.
+  Do NOT try to work around it with a different action.
+
+This is your only chance to correct this cycle. Do not repeat the same error."""
+
+            messages = [
+                ("system", self.SYSTEM_PROMPT),
+                ("user", prompt + correction_block),
+            ]
+
+            logger.info("Requesting risk correction from LLM...")
+            signal: TradingSignal = self.structured_llm.invoke(messages)
+
+            logger.info(
+                "Correction received: actions=%s confidence=%.2f reasoning=%s",
+                signal.get_actions(),
+                signal.confidence,
+                signal.reasoning[:80] if signal.reasoning else "",
+            )
+
+            return signal
+
+        except Exception as e:
+            logger.error("Risk correction failed: %s", e, exc_info=True)
+            return None
+

@@ -136,7 +136,14 @@ def run_once_single(
         logger.warning("LLM returned no signal, skipping cycle")
         return {"status": "skipped", "reason": "LLM returned None"}
 
-    return _validate_and_execute(signal_result, report, risk, executor, trade_logger)
+    # Correction callback — gives the LLM one chance to fix a rejected signal
+    def _correct_single(sig: Any, reason: str) -> Any:
+        return llm.correct(report, sig, reason)
+
+    return _validate_and_execute(
+        signal_result, report, risk, executor, trade_logger,
+        correct_fn=_correct_single,
+    )
 
 
 # ─── Multi-Agent Debate Strategy ────────────────────────────────────────────
@@ -238,7 +245,14 @@ def run_once_debate(
     if transcript.get("hold_rebuttal"):
         logger.info("Rebuttal (Hold): %s", transcript["hold_rebuttal"][:120])
 
-    result = _validate_and_execute(signal_result, report, risk, executor, trade_logger)
+    # Correction callback — gives the Judge one chance to fix a rejected signal
+    def _correct_debate(sig: Any, reason: str) -> Any:
+        return strategy.correct_judge_sync(report, sig, reason, transcript)
+
+    result = _validate_and_execute(
+        signal_result, report, risk, executor, trade_logger,
+        correct_fn=_correct_debate,
+    )
     result["transcript"] = {
         "bull": transcript["bull"],
         "bear": transcript["bear"],
@@ -256,8 +270,15 @@ def _validate_and_execute(
     risk: RiskManager,
     executor: TradeExecutor,
     trade_logger: TradeLogger,
+    correct_fn: Any = None,
 ) -> dict:
-    """Risk validation + trade execution — shared by all strategies."""
+    """Risk validation + trade execution — shared by all strategies.
+
+    Args:
+        correct_fn: Optional callable(signal, reason) -> corrected_signal | None.
+            When set and risk_correction_enabled, a rejected signal gets one
+            chance to be corrected by the original decision-maker.
+    """
 
     account = report.get("account")
     market = report.get("market")
@@ -322,19 +343,72 @@ def _validate_and_execute(
 
     # ── Phase 2: Risk validation (multi-action aware) ──
     actions = signal_result.get_actions()
-    risk_check = risk.validate_sequence(
-        signal_result, current_size, current_side,
-        mid_price=mid_price, account_balance=account_balance,
-    )
+
+    def _validate(sig: Any) -> Any:
+        """Run risk validation and return the check result."""
+        return risk.validate_sequence(
+            sig, current_size, current_side,
+            mid_price=mid_price, account_balance=account_balance,
+        )
+
+    risk_check = _validate(signal_result)
     if not risk_check.passed:
         logger.warning("Risk check failed: %s", risk_check.reason)
-        notify.send(f"🛡️ Risk rejected: {risk_check.reason}")
-        return {
-            "status": "rejected",
-            "signal": "/".join(actions),
-            "confidence": signal_result.confidence,
-            "reason": risk_check.reason,
-        }
+
+        # Attempt one-shot correction if enabled and a correction callback is provided
+        if config.risk_correction_enabled and correct_fn is not None:
+            logger.info("Attempting risk correction — asking LLM to fix signal...")
+            notify.send(
+                f"🔄 Risk correction: asking LLM to fix — {risk_check.reason[:100]}"
+            )
+
+            corrected_signal = correct_fn(signal_result, risk_check.reason)
+
+            if corrected_signal is not None:
+                corrected_actions = corrected_signal.get_actions()
+                risk_check2 = _validate(corrected_signal)
+
+                if risk_check2.passed:
+                    logger.info("Risk correction accepted — executing corrected signal")
+                    notify.send(
+                        f"✅ Risk correction accepted — "
+                        f"{'/'.join(corrected_actions)} "
+                        f"(was {'/'.join(actions)})"
+                    )
+                    # Use the corrected signal going forward
+                    signal_result = corrected_signal
+                    actions = corrected_actions
+                else:
+                    logger.warning(
+                        "Risk correction failed: %s — giving up", risk_check2.reason
+                    )
+                    notify.send(
+                        f"❌ Risk correction failed: {risk_check2.reason}. Giving up."
+                    )
+                    return {
+                        "status": "rejected",
+                        "signal": "/".join(corrected_actions),
+                        "confidence": corrected_signal.confidence,
+                        "reason": risk_check2.reason,
+                    }
+            else:
+                logger.warning("Risk correction returned None — giving up")
+                notify.send("❌ Risk correction: LLM unavailable, giving up.")
+                return {
+                    "status": "rejected",
+                    "signal": "/".join(actions),
+                    "confidence": signal_result.confidence,
+                    "reason": risk_check.reason,
+                }
+        else:
+            # No correction available or disabled — reject immediately
+            notify.send(f"🛡️ Risk rejected: {risk_check.reason}")
+            return {
+                "status": "rejected",
+                "signal": "/".join(actions),
+                "confidence": signal_result.confidence,
+                "reason": risk_check.reason,
+            }
 
     # ── Phase 3: Record trade open intent ──
     trade_opened_this_cycle = False
