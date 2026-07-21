@@ -1042,6 +1042,8 @@ Hyperliquid 支持三种账户模式：
 ```
 
 > **`actions` 优先**：LLM 应输出 `actions` 数组。单个操作用 `["LONG"]`，翻转仓位用 `["CLOSE", "SHORT"]`，调整止盈止损用 `["MODIFY_SL", "MODIFY_TP"]`。仍支持旧格式 `action` 字符串以保证向后兼容。
+>
+> **`entry_price` 仅供参考**：所有入场单以市价单（Ioc）执行。`entry_price` 仅用于风控计算（SL 距离、风险金额），建议设为 `null` 用当前市价，或填入预估成交价。
 
 > `next_interval`：LLM 建议的下次唤醒秒数（60-10800），null 则用默认值。上例中 120s 表示开仓后紧盯。
 
@@ -1069,7 +1071,7 @@ Hyperliquid 支持三种账户模式：
 **字段说明**：
 - `actions`: **推荐使用**。有序操作列表，执行器按序执行，遇失败停止后续操作
 - `action`: 旧格式（仍支持），当 `actions` 为 null 时使用
-- `entry_price`: 设为具体价格 → 限价单；设为 `null` → 市价单（Ioc）
+- `entry_price`: **仅供参考**（风控计算用）——所有入场单以市价单（Ioc）执行，不设限价。设为 `null` 用当前市价估值，或填入你对成交价的预估以获得更精确的风控计算
 - `stop_loss`: **强制字段**，LONG/SHORT 时必须提供，且距入场价 ≥ 0.5%
 - `size`: `null` 时自动使用 `MAX_POSITION_SIZE`
 - `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格
@@ -1734,12 +1736,9 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash # Flash 模型
 
 加上 **OrderMonitor** 的 WebSocket 实时同步，`PositionTracker` 在订单成交瞬间更新——大模型在下一个决策周期就能看到最新状态。
 
-### Q: 如果上一轮运行留下了未成交的限价单怎么办？
+### Q: 如果上一轮运行留下了未成交的挂单怎么办？
 
-两层保护：
-
-1. **程序化**：限价单 3 个周期未成交自动取消（`max_resting_cycles=3`）
-2. **LLM 判断**：每个周期 prompt 列出**全部链上挂单**，且 Step 0-c 要求 LLM 检查僵尸订单。LLM 可以判断这些订单是否还有效，通过 `CLOSE` 清理或在下个 `actions` 中覆盖。你也可以用 `--status` 手动查看。
+所有入场单以市价单（Ioc）执行，正常情况立即成交。极端情况下（价格瞬间跳变 >2% 导致 Ioc 未成交），订单会被交易所自动取消，程序在 3 个周期内检测到链上无仓位后自动清理 tracker 和 pending trade 记录。
 
 ### Q: SL/TP 订单会被交易所意外取消吗？如何防护？
 

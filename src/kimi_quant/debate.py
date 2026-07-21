@@ -224,7 +224,8 @@ Output TradingSignal JSON:
 - actions: ordered list of actions (preferred). Use for flip ["CLOSE", "SHORT"],
   adjust both ["MODIFY_SL", "MODIFY_TP"], or single ["LONG"].
   For backward compatibility, may also output a single `action` string.
-- confidence, reasoning, size (BTC), entry_price (null=market),
+- confidence, reasoning, size (BTC), entry_price (informational — all entries
+  are market/Ioc; set to null or your estimated fill price for risk calc),
   stop_loss, take_profit, modify_sl_to, modify_tp_to, key_factors (2-4 items),
   next_interval (null=default, range 300-10800s): ONLY use 300-600 for
   active positions or confirmed breakout setups. Default to null or 1800+

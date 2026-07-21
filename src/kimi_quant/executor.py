@@ -952,16 +952,11 @@ class TradeExecutor:
                 entry_confidence=signal.confidence,
             )
 
-            # Determine if market order (should fill instantly) vs limit
-            is_market = signal.entry_price is None
-            if is_market:
-                # Market/Ioc orders fill immediately — verify on next cycle
-                logger.info("Market order placed; will confirm fill next cycle")
-            else:
-                logger.info(
-                    "Limit order placed @ $%.1f; will monitor for fill",
-                    signal.entry_price,
-                )
+            # All entry orders are Ioc market orders — fill immediately
+            logger.info(
+                "Market (Ioc) order placed%s; will confirm fill next cycle",
+                f" (ref=${signal.entry_price:.0f})" if signal.entry_price else "",
+            )
 
             return {
                 "action": signal.action,
@@ -988,41 +983,29 @@ class TradeExecutor:
     ) -> list[dict]:
         """Build the order request list for atomic open + SL + TP.
 
-        For market orders: uses Ioc with a wide limit price (mid_price ± 2%)
-        to ensure execution while protecting against extreme slippage.
-        For limit orders: uses Gtc at the specified price.
+        All entry orders use Ioc (market) with a wide limit price
+        (mid_price ± 2%) to ensure execution while protecting against
+        extreme slippage. The LLM's entry_price is ignored for order
+        construction — it is used only for risk checks and trade logging.
         """
         orders: list[dict] = []
 
-        # Order 0: Open position
-        if signal.entry_price:
-            # Limit order
-            orders.append({
-                "coin": self.coin,
-                "is_buy": is_buy,
-                "sz": size,
-                "limit_px": _round_to_tick(signal.entry_price, self._tick_size),
-                "order_type": {"limit": {"tif": "Gtc"}},
-                "reduce_only": False,
-            })
-        else:
-            # Market order via Ioc with a wide price bound
-            # Get current mid for a reasonable limit_px
-            try:
-                mids = self.info.all_mids()
-                mid = float(mids.get(self.coin, 0))
-            except Exception:
-                mid = 0
-            buffer = mid * 0.02 if mid > 0 else 1000  # 2% buffer
-            px = mid + buffer if is_buy else max(mid - buffer, 1)
-            orders.append({
-                "coin": self.coin,
-                "is_buy": is_buy,
-                "sz": size,
-                "limit_px": _round_to_tick(px, self._tick_size),
-                "order_type": {"limit": {"tif": "Ioc"}},
-                "reduce_only": False,
-            })
+        # Order 0: Open position — always market order via Ioc
+        try:
+            mids = self.info.all_mids()
+            mid = float(mids.get(self.coin, 0))
+        except Exception:
+            mid = 0
+        buffer = mid * 0.02 if mid > 0 else 1000  # 2% buffer
+        px = mid + buffer if is_buy else max(mid - buffer, 1)
+        orders.append({
+            "coin": self.coin,
+            "is_buy": is_buy,
+            "sz": size,
+            "limit_px": _round_to_tick(px, self._tick_size),
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": False,
+        })
 
         # Order 1: Stop Loss (trigger, market execution)
         if signal.stop_loss:
@@ -1061,10 +1044,8 @@ class TradeExecutor:
             })
 
         logger.info(
-            "Built %d orders: %s @%s %sSL %sTP",
+            "Built %d orders: MARKET(Ioc) @market %sSL %sTP",
             len(orders),
-            "LIMIT" if signal.entry_price else "MARKET(Ioc)",
-            f"${signal.entry_price:.0f}" if signal.entry_price else "market",
             f"${signal.stop_loss:.0f} " if signal.stop_loss else "NO ",
             f"${signal.take_profit:.0f}" if signal.take_profit else "NO",
         )

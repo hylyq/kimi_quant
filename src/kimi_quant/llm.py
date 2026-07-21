@@ -264,7 +264,9 @@ class TradingSignal(BaseModel):
     )
     entry_price: float | None = Field(
         default=None,
-        description="Suggested entry price, None for market order",
+        description="Estimated entry price for risk calculation. "
+                    "Informational only — all entries execute as market/Ioc orders. "
+                    "Set to null to use current mid, or provide your best estimate.",
     )
     stop_loss: float | None = Field(
         default=None,
@@ -440,7 +442,10 @@ Output JSON only (no markdown):
 - confidence: 0.0-1.0
 - reasoning: brief synthesis
 - size: BTC amount (null for CLOSE/HOLD)
-- entry_price: limit price or null for market order
+- entry_price: estimated entry price for risk calc (informational — all entries
+  execute as market orders via Ioc. You do NOT need to set this. Set to null
+  to use current mid, or provide your best estimate of the fill price for
+  accurate risk calculation.)
 - stop_loss: mandatory for directional (min 0.5% from entry)
 - take_profit: realistic target
 - modify_sl_to: new SL price (MODIFY_SL only)
