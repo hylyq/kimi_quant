@@ -347,7 +347,8 @@ class RiskManager:
             lines.append(
                 f"Your confidence ({self.min_confidence:.2f} min) "
                 f"must EXCEED {breakeven:.1%} for positive EV. "
-                f"If R:R < 1:1.5, the trade needs very high confidence."
+                f"R:R below {self.MIN_RR_RATIO}:1 is HARD REJECTED — "
+                f"widen TP or skip the trade."
             )
         lines.append(
             "Formula: breakeven = 1 / (1 + reward/risk). "

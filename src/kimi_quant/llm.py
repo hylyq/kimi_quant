@@ -406,8 +406,9 @@ Step 1 — ANALYZE MARKET (only after completing Step 0):
   3. Funding: very positive → crowded longs (reversal risk); negative → shorts paying (squeeze risk).
   4. Multi-TF confluence → higher confidence. Divergence → follow higher TF, reduce size.
   5. When uncertain, HOLD. Confidence must EXCEED the breakeven win-rate from
-     the EV Check section (usually 30-40%). A trade with R:R < 1:1.5 needs
-     confidence > 45% just to break even. Confidence < 0.7 → skip trade.
+     the EV Check section (usually 30-40%). R:R below 1.5:1 is HARD REJECTED
+     regardless of confidence — widen TP or skip the trade.
+     Confidence < 0.7 → skip trade.
   6. If you decided to modify SL/TP in Step 0, include those actions BEFORE
      any new entry actions in the `actions` array.
 

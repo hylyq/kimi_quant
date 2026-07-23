@@ -120,8 +120,10 @@ class PositionTracker:
 
     # Thread safety: the main loop and the WebSocket monitor both access
     # tracker state. All public mutations must hold this lock.
-    _lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
+    # RLock (reentrant) is required because apply_ws_event() holds the lock
+    # while calling clear(), which also acquires it.
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
     )
 
     # ─── Read-only helpers ───────────────────────────────────────────
