@@ -501,10 +501,27 @@ def _validate_and_execute(
     trade_opened_this_cycle = False
     has_close = "CLOSE" in actions
     has_open = any(a in ("LONG", "SHORT") for a in actions)
+    is_flip = has_close and has_open  # e.g. ["CLOSE", "SHORT"]
+
+    # Determine flip side early — needed in Phase 5 if execution succeeds
+    flip_side = ""
+    flip_size = 0.0
+    flip_entry_price = 0.0
+    if is_flip:
+        open_action = next((a for a in reversed(actions)
+                           if a in ("LONG", "SHORT")), None)
+        flip_side = "long" if open_action == "LONG" else "short"
+        flip_size = signal_result.size or config.max_position_size
+        flip_entry_price = signal_result.entry_price or mid_price
+
+    # Simple open (no CLOSE): record intent before execution so it exists
+    # even if the bot restarts mid-cycle. Flips are deferred to Phase 5
+    # because the old position must be closed first — opening a new pending
+    # trade before the CLOSE executes would discard the old trade's P&L.
     if (has_open
+            and not is_flip
             and not executor.tracker.has_resting_order()
             and (not executor.tracker.has_position() or has_close)):
-        # Determine the side from the LAST directional action in the sequence
         open_action = next((a for a in reversed(actions)
                            if a in ("LONG", "SHORT")), None)
         side = "long" if open_action == "LONG" else "short"
@@ -543,7 +560,53 @@ def _validate_and_execute(
         r.get("action") == "CLOSE" and r.get("executed")
         for r in results_list
     )
-    if close_was_executed:
+    open_was_executed = any(
+        r.get("action") in ("LONG", "SHORT") and r.get("executed")
+        for r in results_list
+    )
+
+    if is_flip and close_was_executed:
+        # Flip: close the OLD trade first, then open the new one.
+        # Both operations happen AFTER execution succeeds, so a failed
+        # CLOSE won't orphan a trade record.
+        exit_price = _get_exit_price(report)
+        closed_trade = trade_logger.close_trade(exit_price, reason="signal")
+        if closed_trade:
+            if closed_trade.is_win:
+                risk.record_win(closed_trade.net_pnl)
+            else:
+                risk.record_loss(closed_trade.net_pnl)
+            emoji = "🟢" if closed_trade.is_win else "🔴"
+            total_balance = account.balance if account else 0.0
+            notify.send(
+                f"{emoji} Position closed: {closed_trade.side.upper()}\n"
+                f"Entry: ${closed_trade.entry_price:.0f} → Exit: ${closed_trade.exit_price:.0f}\n"
+                f"P&L: ${closed_trade.net_pnl:+.2f} ({closed_trade.pnl_pct:+.2f}%) | "
+                f"Leverage: {config.max_leverage}x\n"
+                f"Reason: {closed_trade.close_reason} | Balance: ${total_balance:.2f}"
+            )
+
+        if open_was_executed:
+            trade_logger.open_trade(
+                side=flip_side, size=flip_size,
+                entry_price=flip_entry_price,
+                dry_run=executor.dry_run,
+            )
+            trade_opened_this_cycle = True
+            notional = flip_size * flip_entry_price
+            margin = notional / config.max_leverage
+            total_balance = account.balance if account else 0.0
+            action_label = " → ".join(actions)
+            notify.send(
+                f"📈 {action_label} {flip_size} BTC @ ${flip_entry_price:.0f}\n"
+                f"Notional: ${notional:.0f} | Margin: ${margin:.2f} | "
+                f"Leverage: {config.max_leverage}x\n"
+                f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
+                f"Confidence: {signal_result.confidence:.2f} | Balance: ${total_balance:.2f}"
+            )
+
+    elif close_was_executed:
+        # Simple close (no flip): close the pending trade normally.
         exit_price = _get_exit_price(report)
         trade = trade_logger.close_trade(exit_price, reason="signal")
         if trade:
