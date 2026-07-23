@@ -110,7 +110,10 @@
 │  3. 15 分钟反转: "如果 15 分钟内反向 2%, 我漏了什么信号?" │
 │  4. 偏差审计: 数据证据(0-10) ___ vs 主观期望(0-10) ___   │
 │     → 期望 > 证据 → confidence -0.15 或 HOLD            │
-│  综合检查引发严重疑虑 → HOLD 是正确决策，永远有下一笔交易  │
+│  5. R:R 验证: R:R = |TP-entry|/|SL-entry|. 必须 ≥ 1.5:1. │
+│     扣除 ~0.07% taker 手续费后，小止盈很容易被吃掉。       │
+│     → R:R < 1.5:1 → 放宽 TP 或 HOLD                       │
+│  综合检查引发严重疑虑 → HOLD 是正确决策，永远有下一笔交易   │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -1114,6 +1117,8 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 ## Hard Limits
 - Min confidence: 0.7 | Max position: 0.001 BTC | Leverage: 3x
 - SL min distance: 0.5% | SL REQUIRED for directional trades
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.
+- Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). Factor into P&L.
 
 ## Margin Budget (from your account)
 - Available: $5000.00 → Max notional: $14250.00 → Max size: 0.1583 BTC
@@ -1148,7 +1153,8 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 4 | **保证金需求** | `size × price / leverage` ≤ 可用余额的 95%，超出则拒绝并建议合理 size |
 | 5 | **风险金额** | 单笔止损亏损 > 1% 账户警告，> 2% 拒绝（`\|entry - SL\| × size`） |
 | 6 | **止损距离** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝） |
-| 7 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换 |
+| 7 | **盈亏比 (R:R)** | ≥ 1.5:1（`|TP - entry| / |SL - entry|`），当设置了止盈时强制执行。盈亏比差的交易（如冒 2% 风险博 0.5% 收益）会被拒绝。止盈为可选字段——未设止盈则跳过此检查 |
+| 8 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换 |
 | — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`，丢失时 prompt 告警 + 推送通知 |
 | — | **多操作失败即停** | 序列中任一非 HOLD 操作失败，立即停止后续操作，防止半完成状态 |
 
@@ -1361,10 +1367,12 @@ Minimum SL distance: 0.72%
 
 **问题**：LLM 被要求 `confidence > 0.7`，但没有考虑 R:R——一个 R:R=1:0.5 的交易即使 confidence=0.8 也是负期望。
 
-**方案**：注入 R:R 计算示例和盈亏平衡公式：
+**方案**：注入 R:R 计算示例、盈亏平衡公式和手续费意识：
 
 ```
 ## Expected Value (EV) Check
+Round-trip taker fees: ~0.07% of notional (entry+exit are market/Ioc orders).
+Hard limit: R:R ≥ 1.5:1 (|TP-entry| / |SL-entry|). Below this → REJECTED.
 Example: Entry=$67,200, SL=$66,500 (1.0% risk), TP=$68,500 (1.9% reward)
 R:R = 1:1.9 → Breakeven win-rate = 1/(1+1.9) = 34.5%
 Your confidence must EXCEED 34.5% for positive EV.
@@ -1395,7 +1403,9 @@ Your confidence must EXCEED 34.5% for positive EV.
 # ⚠️ HARD CONSTRAINTS (repeated from above)
 - Max position: 0.01 BTC | Min confidence: 0.70
 - SL REQUIRED for LONG/SHORT | Min SL distance: 0.5% of entry
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP set, enforced.
 - Max leverage: 3x
+- Taker fees: ~0.07% round-trip. Factor into P&L estimates.
 - ⛔ CIRCUIT BREAKER ACTIVE: NEW POSITIONS BLOCKED (use HOLD/CLOSE/MODIFY only)
 ```
 

@@ -110,7 +110,10 @@ Regardless of strategy mode, the LLM follows a **mandatory two-step decision pro
 │  3. 15-Min Reversal: "If 2% reversal in 15min, what signal?"  │
 │  4. Bias Audit: Evidence (0-10) ___ vs Expectation (0-10) ___ │
 │     → Expectation > evidence → confidence -0.15 or HOLD       │
-│  Any serious doubt → HOLD is correct. There's always next.    │
+│  5. R:R VERIFICATION: R:R = |TP-entry|/|SL-entry|. ≥ 1.5:1.   │
+│     After ~0.07% taker fees, small TP moves are eaten by costs.│
+│     → R:R < 1.5:1 → widen TP or HOLD                           │
+│  Any serious doubt → HOLD is correct. There's always next.     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -1113,6 +1116,8 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 ## Hard Limits
 - Min confidence: 0.7 | Max position: 0.001 BTC | Leverage: 3x
 - SL min distance: 0.5% | SL REQUIRED for directional trades
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.
+- Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). Factor into P&L.
 
 ## Margin Budget (from your account)
 - Available: $5000.00 → Max notional: $14250.00 → Max size: 0.1583 BTC
@@ -1147,7 +1152,8 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 4 | **Margin Requirement** | `size × price / leverage` ≤ 95% available balance; reject and suggest appropriate size if exceeded |
 | 5 | **Risk Amount** | Single trade SL loss > 1% account warning, > 2% reject (`\|entry - SL\| × size`) |
 | 6 | **Stop Loss Distance** | ≥ 0.5% from entry (BTC noise ~0.3%, reject below this threshold) |
-| 7 | **Direction** | Same-direction position rejected; CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation |
+| 7 | **Risk/Reward Ratio** | ≥ 1.5:1 (`|TP - entry| / |SL - entry|`) when TP is set. Trades with poor R:R (e.g., risking 2% to make 0.5%) are rejected. TP is optional — trades without TP skip this check |
+| 8 | **Direction** | Same-direction position rejected; CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation |
 | — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; if missing, prompt warning + push notification |
 | — | **Multi-Operation Fail-Fast** | Any non-HOLD operation in sequence fails → immediately stop subsequent operations, prevent half-completed states |
 
@@ -1360,10 +1366,12 @@ Minimum SL distance: 0.72%
 
 **Problem**: LLM is required to have `confidence > 0.7` but doesn't consider R:R — a R:R=1:0.5 trade is negative EV even at confidence=0.8.
 
-**Solution**: Inject R:R calculation example and breakeven formula:
+**Solution**: Inject R:R calculation example, breakeven formula, and fee awareness:
 
 ```
 ## Expected Value (EV) Check
+Round-trip taker fees: ~0.07% of notional (entry+exit are market/Ioc orders).
+Hard limit: R:R ≥ 1.5:1 (|TP-entry| / |SL-entry|). Below this → REJECTED.
 Example: Entry=$67,200, SL=$66,500 (1.0% risk), TP=$68,500 (1.9% reward)
 R:R = 1:1.9 → Breakeven win-rate = 1/(1+1.9) = 34.5%
 Your confidence must EXCEED 34.5% for positive EV.
@@ -1394,7 +1402,9 @@ Your confidence must EXCEED 34.5% for positive EV.
 # ⚠️ HARD CONSTRAINTS (repeated from above)
 - Max position: 0.01 BTC | Min confidence: 0.70
 - SL REQUIRED for LONG/SHORT | Min SL distance: 0.5% of entry
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP set, enforced.
 - Max leverage: 3x
+- Taker fees: ~0.07% round-trip. Factor into P&L estimates.
 - ⛔ CIRCUIT BREAKER ACTIVE: NEW POSITIONS BLOCKED (use HOLD/CLOSE/MODIFY only)
 ```
 

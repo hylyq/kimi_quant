@@ -37,6 +37,11 @@ class RiskManager:
     # Minimum stop loss distance from entry (as fraction of price)
     MIN_SL_DISTANCE = 0.005  # 0.5% — BTC noise is ~0.3%
 
+    # Minimum risk/reward ratio: |TP - entry| / |SL - entry| must be ≥ this.
+    # Prevents trades where the potential loss dwarfs the potential gain.
+    # Only enforced when a take_profit is explicitly set (TP is optional).
+    MIN_RR_RATIO = 1.5  # reward must be at least 1.5× the risk
+
     # Circuit breaker
     MAX_CONSECUTIVE_LOSSES = 4
     COOLDOWN_CYCLES = 6  # wait 6 cycles (e.g. 30 min) before resuming
@@ -73,6 +78,7 @@ class RiskManager:
             ),
             self._check_direction(signal, current_position_side),
             self._check_stop_loss_distance(signal, mid_price),
+            self._check_risk_reward_ratio(signal, mid_price),
         ]
 
         for check in checks:
@@ -245,6 +251,10 @@ class RiskManager:
         lines.append(f"- SL min distance: {self.MIN_SL_DISTANCE:.1%} of entry "
                      f"(BTC noise is ~0.3%)")
         lines.append(f"- SL is REQUIRED for LONG/SHORT (no SL → rejected)")
+        lines.append(f"- R:R minimum: {self.MIN_RR_RATIO}:1 "
+                     f"(|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.")
+        lines.append(f"- Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). "
+                     f"Factor into P&L.")
         lines.append("")
 
         # ── Margin budget (dynamic) ──────────────────────────────────
@@ -305,6 +315,14 @@ class RiskManager:
         # ── Expected Value Guidance ────────────────────────────────────
         lines.append("")
         lines.append("## Expected Value (EV) Check")
+        lines.append(
+            "Round-trip taker fees: ~0.07% of notional (entry + exit are "
+            "both market/Ioc orders). Factor fee cost into your P&L estimate."
+        )
+        lines.append(f"Hard limit: R:R ≥ {self.MIN_RR_RATIO}:1 "
+                     f"(|TP - entry| / |SL - entry|). "
+                     f"Trades below this ratio are REJECTED.")
+        lines.append("")
         lines.append("Before proposing a trade, compute the implied breakeven win-rate:")
         if mid_price > 0:
             # Show an example: assume 1% SL distance, pick a 2:1 reward:risk TP
@@ -503,3 +521,45 @@ class RiskManager:
             )
 
         return RiskCheck(passed=True, reason=f"SL distance OK ({sl_distance:.2%})")
+
+    def _check_risk_reward_ratio(
+        self, signal: TradingSignal, mid_price: float,
+    ) -> RiskCheck:
+        """Validate that the reward/risk ratio meets the minimum threshold.
+
+        Only enforced when both stop_loss and take_profit are provided
+        (TP is optional — the LLM may leave it unset for manual management).
+        """
+        if signal.action not in ("LONG", "SHORT"):
+            return RiskCheck(passed=True, reason="No R:R needed")
+
+        if signal.stop_loss is None or signal.take_profit is None:
+            return RiskCheck(passed=True, reason="TP not set — R:R not enforced")
+
+        entry = signal.entry_price or mid_price
+        if entry <= 0 or entry == signal.stop_loss:
+            return RiskCheck(passed=True, reason="Cannot validate R:R")
+
+        risk_distance = abs(entry - signal.stop_loss)
+        reward_distance = abs(signal.take_profit - entry)
+
+        if risk_distance <= 0:
+            return RiskCheck(passed=True, reason="Zero risk distance")
+
+        rr_ratio = reward_distance / risk_distance
+
+        if rr_ratio < self.MIN_RR_RATIO:
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    f"Risk/reward ratio {rr_ratio:.1f}:1 is below minimum "
+                    f"{self.MIN_RR_RATIO}:1. "
+                    f"Entry=${entry:.0f} SL=${signal.stop_loss:.0f} "
+                    f"(risk=${risk_distance:.0f}) "
+                    f"TP=${signal.take_profit:.0f} "
+                    f"(reward=${reward_distance:.0f}). "
+                    f"Widen TP or tighten SL to improve R:R."
+                ),
+            )
+
+        return RiskCheck(passed=True, reason=f"R:R OK ({rr_ratio:.1f}:1)")

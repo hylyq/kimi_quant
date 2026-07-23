@@ -24,6 +24,12 @@ DEFAULT_LOG_PATH = str(
     Path(__file__).parent.parent.parent / "data" / "trades.jsonl"
 )
 
+# Hyperliquid standard fee rates (as of 2026-07).
+# All entry orders use Ioc (market) execution → taker fee on both sides.
+TAKER_FEE_RATE = 0.00035   # 0.035% per side
+MAKER_FEE_RATE = 0.00010   # 0.010% per side (not used for Ioc entries)
+ROUNDTRIP_TAKER_FEE = TAKER_FEE_RATE * 2  # 0.07% round-trip
+
 
 # ─── Trade Record ────────────────────────────────────────────────────────
 
@@ -72,9 +78,11 @@ class TradeRecord:
             else 0.0
         )
 
-        # Estimated fees: 0.02% maker (entry) + 0.05% taker (exit)
-        notional = self.entry_price * self.size
-        self.fees_est = notional * 0.0002 + exit_price * self.size * 0.0005
+        # Estimated fees: taker on both sides (all entries use Ioc market orders).
+        # Entry notional + exit notional, each at the taker rate.
+        entry_notional = self.entry_price * self.size
+        exit_notional = exit_price * self.size
+        self.fees_est = (entry_notional + exit_notional) * TAKER_FEE_RATE
 
     @property
     def is_win(self) -> bool:

@@ -428,6 +428,11 @@ Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing
      - Hope/trying to find a trade (0-10): ___
      → If hope > data, reduce confidence by 0.15 or output HOLD.
 
+  5. R:R VERIFICATION: R:R = |TP - entry| / |SL - entry|. Must be ≥ 1.5:1.
+     After ~0.07% round-trip taker fees, a 0.5% move is only ~0.43% net profit.
+     Small TP distances are eaten by fees. Widen TP or skip the trade.
+     → If R:R < 1.5:1: widen TP or output HOLD.
+
   If the combined check raises serious doubts → HOLD is the correct decision.
   There will ALWAYS be another trade.
 
