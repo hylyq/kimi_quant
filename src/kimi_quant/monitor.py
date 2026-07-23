@@ -257,6 +257,7 @@ class OrderMonitor:
     def _on_order_update(self, data: Any) -> None:
         """Callback for orderUpdates subscription."""
         try:
+            logger.debug("WS orderUpdate raw: %s", data)
             event = self._parse_order_update(data)
             if event and event.is_significant:
                 # Sync to PositionTracker first (so LLM sees latest state)
@@ -270,12 +271,15 @@ class OrderMonitor:
                     event.filled_size,
                     event.total_size,
                 )
+            elif event is None:
+                logger.debug("WS orderUpdate parsed to None (non-significant or unknown format)")
         except Exception:
             logger.error("Failed to parse order update: %s", data, exc_info=True)
 
     def _on_fill_update(self, data: Any) -> None:
         """Callback for userFills subscription."""
         try:
+            logger.debug("WS userFills raw: %s", data)
             event = self._parse_fill_update(data)
             if event and event.is_significant:
                 self._sync_to_tracker(event)
@@ -287,6 +291,8 @@ class OrderMonitor:
                     event.fill_price,
                     event.filled_size,
                 )
+            elif event is None:
+                logger.debug("WS userFills parsed to None (non-significant or unknown format)")
         except Exception:
             logger.error("Failed to parse fill update: %s", data, exc_info=True)
 
@@ -443,39 +449,78 @@ You are a trading assistant that reports order status changes. \
 Given an order event, produce a concise, one-line notification in Chinese.
 
 Rules:
-- Be specific: include side (多/空), size (BTC), price ($), and what happened.
-- Use these emoji prefixes by event type:
-  - order_filled → ✅ (entry filled) or 🎯 (take profit) or 🛑 (stop loss)
-  - order_partial → ⏳
-  - order_cancelled → ❌
-  - order_rejected → 🚫
-  - position_closed → 🏁
-  - liquidated → 💀
-- If you can infer SL/TP from context, mention it.
+- The "Order role" field tells you EXACTLY what this order is:
+  - "entry" → emoji ✅, say "开仓成交"
+  - "stop_loss" → emoji 🛑, say "止损触发"
+  - "take_profit" → emoji 🎯, say "止盈触发"
+  - "unknown" → emoji ✅, say "订单成交"
+- Include side (多/空), size (BTC), and price ($).
+- For order_partial → ⏳
+- For order_cancelled → ❌
+- For order_rejected → 🚫
+- For liquidated → 💀
 - Keep it under 120 characters — it's a push notification.
 - Output ONLY the notification text, no markdown, no explanation.
 """
 
 
-def _build_flash_prompt(event: OrderEvent) -> str:
-    """Build a compact prompt for the Flash model from an OrderEvent."""
+def _build_flash_prompt(event: OrderEvent, tracker: Any = None) -> str:
+    """Build a compact prompt for the Flash model from an OrderEvent.
+
+    Includes tracker context so the LLM can accurately classify the fill
+    as entry, stop loss, or take profit — eliminating hallucination.
+    """
     pct = f" ({event.fill_pct:.0f}%)" if event.total_size > 0 else ""
-    return (
-        f"Event: {event.event_type}\n"
-        f"Side: {event.side} | Coin: {event.coin}\n"
-        f"Size: {event.filled_size:.4f}/{event.total_size:.4f} BTC{pct}\n"
-        f"Price: ${event.fill_price:.1f}\n"
-        f"Order ID: {event.order_id}\n"
-        f"Status: {event.status}\n"
-    )
+
+    # Classify the order using tracker oid mapping
+    order_role = _classify_fill(event.order_id, tracker)
+
+    lines = [
+        f"Event: {event.event_type}",
+        f"Order role: {order_role}",
+        f"Side: {event.side} | Coin: {event.coin}",
+        f"Size: {event.filled_size:.4f}/{event.total_size:.4f} BTC{pct}",
+        f"Price: ${event.fill_price:.1f}",
+        f"Order ID: {event.order_id}",
+        f"Status: {event.status}",
+    ]
+    return "\n".join(lines)
+
+
+def _classify_fill(oid: int | None, tracker: Any = None) -> str:
+    """Classify a fill event using tracker oid mapping.
+
+    Returns one of: "entry", "stop_loss", "take_profit", "unknown".
+    """
+    if oid is None or tracker is None:
+        return "unknown"
+    try:
+        if oid == tracker.entry_oid:
+            return "entry"
+        if oid == tracker.sl_oid:
+            return "stop_loss"
+        if oid == tracker.tp_oid:
+            return "take_profit"
+    except Exception:
+        pass
+    return "unknown"
 
 
 class FlashReporter:
     """Consumes OrderEvents from the monitor queue and reports via Flash LLM.
 
     Runs in its own daemon thread. Falls back to plain-text formatting
-    if the LLM is unavailable or errors out.
+    if the LLM is unavailable or errors out. Uses cooldown-based retry
+    instead of permanent disable — the LLM can recover after a delay.
+
+    The tracker reference enables accurate SL/TP/entry classification
+    in both LLM-generated and fallback notifications.
     """
+
+    # LLM error cooldown: after a failure, wait this many seconds before
+    # retrying the Flash model. Prevents permanent disable from a single
+    # transient error (timeout, rate limit, etc.).
+    _LLM_COOLDOWN_SECONDS = 300  # 5 minutes
 
     def __init__(
         self,
@@ -483,17 +528,21 @@ class FlashReporter:
         model: str = "deepseek-v4-flash",
         api_key: str | None = None,
         base_url: str | None = None,
+        tracker: Any = None,  # PositionTracker for oid→type mapping
     ):
         self._queue = event_queue
         self._model = model
         self._api_key = api_key
         self._base_url = base_url
+        self._tracker = tracker
         self._llm = None  # lazy init in thread
+        self._llm_disabled_until: float = 0.0  # cooldown timestamp (monotonic)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._started = False
         self._error_count = 0
         self._report_count = 0
+        self._llm_failures = 0  # consecutive LLM failures for rate-limiting
 
     @property
     def report_count(self) -> int:
@@ -558,9 +607,43 @@ class FlashReporter:
                     temperature=0.0,
                     max_tokens=128,
                 )
-                logger.info("FlashReporter LLM ready: %s", self._model)
+                logger.info(
+                    "FlashReporter LLM ready: %s (base_url=%s)",
+                    self._model,
+                    self._base_url or "default",
+                )
+
+                # Startup health check: send a trivial request to verify the
+                # model exists and the API key works. A single failure here
+                # puts the LLM into cooldown rather than permanent disable.
+                try:
+                    test_response = self._llm.invoke(
+                        [("user", "say ok")],
+                    )
+                    logger.info(
+                        "Flash LLM health check OK (model=%s)",
+                        self._model,
+                    )
+                except Exception as health_err:
+                    self._llm_failures = 1
+                    self._llm_disabled_until = (
+                        time.monotonic() + self._LLM_COOLDOWN_SECONDS
+                    )
+                    logger.warning(
+                        "Flash LLM health check FAILED (model=%s): %s. "
+                        "Will retry in %ds. Using fallback formatting until then.",
+                        self._model,
+                        health_err,
+                        self._LLM_COOLDOWN_SECONDS,
+                    )
             except Exception as e:
-                logger.warning("Flash LLM init failed, using fallback: %s", e)
+                logger.warning(
+                    "Flash LLM init failed (model=%s, base_url=%s): %s. "
+                    "Using fallback formatting.",
+                    self._model,
+                    self._base_url or "default",
+                    e,
+                )
                 self._llm = None
 
         while not self._stop_event.is_set():
@@ -587,12 +670,20 @@ class FlashReporter:
     def _generate_report(self, event: OrderEvent) -> str:
         """Generate a notification text for the event.
 
-        Tries Flash LLM first, falls back to deterministic formatting.
+        Tries Flash LLM first (with cooldown on failure), falls back to
+        deterministic formatting. The LLM is NOT permanently disabled —
+        it retries after _LLM_COOLDOWN_SECONDS.
         """
-        # Try LLM
+        # Check if LLM is in cooldown
+        now = time.monotonic()
+        if self._llm is not None and now < self._llm_disabled_until:
+            # Still in cooldown — skip LLM, use fallback
+            return self._format_fallback(event)
+
+        # Try LLM if available and not in cooldown
         if self._llm is not None:
             try:
-                prompt = _build_flash_prompt(event)
+                prompt = _build_flash_prompt(event, self._tracker)
                 response = self._llm.invoke(
                     [
                         ("system", FLASH_SYSTEM_PROMPT),
@@ -601,27 +692,55 @@ class FlashReporter:
                 )
                 text = response.content.strip() if hasattr(response, "content") else str(response).strip()
                 if text and len(text) <= 200:
+                    self._llm_failures = 0  # reset on success
                     return text
                 # If LLM returned something too long, truncate
                 if text:
+                    self._llm_failures = 0
                     return text[:197] + "..."
             except Exception as e:
-                logger.warning("Flash LLM call failed, using fallback: %s", e)
-                self._llm = None  # disable LLM after first failure to avoid spam
+                self._llm_failures += 1
+                cooldown = min(
+                    self._LLM_COOLDOWN_SECONDS * self._llm_failures,
+                    3600,  # max 1 hour cooldown
+                )
+                self._llm_disabled_until = now + cooldown
+                logger.warning(
+                    "Flash LLM call failed (#%d consecutive), "
+                    "cooldown %ds: %s",
+                    self._llm_failures, int(cooldown), e,
+                )
 
-        # Fallback: deterministic formatting
+        # Fallback: deterministic formatting with tracker context
         return self._format_fallback(event)
 
-    @staticmethod
-    def _format_fallback(event: OrderEvent) -> str:
-        """Deterministic fallback formatting when Flash LLM is unavailable."""
+    def _format_fallback(self, event: OrderEvent) -> str:
+        """Deterministic fallback formatting when Flash LLM is unavailable.
+
+        Uses tracker oid mapping to accurately label fills as entry,
+        stop loss, or take profit — eliminating "fake" generic messages.
+        """
         oid_str = f"#{event.order_id}" if event.order_id else ""
         side_label = "多" if event.side == "buy" else "空"
+        role = _classify_fill(event.order_id, self._tracker)
 
         if event.event_type == EventType.ORDER_FILLED:
+            if role == "entry":
+                emoji = "✅"
+                label = "开仓成交"
+            elif role == "stop_loss":
+                emoji = "🛑"
+                label = "止损触发"
+            elif role == "take_profit":
+                emoji = "🎯"
+                label = "止盈触发"
+            else:
+                emoji = "✅"
+                label = "订单成交"
+
             if event.fill_pct >= 99:
                 return (
-                    f"✅ 订单成交 {oid_str}\n"
+                    f"{emoji} {label} {oid_str}\n"
                     f"{side_label} {event.filled_size:.4f} BTC @ ${event.fill_price:.1f}"
                 )
             else:

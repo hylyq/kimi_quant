@@ -674,6 +674,7 @@ def run_loop():
                 model=config.monitor_flash_model,
                 api_key=config.monitor_flash_api_key or None,
                 base_url=config.monitor_flash_base_url or None,
+                tracker=executor.tracker,  # for SL/TP/entry classification
             )
             monitor.start()
             reporter.start()
