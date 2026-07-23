@@ -396,10 +396,12 @@ def _validate_and_execute(
     if not executor.tracker.has_position() and not executor.tracker.has_resting_order():
         # Check if trade_logger has a pending trade that was just closed by SL/TP
         if trade_logger.has_pending and current_side == "none":
+            ws_reason = executor.tracker.consume_ws_close_reason()
             _record_close_from_chain(
                 trade_logger, report,
                 entry_price=tracker_entry_before_sync,
                 side=tracker_side_before_sync,
+                ws_reason=ws_reason,
             )
             # Record the P&L result for circuit breaker tracking
             stats = trade_logger.get_stats()
@@ -593,6 +595,7 @@ def _record_close_from_chain(
     report: dict,
     entry_price: float = 0.0,
     side: str = "none",
+    ws_reason: str | None = None,
 ) -> None:
     """Record a trade close detected from on-chain state (SL/TP filled).
 
@@ -601,12 +604,17 @@ def _record_close_from_chain(
         report: Market data report (for mid price as exit price).
         entry_price: The entry price BEFORE the tracker was cleared.
         side: The position side BEFORE the tracker was cleared.
+        ws_reason: "stop_loss" or "take_profit" from WebSocket event,
+            if the WS cleared the tracker before this call. Takes
+            priority over price-based inference.
     """
     market = report.get("market")
     exit_price = market.mid_price if market else 0.0
 
-    # Determine reason from the captured pre-sync values
-    if entry_price > 0 and exit_price > 0 and side != "none":
+    # Priority: 1) WS event reason (most accurate) → 2) price inference
+    if ws_reason:
+        reason = ws_reason
+    elif entry_price > 0 and exit_price > 0 and side != "none":
         if side == "long":
             reason = "take_profit" if exit_price > entry_price else "stop_loss"
         else:

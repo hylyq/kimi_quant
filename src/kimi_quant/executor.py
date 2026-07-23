@@ -113,6 +113,11 @@ class PositionTracker:
     resting_cycles: int = 0
     max_resting_cycles: int = 3  # cancel limit order after this many unfilled cycles
 
+    # WS→main-loop bridge: when the WebSocket clears the tracker before the
+    # main loop can capture pre-sync state, this field preserves the close
+    # reason ("stop_loss" | "take_profit" | None) so P&L recording is accurate.
+    _last_ws_close_reason: str | None = None
+
     # Thread safety: the main loop and the WebSocket monitor both access
     # tracker state. All public mutations must hold this lock.
     _lock: threading.Lock = field(
@@ -130,6 +135,18 @@ class PositionTracker:
     def should_cancel_resting(self) -> bool:
         return self.state == "resting" and self.resting_cycles >= self.max_resting_cycles
 
+    def consume_ws_close_reason(self) -> str | None:
+        """Return and clear the last WS close reason (if any).
+
+        Called by the main loop after sync_with_chain to get the accurate
+        close reason when the WebSocket beat the main loop to clearing the
+        tracker. Returns "stop_loss", "take_profit", or None.
+        """
+        with self._lock:
+            reason = self._last_ws_close_reason
+            self._last_ws_close_reason = None
+            return reason
+
     # ─── Mutations (thread-safe via _lock) ───────────────────────────
 
     def clear(self) -> None:
@@ -145,7 +162,9 @@ class PositionTracker:
             self.sl_price = 0.0
             self.tp_price = 0.0
             self.resting_cycles = 0
-            # Reset position memory
+            # Reset position memory (but NOT _last_ws_close_reason —
+            # the main loop needs it after clear() to record the correct
+            # close_reason. It is consumed via consume_ws_close_reason().)
             self.entry_time = ""
             self.entry_reason = ""
             self.entry_confidence = 0.0
@@ -263,6 +282,7 @@ class PositionTracker:
                         "WS sync: stop loss #%d filled @ %.1f — position closed",
                         oid, event.fill_price,
                     )
+                    self._last_ws_close_reason = "stop_loss"
                     self.clear()
                     return f"sl_filled oid={oid}"
 
@@ -272,6 +292,7 @@ class PositionTracker:
                         "WS sync: take profit #%d filled @ %.1f — position closed",
                         oid, event.fill_price,
                     )
+                    self._last_ws_close_reason = "take_profit"
                     self.clear()
                     return f"tp_filled oid={oid}"
 

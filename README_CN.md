@@ -1156,6 +1156,7 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 7 | **盈亏比 (R:R)** | ≥ 1.5:1（`|TP - entry| / |SL - entry|`），当设置了止盈时强制执行。盈亏比差的交易（如冒 2% 风险博 0.5% 收益）会被拒绝。止盈为可选字段——未设止盈则跳过此检查 |
 | 8 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换 |
 | — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`，丢失时 prompt 告警 + 推送通知 |
+| — | **SL/TP 实时检测** | WebSocket 毫秒级感知 SL/TP 触发 → 即时推送（🛑/🎯）。Tracker 在 WS 清除时保留平仓原因，下一轮主循环可准确记录 close_reason（"stop_loss"/"take_profit"）而非 "manual" |
 | — | **多操作失败即停** | 序列中任一非 HOLD 操作失败，立即停止后续操作，防止半完成状态 |
 
 ### 风控拒绝反馈修正（Risk Correction）

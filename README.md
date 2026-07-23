@@ -1155,6 +1155,7 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 7 | **Risk/Reward Ratio** | ≥ 1.5:1 (`|TP - entry| / |SL - entry|`) when TP is set. Trades with poor R:R (e.g., risking 2% to make 0.5%) are rejected. TP is optional — trades without TP skip this check |
 | 8 | **Direction** | Same-direction position rejected; CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation |
 | — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; if missing, prompt warning + push notification |
+| — | **SL/TP Real-Time Detection** | WebSocket detects SL/TP fills at millisecond latency → instant push notification (🛑/🎯). Tracker preserves close reason across WS-triggered clear() so the next main-loop cycle records accurate close_reason ("stop_loss"/"take_profit") instead of "manual" |
 | — | **Multi-Operation Fail-Fast** | Any non-HOLD operation in sequence fails → immediately stop subsequent operations, prevent half-completed states |
 
 ### Risk Rejection Feedback Correction
