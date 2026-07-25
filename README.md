@@ -215,6 +215,13 @@ PRIMARY_LLM=deepseek
 PRIMARY_LLM=deepseek        # Bull/Bear/Hold use cheap DeepSeek (3 calls)
 JUDGE_PRIMARY_LLM=kimi       # Judge uses strong-reasoning Kimi K3 (1 call)
 
+# Option 3b: Judge with specific model version + independent reasoning effort
+# Full control: provider, model version, and reasoning intensity for the Judge
+PRIMARY_LLM=deepseek              # Bull/Bear/Hold use DeepSeek
+JUDGE_PRIMARY_LLM=deepseek         # Judge also uses DeepSeek...
+JUDGE_MODEL=deepseek-v4-pro       # ...but a specific model version
+JUDGE_REASONING_EFFORT=max        # ...with maximum reasoning effort
+
 # Option 4: Kimi only (don't set DeepSeek key)
 # Option 5: DeepSeek only (don't set Kimi key)
 ```
@@ -280,8 +287,8 @@ Saves **65%** vs all-Kimi, Judge decision quality unaffected — final rulings d
 Startup logs reflect independent config:
 
 ```
-LLM: deepseek primary → fallback: kimi        ← Debaters
-Judge LLM: kimi primary → fallback: deepseek   ← Judge
+LLM: deepseek primary → fallback: kimi              ← Debaters
+Judge: primary=kimi model=kimi-k3 temp=0.05 effort=max  ← Judge
 ```
 
 ## Adaptive Wake Interval
@@ -867,6 +874,8 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `LLM_MAX_TOKENS` | `2048` | Max output tokens (doesn't affect 1M context input) |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate mode Judge temperature |
 | `JUDGE_PRIMARY_LLM` | (same as `PRIMARY_LLM`) | Judge-specific primary model: `kimi` or `deepseek`. Leave blank to match debaters. Recommend `kimi` (strong reasoning for rulings) |
+| `JUDGE_MODEL` | (provider default) | Judge-specific model version (e.g. `deepseek-v4-pro`, `kimi-k3`). Leave blank to use provider default. Only meaningful when `JUDGE_PRIMARY_LLM` is also set |
+| `JUDGE_REASONING_EFFORT` | (same as `REASONING_EFFORT`) | Judge-specific reasoning effort: `max`/`high`/`medium`/`low`/`minimal`/`off`. Leave blank to use global setting. Allows Judge to have independent reasoning intensity |
 | `DEBATE_REBUTTAL_ENABLED` | `false` | Enable rebuttal round: debaters rebut each other before Judge ruling (+3 LLM calls/cycle) |
 | `CACHE_WARMUP_DELAY` | `2.0` | Debate mode cache write delay in seconds. Increase to ensure Bull/Bear cache hits, set to 0 to disable. Only affects timing, not decision quality |
 | **Hyperliquid** | | |
@@ -1680,6 +1689,14 @@ PRIMARY_LLM=deepseek  # DeepSeek primary, Kimi fallback (budget)
 # Debate mode: Judge independent primary model (leave blank = same as PRIMARY_LLM)
 JUDGE_PRIMARY_LLM=kimi      # Judge uses Kimi, debaters use PRIMARY_LLM
 JUDGE_PRIMARY_LLM=deepseek  # Judge uses DeepSeek, debaters use PRIMARY_LLM
+
+# Judge-specific model version (optional, requires JUDGE_PRIMARY_LLM)
+JUDGE_MODEL=deepseek-v4-pro  # Override Judge's model version
+JUDGE_MODEL=kimi-k3          # Override Judge's model version
+
+# Judge-specific reasoning effort (optional, overrides REASONING_EFFORT for Judge only)
+JUDGE_REASONING_EFFORT=max   # Judge uses max reasoning independently
+JUDGE_REASONING_EFFORT=off   # Judge skips reasoning (cost savings)
 ```
 
 Just configure both model API Keys. Primary fails → auto fallback. No code changes needed. See [LLM Model Configuration](#llm-model-configuration).

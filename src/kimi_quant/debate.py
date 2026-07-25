@@ -385,14 +385,31 @@ class JudgeAgent:
 
         # Judge can use a different primary model from the debaters.
         # Set JUDGE_PRIMARY_LLM in .env to override (e.g., "deepseek").
+        # Set JUDGE_MODEL to override the specific model version
+        #   (e.g., "deepseek-v4-pro").
+        # Set JUDGE_REASONING_EFFORT to override reasoning effort
+        #   independently (e.g., "max").
         # Fallback chain always includes all available models (kimi + deepseek).
         judge_primary = config.judge_primary_llm or None  # "" → None → use default
+        judge_model = config.judge_model or None           # "" → None → use default
+        judge_effort = config.judge_reasoning_effort or None
         self.structured_llm = create_structured_llm(
             TradingSignal,
             temperature=config.judge_temperature,
             max_tokens=4096,  # Judge needs more room for synthesizing 3 arguments
             primary=judge_primary,
+            model=judge_model,
+            reasoning_effort=judge_effort,
         )
+        if judge_primary:
+            model_desc = judge_model or (
+                config.kimi_model if judge_primary == "kimi" else config.deepseek_model
+            )
+            logger.info(
+                "Judge: primary=%s model=%s temp=%.2f effort=%s",
+                judge_primary, model_desc, config.judge_temperature,
+                judge_effort or config.reasoning_effort,
+            )
 
     async def ajudge(
         self, account_summary: str, bull: str, bear: str, hold: str,

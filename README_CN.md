@@ -215,6 +215,13 @@ PRIMARY_LLM=deepseek
 PRIMARY_LLM=deepseek        # Bull/Bear/Hold 用便宜的 DeepSeek（3 次调用）
 JUDGE_PRIMARY_LLM=kimi       # Judge 用强推理的 Kimi K3（1 次调用）
 
+# 方案 3b: Judge 指定具体模型版本 + 独立推理强度
+# 完全控制：厂家、模型版本、推理强度均可独立指定
+PRIMARY_LLM=deepseek              # Bull/Bear/Hold 用 DeepSeek
+JUDGE_PRIMARY_LLM=deepseek         # Judge 也用 DeepSeek...
+JUDGE_MODEL=deepseek-v4-pro       # ...但指定具体模型版本
+JUDGE_REASONING_EFFORT=max        # ...并使用最强推理
+
 # 方案 4: 仅 Kimi (不配 DeepSeek key 即可)
 # 方案 5: 仅 DeepSeek (不配 Kimi key 即可)
 ```
@@ -280,8 +287,8 @@ JUDGE_PRIMARY_LLM=kimi       # Judge 用 Kimi K3（1 次调用）
 启动日志会体现独立配置：
 
 ```
-LLM: deepseek primary → fallback: kimi        ← 辩手
-Judge LLM: kimi primary → fallback: deepseek   ← Judge
+LLM: deepseek primary → fallback: kimi              ← 辩手
+Judge: primary=kimi model=kimi-k3 temp=0.05 effort=max  ← Judge
 ```
 
 ## 自适应唤醒间隔
@@ -868,6 +875,8 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `LLM_MAX_TOKENS` | `2048` | 最大输出 token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
 | `JUDGE_PRIMARY_LLM` | (同 `PRIMARY_LLM`) | Judge 专用主模型：`kimi` 或 `deepseek`。留空则与辩手相同。推荐 `kimi`（强推理裁决） |
+| `JUDGE_MODEL` | (厂家的默认模型) | Judge 专用模型版本（如 `deepseek-v4-pro`、`kimi-k3`）。留空则使用厂家默认。仅在设置了 `JUDGE_PRIMARY_LLM` 时生效 |
+| `JUDGE_REASONING_EFFORT` | (同 `REASONING_EFFORT`) | Judge 专用推理强度：`max`/`high`/`medium`/`low`/`minimal`/`off`。留空使用全局设置，允许 Judge 有独立的推理强度 |
 | `DEBATE_REBUTTAL_ENABLED` | `false` | 开启反驳轮：辩手互相反驳后再由 Judge 裁决（+3 次 LLM 调用/周期） |
 | `CACHE_WARMUP_DELAY` | `2.0` | Debate 模式缓存落盘等待秒数。增大确保 Bull/Bear 命中缓存，设 0 关闭。仅影响时序，不影响决策质量 |
 | **Hyperliquid** | | |
@@ -1681,6 +1690,14 @@ PRIMARY_LLM=deepseek  # DeepSeek 主力，Kimi 备份（省钱）
 # Debate 模式：Judge 独立主模型（留空则同 PRIMARY_LLM）
 JUDGE_PRIMARY_LLM=kimi      # Judge 用 Kimi，辩手用 PRIMARY_LLM
 JUDGE_PRIMARY_LLM=deepseek  # Judge 用 DeepSeek，辩手用 PRIMARY_LLM
+
+# Judge 指定具体模型版本（可选，需先设置 JUDGE_PRIMARY_LLM）
+JUDGE_MODEL=deepseek-v4-pro  # 覆盖 Judge 的模型版本
+JUDGE_MODEL=kimi-k3          # 覆盖 Judge 的模型版本
+
+# Judge 独立推理强度（可选，覆盖全局 REASONING_EFFORT，仅对 Judge 生效）
+JUDGE_REASONING_EFFORT=max   # Judge 独立使用最强推理
+JUDGE_REASONING_EFFORT=off   # Judge 跳过推理（省费）
 ```
 
 只需配好两个模型的 API Key，主模型挂了自动切备机。不需改任何代码。见 [LLM 模型配置](#llm-模型配置)。

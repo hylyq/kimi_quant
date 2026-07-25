@@ -95,6 +95,15 @@ class Config:
     judge_primary_llm: str = field(
         default_factory=lambda: os.getenv("JUDGE_PRIMARY_LLM", "")
     )  # "" = use PRIMARY_LLM; set to "kimi" or "deepseek" to override Judge model
+    judge_model: str = field(
+        default_factory=lambda: os.getenv("JUDGE_MODEL", "")
+    )  # "" = use provider default; set to override Judge's specific model version
+    #   (e.g. "deepseek-v4-pro", "kimi-k3"). Only meaningful when judge_primary_llm
+    #   is also set — the model name must match the selected provider.
+    judge_reasoning_effort: str = field(
+        default_factory=lambda: os.getenv("JUDGE_REASONING_EFFORT", "")
+    )  # "" = use global REASONING_EFFORT; set to override Judge's reasoning effort
+    #   independently (e.g. "max", "high", "medium", "low", "minimal", "off").
     debate_rebuttal_enabled: bool = field(
         default_factory=lambda: os.getenv(
             "DEBATE_REBUTTAL_ENABLED", "false"
@@ -177,6 +186,14 @@ class Config:
         if self.judge_primary_llm and self.judge_primary_llm not in ("kimi", "deepseek"):
             errors.append(
                 f"JUDGE_PRIMARY_LLM must be 'kimi' or 'deepseek', got '{self.judge_primary_llm}'"
+            )
+        if self.judge_reasoning_effort and self.judge_reasoning_effort not in (
+            "max", "high", "medium", "low", "minimal", "off",
+        ):
+            errors.append(
+                f"JUDGE_REASONING_EFFORT must be one of "
+                f"(max, high, medium, low, minimal, off), "
+                f"got '{self.judge_reasoning_effort}'"
             )
         if self.llm_temperature < 0:
             errors.append(f"LLM_TEMPERATURE must be >= 0, got {self.llm_temperature}")

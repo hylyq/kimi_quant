@@ -60,7 +60,11 @@ def _log_cache_usage(response: Any, label: str = "") -> None:
 
 
 def _build_model_registry(
-    temp: float, tokens: int, include_thinking: bool = True,
+    temp: float,
+    tokens: int,
+    include_thinking: bool = True,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, ChatOpenAI]:
     """Build available LLM instances keyed by provider name.
 
@@ -73,12 +77,17 @@ def _build_model_registry(
         include_thinking: If False, disable reasoning/thinking params.
             Must be False when using structured output (json_mode) because
             reasoning_effort / thinking conflict with response_format.
+        model: Optional model name override for all providers.
+            When set, replaces the default model from config.
+        reasoning_effort: Optional reasoning effort override for all providers.
+            When set, replaces the global REASONING_EFFORT from config.
     """
     registry: dict[str, ChatOpenAI] = {}
-    effort = config.reasoning_effort.lower()
+    effort = (reasoning_effort or config.reasoning_effort).lower()
 
     # Kimi / Moonshot
     if config.moonshot_api_key:
+        kimi_model = model or config.kimi_model
         # Kimi K3 only supports temperature=1 (reasoning model).
         # Using any other value returns HTTP 400.
         kimi_temp = 1.0
@@ -89,7 +98,7 @@ def _build_model_registry(
         kimi_kwargs: dict[str, Any] = dict(
             api_key=config.moonshot_api_key,
             base_url=config.moonshot_base_url,
-            model=config.kimi_model,
+            model=kimi_model,
             temperature=kimi_temp,
             max_tokens=tokens,
         )
@@ -101,10 +110,11 @@ def _build_model_registry(
 
     # DeepSeek
     if config.deepseek_api_key:
+        ds_model = model or config.deepseek_model
         ds_kwargs: dict[str, Any] = dict(
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
-            model=config.deepseek_model,
+            model=ds_model,
             temperature=temp,
             max_tokens=tokens,
         )
@@ -163,6 +173,8 @@ def create_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
     primary: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> ChatOpenAI:
     """Create a ChatOpenAI with automatic fallback chain.
 
@@ -174,13 +186,21 @@ def create_llm(
         max_tokens: Override default max_tokens.
         primary: Override PRIMARY_LLM for this instance (None = use default).
             e.g., "kimi" or "deepseek". Empty string also falls back to default.
+        model: Optional model name override for all providers.
+            When set, replaces the provider's default model from config.
+        reasoning_effort: Optional reasoning effort override.
+            When set, replaces the global REASONING_EFFORT from config.
 
     Returns:
         A ChatOpenAI wrapped with fallback chain.
     """
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
-    registry = _build_model_registry(temp, tokens)
+    registry = _build_model_registry(
+        temp, tokens,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
     primary_name = primary or config.primary_llm
     return _resolve_chain(registry, primary_name)
 
@@ -190,6 +210,8 @@ def create_structured_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
     primary: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ):
     """Create a structured-output LLM with automatic fallback chain.
 
@@ -203,11 +225,19 @@ def create_structured_llm(
         max_tokens: Override default max_tokens.
         primary: Override PRIMARY_LLM for this instance (None = use default).
             e.g., "kimi" or "deepseek". Empty string also falls back to default.
+        model: Optional model name override for all providers.
+            When set, replaces the provider's default model from config.
+        reasoning_effort: Optional reasoning effort override.
+            When set, replaces the global REASONING_EFFORT from config.
     """
     temp = temperature if temperature is not None else config.llm_temperature
     tokens = max_tokens if max_tokens is not None else config.llm_max_tokens
     # Disable thinking/reasoning — conflicts with response_format (json_mode).
-    registry = _build_model_registry(temp, tokens, include_thinking=False)
+    registry = _build_model_registry(
+        temp, tokens, include_thinking=False,
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
 
     # json_mode → response_format={'type': 'json_object'}
     # Schema guidance is included in the system prompt (Pydantic schema dump).

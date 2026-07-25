@@ -707,8 +707,15 @@ def run_loop():
                 config.display_model, mode,
                 config.trading_interval_seconds, config.dry_run)
     if mode == "debate" and config.judge_primary_llm:
-        logger.info("Judge Model: %s (independent from debaters)",
-                    config.judge_primary_llm)
+        judge_model_desc = config.judge_model or (
+            config.kimi_model if config.judge_primary_llm == "kimi"
+            else config.deepseek_model
+        )
+        judge_effort = config.judge_reasoning_effort or config.reasoning_effort
+        logger.info(
+            "Judge: provider=%s model=%s effort=%s",
+            config.judge_primary_llm, judge_model_desc, judge_effort,
+        )
     logger.info("Risk: min_confidence=%.2f | max_position=%.4f BTC | max_leverage=%dx",
                 config.min_confidence, config.max_position_size, config.max_leverage)
     logger.info("=" * 50)
