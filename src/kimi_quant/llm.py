@@ -80,10 +80,18 @@ def _build_model_registry(
         model: Optional model name override for all providers.
             When set, replaces the default model from config.
         reasoning_effort: Optional reasoning effort override for all providers.
-            When set, replaces the global REASONING_EFFORT from config.
+            When set, replaces per-provider and global settings (highest priority).
+            Resolution order: this param > *_REASONING_EFFORT > REASONING_EFFORT.
     """
     registry: dict[str, ChatOpenAI] = {}
-    effort = (reasoning_effort or config.reasoning_effort).lower()
+    # Per-provider effort resolution:
+    #   caller override (Judge) > per-provider env > global REASONING_EFFORT
+    kimi_effort = (
+        reasoning_effort or config.kimi_reasoning_effort or config.reasoning_effort
+    ).lower()
+    ds_effort = (
+        reasoning_effort or config.deepseek_reasoning_effort or config.reasoning_effort
+    ).lower()
 
     # Kimi / Moonshot
     if config.moonshot_api_key:
@@ -104,7 +112,7 @@ def _build_model_registry(
         )
         # Kimi K3: reasoning_effort is a direct API param (only "max" supported).
         # Skip when include_thinking=False — conflicts with response_format.
-        if include_thinking and effort == "max":
+        if include_thinking and kimi_effort == "max":
             kimi_kwargs["reasoning_effort"] = "max"
         registry["kimi"] = ChatOpenAI(**kimi_kwargs)
 
@@ -121,7 +129,7 @@ def _build_model_registry(
         # DeepSeek: thinking control via extra_body (OpenAI SDK passthrough).
         # Skip when include_thinking=False — conflicts with response_format.
         if include_thinking:
-            if effort == "off":
+            if ds_effort == "off":
                 ds_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             else:
                 ds_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}

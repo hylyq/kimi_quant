@@ -228,7 +228,21 @@ JUDGE_REASONING_EFFORT=max        # ...并使用最强推理
 
 ### 推理强度控制
 
-一个 `REASONING_EFFORT` 变量，自动转换为各模型的原生 API 格式：
+三层配置，每层覆盖上一层：
+
+```bash
+# 第一层 — 全局默认（所有模型生效）
+REASONING_EFFORT=max
+
+# 第二层 — 按厂家覆盖（可选，覆盖全局设置，仅对该厂家生效）
+KIMI_REASONING_EFFORT=max       # Kimi 使用最强推理
+DEEPSEEK_REASONING_EFFORT=off   # DeepSeek 关闭推理（省钱）
+
+# 第三层 — Judge 专属覆盖（可选，最高优先级，仅对 Judge 生效）
+JUDGE_REASONING_EFFORT=max      # Judge 始终使用最强推理，不受厂家设置影响
+```
+
+**优先级**（从高到低）：Judge 覆盖 → 厂家专属设置 → 全局 `REASONING_EFFORT`。
 
 ```bash
 REASONING_EFFORT=max      # 最强推理 (默认)
@@ -868,9 +882,11 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `DEEPSEEK_API_KEY` | — | DeepSeek API Key（留空仅用 Kimi） |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | API 端点 |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名称 |
+| `KIMI_REASONING_EFFORT` | (同 `REASONING_EFFORT`) | Kimi 专用推理强度覆盖。留空则使用全局 `REASONING_EFFORT` |
+| `DEEPSEEK_REASONING_EFFORT` | (同 `REASONING_EFFORT`) | DeepSeek 专用推理强度覆盖。留空则使用全局 `REASONING_EFFORT` |
 | **LLM 参数** | | |
 | `PRIMARY_LLM` | `kimi` | 主模型：`kimi` 或 `deepseek` |
-| `REASONING_EFFORT` | `max` | 推理强度：`max`/`high`/`medium`/`low`/`minimal`/`off` |
+| `REASONING_EFFORT` | `max` | 全局默认推理强度：`max`/`high`/`medium`/`low`/`minimal`/`off`。可被厂家或 Judge 专属设置覆盖 |
 | `LLM_TEMPERATURE` | `0.1` | LLM 温度 (0-2)。**注意**：Kimi K3 只支持 1.0，程序自动覆盖 |
 | `LLM_MAX_TOKENS` | `2048` | 最大输出 token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |

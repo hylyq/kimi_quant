@@ -228,7 +228,21 @@ JUDGE_REASONING_EFFORT=max        # ...with maximum reasoning effort
 
 ### Reasoning Effort Control
 
-One `REASONING_EFFORT` variable, auto-converted to each model's native API format:
+Three-tier configuration, each level overrides the one above it:
+
+```bash
+# Tier 1 — Global default (applies to all models)
+REASONING_EFFORT=max
+
+# Tier 2 — Per-provider overrides (optional, overrides global for that provider)
+KIMI_REASONING_EFFORT=max       # Kimi uses max reasoning
+DEEPSEEK_REASONING_EFFORT=off   # DeepSeek disables reasoning (cost savings)
+
+# Tier 3 — Judge-specific override (optional, highest priority for Judge only)
+JUDGE_REASONING_EFFORT=max      # Judge always uses max, regardless of provider settings
+```
+
+**Resolution order** (highest priority first): Judge override → per-provider env → global `REASONING_EFFORT`.
 
 ```bash
 REASONING_EFFORT=max      # Strongest reasoning (default)
@@ -867,9 +881,11 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `DEEPSEEK_API_KEY` | — | DeepSeek API Key (leave blank for Kimi only) |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | API endpoint |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | Model name |
+| `KIMI_REASONING_EFFORT` | (same as `REASONING_EFFORT`) | Per-provider override for Kimi. Leave blank to use `REASONING_EFFORT` |
+| `DEEPSEEK_REASONING_EFFORT` | (same as `REASONING_EFFORT`) | Per-provider override for DeepSeek. Leave blank to use `REASONING_EFFORT` |
 | **LLM Parameters** | | |
 | `PRIMARY_LLM` | `kimi` | Primary model: `kimi` or `deepseek` |
-| `REASONING_EFFORT` | `max` | Reasoning effort: `max`/`high`/`medium`/`low`/`minimal`/`off` |
+| `REASONING_EFFORT` | `max` | Global default reasoning effort: `max`/`high`/`medium`/`low`/`minimal`/`off`. Overridden by per-provider or Judge-specific settings |
 | `LLM_TEMPERATURE` | `0.1` | LLM temperature (0-2). **Note**: Kimi K3 only supports 1.0, auto-overridden |
 | `LLM_MAX_TOKENS` | `2048` | Max output tokens (doesn't affect 1M context input) |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate mode Judge temperature |

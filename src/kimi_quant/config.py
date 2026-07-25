@@ -42,6 +42,12 @@ class Config:
     deepseek_model: str = field(
         default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
     )
+    kimi_reasoning_effort: str = field(
+        default_factory=lambda: os.getenv("KIMI_REASONING_EFFORT", "")
+    )  # "" = use global REASONING_EFFORT; per-provider reasoning override for Kimi
+    deepseek_reasoning_effort: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_REASONING_EFFORT", "")
+    )  # "" = use global REASONING_EFFORT; per-provider reasoning override for DeepSeek
 
     # --- LLM Parameters ---
     primary_llm: str = field(
@@ -50,6 +56,7 @@ class Config:
     reasoning_effort: str = field(
         default_factory=lambda: os.getenv("REASONING_EFFORT", "max")
     )  # "max" | "high" | "medium" | "low" | "minimal" | "off"
+    #   Fallback when per-provider *_REASONING_EFFORT is not set.
     llm_temperature: float = field(
         default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.1"))
     )
@@ -182,6 +189,22 @@ class Config:
         if self.primary_llm not in ("kimi", "deepseek"):
             errors.append(
                 f"PRIMARY_LLM must be 'kimi' or 'deepseek', got '{self.primary_llm}'"
+            )
+        _EFFORT_VALUES = ("max", "high", "medium", "low", "minimal", "off")
+        if self.reasoning_effort not in _EFFORT_VALUES:
+            errors.append(
+                f"REASONING_EFFORT must be one of {_EFFORT_VALUES}, "
+                f"got '{self.reasoning_effort}'"
+            )
+        if self.kimi_reasoning_effort and self.kimi_reasoning_effort not in _EFFORT_VALUES:
+            errors.append(
+                f"KIMI_REASONING_EFFORT must be one of {_EFFORT_VALUES}, "
+                f"got '{self.kimi_reasoning_effort}'"
+            )
+        if self.deepseek_reasoning_effort and self.deepseek_reasoning_effort not in _EFFORT_VALUES:
+            errors.append(
+                f"DEEPSEEK_REASONING_EFFORT must be one of {_EFFORT_VALUES}, "
+                f"got '{self.deepseek_reasoning_effort}'"
             )
         if self.judge_primary_llm and self.judge_primary_llm not in ("kimi", "deepseek"):
             errors.append(
