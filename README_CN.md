@@ -32,6 +32,8 @@
 - 🔄 **WebSocket 实时监控**：订单成交/SL/TP 触发毫秒级感知，Flash 模型生成中文通知
 - 🔧 **CLI 账户工具**：一键查余额/持仓/挂单、切换账户类型、划转资金
 - 📝 **完整记录**：交易盈亏 + 辩论历史 JSONL 持久化，fcntl 文件锁支持并发读写
+- 🌐 **多 IP 故障转移**：请求通过 `CURLOPT_RESOLVE` 钉到可用 CloudFront 边缘 IP（持久化最优优先池），对 Geo DNS 误路由到不可达 CDN 节点（curl 35 RST）完全免疫
+- 💾 **快照磁盘缓存**：`metaAndAssetCtxs` / `l2Book` 数据落盘缓存（1 小时 TTL）；网络全挂时周期降级为使用陈旧数据继续运行，而非整周期失败
 
 ## 目录
 
@@ -1629,7 +1631,7 @@ kimi_quant/
 
 ### Q: 阿里云服务器无法连接 Hyperliquid API？
 
-阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置两层防护：
+阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置四层防护：
 
 **第一层 — TLS 指纹伪装（curl_cffi）**：通过 `tls.py` 共享模块在导入时自动将 Hyperliquid SDK 的 HTTP 客户端替换为 curl_cffi，伪装成 Firefox 147 浏览器的 JA3 TLS 指纹。`data.py` 和 `executor.py` 共用同一套补丁逻辑，避免重复维护。选择 Firefox 而非 Chrome 是因为反爬服务对 Chrome 指纹的检测最严格（Chrome 是最常被仿冒的浏览器），Firefox 的 TLS 密码套件和扩展信号不同，不在重点盯防范围。
 
@@ -1637,6 +1639,14 @@ kimi_quant/
 - **指数退避重试**：遇到 `Connection reset by peer` 等瞬时错误时自动重试（最多 3 次，间隔 1.5s → 3s → 6s + 随机抖动）
 - **并发限制**：并行 API 请求上限从 5 降到 2，避免触发频率封锁
 - **交错提交**：每个并行任务间隔 150ms 提交，避免 TLS 握手瞬时爆量
+
+**第三层 — 多 IP 故障转移（免疫 CloudFront DNS 误路由）**：Hyperliquid API 位于 AWS CloudFront 之后，其 Geo DNS 会间歇性把你的服务器解析到从当前网络路径不可达的边缘节点（TLS 握手阶段整段 RST，可持续数小时，且其他网络下 `curl` 正常）。`tls.py` 通过 `CURLOPT_RESOLVE` 把每个请求钉到可用的边缘 IP：
+- **持久化最优优先池**：最近成功过的 IP 存入 `~/.kimi_quant/hl_ips.json` 并优先使用——即使 DNS 只返回不可达 IP，bot 仍能通过记忆中的可用边缘继续交易
+- **自动故障转移**：网络层错误（SSL/连接/超时）时自动换下一个候选 IP 重试；HTTP 4xx/5xx 永不触发切换
+- **自愈**：成功的 IP 提升到池首并持久化；每 10 分钟重新合并 DNS 答案，让新出现的可用边缘加入候选
+- **线程安全**：并行 fetch 下安全
+
+**第四层 — 快照磁盘缓存兜底**：若所有重试仍失败，`metaAndAssetCtxs` 和 `l2Book` 数据回退到磁盘上最近一次成功副本（`~/.kimi_quant/cache/`，1 小时 TTL）——周期以降级为陈旧数据继续运行，而不是整段失败。日志表现为 `Using stale cached ... (age=Xs)`。
 
 服务器上运行前确保 `curl_cffi` 已安装：
 ```bash

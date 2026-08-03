@@ -32,6 +32,8 @@
 - 🔄 **WebSocket Real-Time Monitoring**: Order fill/SL/TP trigger detection at millisecond level; Flash model generates Chinese notifications
 - 🔧 **CLI Account Tools**: One-click balance/position/order checks, account type switching, fund transfers
 - 📝 **Complete Logging**: Trade P&L + debate history JSONL persistence with fcntl file locking for concurrent read/write
+- 🌐 **Multi-IP Failover**: Requests pinned to working CloudFront edge IPs via `CURLOPT_RESOLVE` with a persisted best-first pool — immune to Geo-DNS misrouting to unreachable CDN edges (curl 35 RSTs)
+- 💾 **Snapshot Disk Cache**: `metaAndAssetCtxs` / `l2Book` payloads disk-cached (1h TTL); a full network outage degrades the cycle to stale data instead of failing it
 
 ## Table of Contents
 
@@ -1628,7 +1630,7 @@ kimi_quant/
 
 ### Q: Can't connect to Hyperliquid API from Alibaba Cloud?
 
-Alibaba Cloud egress gateways perform TLS fingerprint inspection on Python's default SSL library and Reset connections (curl command line works but Python throws `ConnectionResetError` or `SSLError: curl: (35) Recv failure`). This project has built-in two-layer protection:
+Alibaba Cloud egress gateways perform TLS fingerprint inspection on Python's default SSL library and Reset connections (curl command line works but Python throws `ConnectionResetError` or `SSLError: curl: (35) Recv failure`). This project has built-in four-layer protection:
 
 **Layer 1 — TLS Fingerprint Spoofing (curl_cffi)**: The `tls.py` shared module auto-patches Hyperliquid SDK's HTTP client with curl_cffi at import time, impersonating Firefox 147's JA3 TLS fingerprint. `data.py` and `executor.py` share the same patch logic, avoiding duplicate maintenance. Firefox is chosen over Chrome because anti-bot services most aggressively detect Chrome fingerprints (the most commonly impersonated browser); Firefox's TLS cipher suites and extension signals differ and aren't in the primary surveillance scope.
 
@@ -1636,6 +1638,14 @@ Alibaba Cloud egress gateways perform TLS fingerprint inspection on Python's def
 - **Exponential backoff retry**: Auto-retry on transient errors like `Connection reset by peer` (max 3 retries, intervals 1.5s → 3s → 6s + random jitter)
 - **Concurrency limit**: Parallel API request cap reduced from 5 to 2, avoiding frequency-triggered blocks
 - **Staggered submission**: Each parallel task spaced 150ms apart to avoid TLS handshake bursts
+
+**Layer 3 — Multi-IP Failover (CloudFront DNS routing immunity)**: Hyperliquid's API sits behind AWS CloudFront, whose Geo DNS can intermittently route your server to edge IPs that are unreachable from your network path — blanket TCP RSTs during the TLS handshake that can persist for hours while `curl` works fine from other networks. `tls.py` pins each request to a working edge IP via `CURLOPT_RESOLVE`:
+- **Persisted best-first pool**: The last-known-good IPs are stored in `~/.kimi_quant/hl_ips.json` and tried first — even when DNS returns only unreachable IPs, the bot keeps trading through the remembered working edge
+- **Auto failover**: On a network-level error (SSL/connect/timeout) the request is retried against the next candidate; HTTP 4xx/5xx never trigger failover
+- **Self-healing**: Successful IPs are promoted to the front of the pool and persisted; DNS answers are re-merged every 10 minutes so newly-valid edges can join
+- **Thread-safe**: Safe under the parallel fetch workers
+
+**Layer 4 — Snapshot Disk Cache**: If every retry still fails, `metaAndAssetCtxs` and `l2Book` payloads fall back to the last successful copy on disk (`~/.kimi_quant/cache/`, 1h TTL) — the cycle continues on stale-but-recent data instead of failing outright. Logged as `Using stale cached ... (age=Xs)`.
 
 Ensure `curl_cffi` is installed before running on server:
 ```bash
