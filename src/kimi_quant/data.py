@@ -8,12 +8,14 @@ Provides structured market data for the LLM to analyze:
   - Account position state
 """
 
+import json
 import logging
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from hyperliquid.info import Info
@@ -96,6 +98,74 @@ def retry_api_call(
     # Should be unreachable — retries exhausted on transient errors
     assert last_error is not None
     raise last_error
+
+
+# ─── Snapshot Disk Cache ────────────────────────────────────────────────
+
+# Where stale-but-usable snapshot payloads live when the network path is down
+# (see tls.py — CloudFront may route to an unreachable edge IP for extended
+# periods). Mirrors the directory layout of the IP seed file in tls.py.
+_CACHE_DIR = Path.home() / ".kimi_quant" / "cache"
+_SNAPSHOT_MAX_AGE = 3600  # 1h — refuse to trade on older data
+
+
+class _SnapshotCache:
+    """Disk-cache fail-safe for a single snapshot payload.
+
+    Wraps a fetch callable: on success the payload is written to disk; on
+    failure a recent cached copy (default max_age 1h) is returned instead, so
+    a network outage degrades the cycle to stale data rather than failing it
+    outright. If no cache exists yet, the original error propagates.
+    """
+
+    def __init__(self, key: str, max_age: float = _SNAPSHOT_MAX_AGE):
+        self.key = key
+        self.max_age = max_age
+        self._mem: tuple[float, Any] | None = None
+        self._path = _CACHE_DIR / f"{key}.json"
+
+    def fetch(self, fn: Callable[[], Any]) -> Any:
+        try:
+            data = fn()
+        except Exception as e:
+            stale = self._load()
+            if stale is not None:
+                age = time.time() - stale[0]
+                logger.warning(
+                    "Using stale cached %s (age=%.0fs) after error: %s",
+                    self.key, age, e,
+                )
+                return stale[1]
+            raise
+        self._save(time.time(), data)
+        return data
+
+    def _save(self, ts: float, data: Any) -> None:
+        try:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps({"ts": ts, "data": data}))
+            self._mem = (ts, data)
+        except Exception as e:
+            logger.debug("snapshot cache write failed (%s): %s", self.key, e)
+
+    def _load(self) -> tuple[float, Any] | None:
+        if self._mem is not None:
+            return self._mem
+        try:
+            payload = json.loads(self._path.read_text())
+            ts = float(payload["ts"])
+            if time.time() - ts > self.max_age:
+                logger.warning(
+                    "%s cache expired (age > %.0fs)", self.key, self.max_age
+                )
+                return None
+            self._mem = (ts, payload["data"])
+            return self._mem
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.debug("snapshot cache read failed (%s): %s", self.key, e)
+            return None
 
 
 # ─── Time Context ───────────────────────────────────────────────────────
@@ -506,6 +576,9 @@ class DataProvider:
         self._candle_cache: dict[str, tuple[float, list[dict]]] = {}
         # Previous cycle snapshot for cycle-over-cycle diff
         self._previous_snapshot: dict[str, Any] = {}
+        # Disk-cache fail-safes for critical snapshot payloads
+        self._meta_ctx_cache = _SnapshotCache("meta_asset_ctxs")
+        self._l2_cache = _SnapshotCache(f"l2_book_{self.coin.lower()}")
 
         logger.info(
             "DataProvider initialized (testnet=%s, coin=%s, curl_cffi=%s)",
@@ -523,9 +596,11 @@ class DataProvider:
         mark/oracle/OI). Uses meta_and_asset_ctxs() for full field coverage.
         """
         info = self._info_mainnet
-        meta, asset_ctxs = retry_api_call(
-            lambda: info.meta_and_asset_ctxs(),
-            description="meta_and_asset_ctxs",
+        meta, asset_ctxs = self._meta_ctx_cache.fetch(
+            lambda: retry_api_call(
+                lambda: info.meta_and_asset_ctxs(),
+                description="meta_and_asset_ctxs",
+            )
         )
 
         # Find BTC in both universe (for name lookup) and asset contexts
@@ -546,9 +621,11 @@ class DataProvider:
         prev_day_px = float(coin_ctx.get("prevDayPx", 0))
         premium = float(coin_ctx.get("premium", 0))
 
-        l2 = retry_api_call(
-            lambda: info.l2_snapshot(self.coin),
-            description="l2_snapshot",
+        l2 = self._l2_cache.fetch(
+            lambda: retry_api_call(
+                lambda: info.l2_snapshot(self.coin),
+                description="l2_snapshot",
+            )
         )
         bid_price = float(l2["levels"][0][0]["px"]) if l2["levels"][0] else 0
         ask_price = float(l2["levels"][1][0]["px"]) if l2["levels"][1] else 0
@@ -587,9 +664,11 @@ class DataProvider:
         Always uses mainnet (testnet order books are too thin to analyze).
         """
         info = self._info_mainnet
-        l2 = retry_api_call(
-            lambda: info.l2_snapshot(self.coin),
-            description="l2_snapshot (order_book)",
+        l2 = self._l2_cache.fetch(
+            lambda: retry_api_call(
+                lambda: info.l2_snapshot(self.coin),
+                description="l2_snapshot (order_book)",
+            )
         )
 
         bids = []
