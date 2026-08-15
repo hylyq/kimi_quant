@@ -829,10 +829,13 @@ Ctrl+B, D
 tmux attach -t kimi
 ```
 
-### Background (systemd)
+### Run in Background (systemd)
 
 ```bash
-# Create service file
+# 1. Deploy a copy of the repo to a fixed path, then adjust the paths below
+#    cp -r /path/to/kimi_quant ~/kimi_quant && cd ~/kimi_quant && uv sync
+
+# 2. Create the service file — replace <user> with YOUR Linux username
 sudo tee /etc/systemd/system/kimi-quant.service << 'EOF'
 [Unit]
 Description=Kimi Quant Trading Bot
@@ -841,12 +844,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=marvin
-WorkingDirectory=/home/marvin/playground/kimi_quant
-EnvironmentFile=/home/marvin/playground/kimi_quant/.env
-ExecStart=/home/marvin/playground/kimi_quant/.venv/bin/kimi-quant --interval 300
+User=<user>
+WorkingDirectory=/home/<user>/kimi_quant
+# The bot loads .env itself (python-dotenv) — EnvironmentFile is optional.
+# If you keep it, the file must have NO trailing comments (# ...): systemd
+# does not strip them and config values (e.g. float parsing) would break.
+# EnvironmentFile=/home/<user>/kimi_quant/.env
+ExecStart=/home/<user>/kimi_quant/.venv/bin/kimi-quant --interval 300
 Restart=on-failure
 RestartSec=30
+# A debate-mode cycle can exceed the default 90s graceful-stop timeout —
+# raise it so shutdown finishes cleanly instead of being SIGKILLed.
+TimeoutStopSec=180
+# Stream logs to journald immediately (visible via journalctl -f)
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
@@ -859,14 +870,19 @@ sudo systemctl enable --now kimi-quant
 journalctl -u kimi-quant -f
 ```
 
+Notes:
+- Replace `<user>` with your actual Linux username and point the paths at your deployment directory (e.g. `~/projects/kimi_quant`).
+- The bot persists state under `~/.kimi_quant/` (IP seed file + snapshot cache). If you harden the unit (`ProtectHome=` / `ProtectSystem=strict`), whitelist that path with `ReadWritePaths=` or the cache / IP-failover features will silently stop persisting.
+- Per-service overrides (e.g. `NoNewPrivileges=true`): `sudo systemctl edit kimi-quant`
+
 ### Health Monitoring
 
 ```bash
 # Set up periodic alerts (crontab)
 */10 * * * * cd /path/to/kimi_quant && uv run kimi-quant --stats 2>&1 | grep -q "Net P&L.*-[5-9][0-9]" && notify-send "Kimi Quant: Large drawdown warning"
 
-# Check if process is alive
-pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
+# Check if the service is alive
+systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 ```
 
 ## Configuration Reference

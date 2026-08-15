@@ -459,7 +459,6 @@ Redis 配置（可选，默认 localhost:6379）：
   REDIS_PORT=6379
   REDIS_DB=0
 ```
-```
 
 程序启动时自动 ping Redis，连通即走通知通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
 
@@ -833,7 +832,10 @@ tmux attach -t kimi
 ### 后台运行 (systemd)
 
 ```bash
-# 创建 service 文件
+# 1. 把项目部署到固定路径，然后按需调整下面所有路径
+#    cp -r /path/to/kimi_quant ~/kimi_quant && cd ~/kimi_quant && uv sync
+
+# 2. 创建 service 文件——把 <user> 替换成你自己的 Linux 用户名
 sudo tee /etc/systemd/system/kimi-quant.service << 'EOF'
 [Unit]
 Description=Kimi Quant Trading Bot
@@ -842,12 +844,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=marvin
-WorkingDirectory=/home/marvin/playground/kimi_quant
-EnvironmentFile=/home/marvin/playground/kimi_quant/.env
-ExecStart=/home/marvin/playground/kimi_quant/.venv/bin/kimi-quant --interval 300
+User=<user>
+WorkingDirectory=/home/<user>/kimi_quant
+# 机器人会自己加载 .env（python-dotenv），EnvironmentFile 可省略。
+# 若要保留，文件里不能有行尾注释（# ...）：systemd 不会去掉行尾注释，
+# 配置值（如 float 解析）会解析失败。
+# EnvironmentFile=/home/<user>/kimi_quant/.env
+ExecStart=/home/<user>/kimi_quant/.venv/bin/kimi-quant --interval 300
 Restart=on-failure
 RestartSec=30
+# debate 模式一个完整周期可能超过默认 90 秒的优雅停机超时——
+# 调大它，让停机干净完成而不是被 SIGKILL 强杀。
+TimeoutStopSec=180
+# 日志立即写入 journald（journalctl -f 实时可见）
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
@@ -860,14 +870,19 @@ sudo systemctl enable --now kimi-quant
 journalctl -u kimi-quant -f
 ```
 
+注意事项：
+- 把 `<user>` 替换成你的实际 Linux 用户名，路径指向你的部署目录（例如 `~/projects/kimi_quant`）。
+- 机器人会把状态持久化到 `~/.kimi_quant/`（IP 种子文件 + 快照缓存）。如果对 unit 做安全加固（`ProtectHome=` / `ProtectSystem=strict`），需用 `ReadWritePaths=` 放行该路径，否则缓存 / IP 故障转移功能会静默失效。
+- 按服务覆盖配置（例如 `NoNewPrivileges=true`）：`sudo systemctl edit kimi-quant`
+
 ### 健康监控
 
 ```bash
 # 设置定时告警（crontab）
 */10 * * * * cd /path/to/kimi_quant && uv run kimi-quant --stats 2>&1 | grep -q "Net P&L.*-[5-9][0-9]" && notify-send "Kimi Quant: 大幅回撤警告"
 
-# 检查进程是否存活
-pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
+# 检查服务是否存活
+systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 ```
 
 ## 配置参考
