@@ -1282,21 +1282,6 @@ def cmd_status():
     if mid_price > 0:
         print(f"  {coin} Mid Price:  ${mid_price:,.2f}")
 
-    # Try to get 24h change from metadata
-    try:
-        from kimi_quant.data import retry_api_call as _retry
-        meta = _retry(
-            lambda: info.meta_and_asset_ctxs(),
-            description="meta",
-        )
-        for m in meta[0] if isinstance(meta, tuple) else meta:
-            if isinstance(m, dict) and m.get("name") == coin:
-                day_change = float(m.get("dayNtlVlm", 0))
-                break
-        # Actually, let's get proper 24h change from the market data
-    except Exception:
-        pass
-
     # Show funding rate if available
     try:
         from kimi_quant.data import DataProvider
