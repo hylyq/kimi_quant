@@ -258,21 +258,24 @@ class OrderMonitor:
         """Callback for orderUpdates subscription."""
         try:
             logger.debug("WS orderUpdate raw: %s", data)
-            event = self._parse_order_update(data)
-            if event and event.is_significant:
-                # Sync to PositionTracker first (so LLM sees latest state)
-                self._sync_to_tracker(event)
-                self._enqueue(event)
+            events = self._parse_order_update(data)
+            for event in events:
+                if event and event.is_significant:
+                    # Sync to PositionTracker first (so LLM sees latest state)
+                    self._sync_to_tracker(event)
+                    self._enqueue(event)
+                    logger.debug(
+                        "Order update: type=%s oid=%s status=%s fill=%.4f/%.4f",
+                        event.event_type,
+                        event.order_id,
+                        event.status,
+                        event.filled_size,
+                        event.total_size,
+                    )
+            if not events:
                 logger.debug(
-                    "Order update: type=%s oid=%s status=%s fill=%.4f/%.4f",
-                    event.event_type,
-                    event.order_id,
-                    event.status,
-                    event.filled_size,
-                    event.total_size,
+                    "WS orderUpdate parsed to empty (non-significant or unknown format)"
                 )
-            elif event is None:
-                logger.debug("WS orderUpdate parsed to None (non-significant or unknown format)")
         except Exception:
             logger.error("Failed to parse order update: %s", data, exc_info=True)
 
@@ -280,19 +283,22 @@ class OrderMonitor:
         """Callback for userFills subscription."""
         try:
             logger.debug("WS userFills raw: %s", data)
-            event = self._parse_fill_update(data)
-            if event and event.is_significant:
-                self._sync_to_tracker(event)
-                self._enqueue(event)
+            events = self._parse_fill_update(data)
+            for event in events:
+                if event and event.is_significant:
+                    self._sync_to_tracker(event)
+                    self._enqueue(event)
+                    logger.debug(
+                        "Fill update: oid=%s side=%s px=%.1f sz=%.4f",
+                        event.order_id,
+                        event.side,
+                        event.fill_price,
+                        event.filled_size,
+                    )
+            if not events:
                 logger.debug(
-                    "Fill update: oid=%s side=%s px=%.1f sz=%.4f",
-                    event.order_id,
-                    event.side,
-                    event.fill_price,
-                    event.filled_size,
+                    "WS userFills parsed to empty (non-significant or unknown format)"
                 )
-            elif event is None:
-                logger.debug("WS userFills parsed to None (non-significant or unknown format)")
         except Exception:
             logger.error("Failed to parse fill update: %s", data, exc_info=True)
 
@@ -320,20 +326,24 @@ class OrderMonitor:
 
     # ─── Parsing ─────────────────────────────────────────────────────────
 
-    def _parse_order_update(self, data: Any) -> OrderEvent | None:
-        """Normalize a raw orderUpdate payload into an OrderEvent.
+    def _parse_order_update(self, data: Any) -> list[OrderEvent]:
+        """Normalize a raw orderUpdate payload into a list of OrderEvents.
 
         Hyperliquid orderUpdates contain one or more order status entries.
         Each entry has: order -> {oid, coin, side, sz, limitPx, orderType},
         status (e.g. "filled", "open", "canceled", "rejected"), and
         statusTimestamp.
+
+        The WebSocket frequently batches MULTIPLE order updates in one
+        message — ALL of them are returned (a single return on the first
+        entry would silently drop the rest, e.g. a flip's CLOSE+SHORT fills).
         """
         if not isinstance(data, dict):
-            return None
+            return []
 
         # Sentinel check
         if data.get("_sentinel"):
-            return None
+            return []
 
         # The WebSocket may batch multiple updates in a list under 'data'
         # or send single-order dicts directly.
@@ -343,6 +353,7 @@ class OrderMonitor:
         else:
             entries = [data]
 
+        events: list[OrderEvent] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -357,16 +368,22 @@ class OrderMonitor:
             # Determine event type from status
             event_type = EventType.UNKNOWN
             filled_sz = 0.0
+            total_sz = sz
+            remaining_sz = sz
 
             if status == "filled":
                 event_type = EventType.ORDER_FILLED
                 filled_sz = sz  # fully filled
+                remaining_sz = 0.0
             elif status == "open":
-                # Check if partial fill
+                # Check if partial fill: sz is the REMAINING size, origSz
+                # is the original order size → filled = origSz - sz.
                 orig_sz = float(order.get("origSz") or sz)
                 if orig_sz > sz > 0:
                     event_type = EventType.ORDER_PARTIAL
                     filled_sz = orig_sz - sz
+                    total_sz = orig_sz  # total is the ORIGINAL size, not remaining
+                    remaining_sz = sz
                 else:
                     # Just an open order — not significant enough to report
                     continue
@@ -377,34 +394,37 @@ class OrderMonitor:
             else:
                 continue
 
-            return OrderEvent(
+            events.append(OrderEvent(
                 event_type=event_type,
                 coin=coin,
                 side=side,
                 order_id=int(oid) if oid is not None else None,
                 order_type=str(order.get("orderType", "")),
                 filled_size=filled_sz,
-                total_size=sz if filled_sz > 0 else sz,
+                total_size=total_sz,
                 fill_price=float(order.get("limitPx") or 0),
-                remaining_size=sz,
+                remaining_size=remaining_sz,
                 status=status,
                 raw=entry,
-            )
+            ))
 
-        return None
+        return events
 
-    def _parse_fill_update(self, data: Any) -> OrderEvent | None:
-        """Normalize a raw userFills payload into an OrderEvent.
+    def _parse_fill_update(self, data: Any) -> list[OrderEvent]:
+        """Normalize a raw userFills payload into a list of OrderEvents.
 
         Hyperliquid userFills contain fill details: oid, coin, px, sz, side.
         These are more detailed than orderUpdates — they have the exact fill
         price and size for each individual fill.
+
+        The subscription delivers a batch of fills per message — all of them
+        are returned so none are dropped.
         """
         if not isinstance(data, dict):
-            return None
+            return []
 
         if data.get("_sentinel"):
-            return None
+            return []
 
         entries: list[dict] = []
         if "data" in data and isinstance(data["data"], list):
@@ -412,6 +432,7 @@ class OrderMonitor:
         else:
             entries = [data]
 
+        events: list[OrderEvent] = []
         for entry in entries:
             if not isinstance(entry, dict) or "coin" not in entry:
                 continue
@@ -422,7 +443,7 @@ class OrderMonitor:
             side = "buy" if entry.get("side", "") == "B" else "sell"
             coin = entry.get("coin", "")
 
-            return OrderEvent(
+            events.append(OrderEvent(
                 event_type=EventType.ORDER_FILLED,
                 coin=coin,
                 side=side,
@@ -434,9 +455,9 @@ class OrderMonitor:
                 remaining_size=0.0,
                 status="filled",
                 raw=entry,
-            )
+            ))
 
-        return None
+        return events
 
 
 # ─── Flash Reporter ─────────────────────────────────────────────────────────
@@ -495,11 +516,15 @@ def _classify_fill(oid: int | None, tracker: Any = None) -> str:
     if oid is None or tracker is None:
         return "unknown"
     try:
-        if oid == tracker.entry_oid:
+        with tracker._lock:  # noqa: SLF001 — read tracker state atomically
+            entry_oid = tracker.entry_oid
+            sl_oid = tracker.sl_oid
+            tp_oid = tracker.tp_oid
+        if oid == entry_oid:
             return "entry"
-        if oid == tracker.sl_oid:
+        if oid == sl_oid:
             return "stop_loss"
-        if oid == tracker.tp_oid:
+        if oid == tp_oid:
             return "take_profit"
     except Exception:
         pass
