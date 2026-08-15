@@ -50,6 +50,64 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 
+# ─── Fail-safe: Unknown Account State ──────────────────────────────────────
+# CRITICAL: in live mode, account=None is NOT the same as "no position".
+# get_account_snapshot() returns None on API failure, and treating that as
+# "position gone" would clear the tracker (sync Case 3) — the bot would then
+# believe it is flat and could open a new position ON TOP of the real one.
+# When account state is unknown we pause the whole cycle.
+
+_account_outage_since: float | None = None
+_ACCOUNT_OUTAGE_NOTIFY_INTERVAL = 900  # seconds — don't spam during outages
+
+_last_sl_missing_notify: float = 0.0
+_SL_MISSING_NOTIFY_INTERVAL = 900  # seconds
+
+
+def _fail_safe_account_unavailable() -> dict:
+    """Return a skipped-cycle result when account state is unknown in live mode.
+
+    Without position state we cannot safely sync the tracker or validate
+    signals. Trading is paused until the account API recovers.
+    """
+    global _account_outage_since
+    now = time.monotonic()
+    if _account_outage_since is None or (
+        now - _account_outage_since >= _ACCOUNT_OUTAGE_NOTIFY_INTERVAL
+    ):
+        _account_outage_since = now
+        notify.send(
+            "⚠️ Account state unavailable (Hyperliquid API failure)\n"
+            "Trading cycles paused for safety until account data recovers."
+        )
+    logger.critical(
+        "Account state UNAVAILABLE — skipping cycle (fail-safe). "
+        "No trading while position state is unknown."
+    )
+    return {
+        "status": "skipped",
+        "reason": "Account state unavailable (API failure)",
+    }
+
+
+def _account_ok() -> None:
+    """Reset the outage notifier once account data is available again."""
+    global _account_outage_since
+    _account_outage_since = None
+
+
+def _notify_sl_missing() -> None:
+    """Notify about a missing stop loss, throttled (avoid notification spam)."""
+    global _last_sl_missing_notify
+    now = time.monotonic()
+    if now - _last_sl_missing_notify >= _SL_MISSING_NOTIFY_INTERVAL:
+        _last_sl_missing_notify = now
+        notify.send(
+            "⚠️ Stop Loss order missing from exchange\n"
+            "Position is unprotected. LLM will attempt to restore."
+        )
+
+
 # ─── Last-Cycle Feedback ────────────────────────────────────────────────────
 
 
@@ -97,24 +155,36 @@ def _build_last_cycle_feedback(prev: dict | None) -> str:
     return "\n".join(lines)
 
 
-# ─── Single-Agent Strategy ──────────────────────────────────────────────────
+# ─── Shared: Cycle Report Preparation ───────────────────────────────────────
 
 
-def run_once_single(
-    llm: KimiLLM,
+class _AccountStateUnavailable(Exception):
+    """Internal: live mode could not fetch account state — cycle must skip.
+
+    Raised by _prepare_cycle_report; the caller converts it into a
+    fail-safe 'skipped' result via _fail_safe_account_unavailable().
+    """
+
+
+def _prepare_cycle_report(
     data: DataProvider,
-    risk: RiskManager,
     executor: TradeExecutor,
     trade_logger: TradeLogger,
-    last_cycle: dict | None = None,
+    risk: RiskManager,
+    report: dict,
+    last_cycle: dict | None,
 ) -> dict:
-    """Single-agent analysis → risk check → execute."""
-    logger.info("=" * 50)
-    logger.info("Starting trading cycle [mode: single-agent]")
+    """Log market/account state and inject every LLM context section.
 
-    logger.info("Fetching market data...")
-    report = data.get_full_report(address=executor.address)
+    Shared by the single-agent and debate strategies so both decision-makers
+    see identical context: performance, lessons, open orders, SL/TP status,
+    risk constraints, position memory, cycle-over-cycle diff and last-cycle
+    feedback.
 
+    Raises _AccountStateUnavailable when live mode cannot fetch account
+    state — trading on unknown position state is unsafe, so the cycle must
+    be skipped (see run_once_* callers).
+    """
     market = report.get("market")
     if market:
         logger.info(
@@ -135,6 +205,13 @@ def run_once_single(
     else:
         logger.warning("Account: NOT AVAILABLE (API error)")
 
+    # Fail-safe: in live mode, unknown account state means we cannot safely
+    # sync the tracker or validate signals — pause the cycle. A transient
+    # API failure must never be interpreted as "position gone".
+    if not config.dry_run and account is None:
+        raise _AccountStateUnavailable()
+    _account_ok()
+
     # Inject performance context for LLM self-reflection
     perf_ctx = trade_logger.get_llm_context()
     if perf_ctx:
@@ -145,29 +222,26 @@ def run_once_single(
     if lessons_ctx:
         report["lessons_context"] = lessons_ctx
 
-    # Inject open orders so LLM knows existing SL/TP levels
+    # Inject open orders so the decision-maker knows existing SL/TP levels
     orders_summary = executor.tracker.to_orders_summary()
     if orders_summary:
         report["open_orders_summary"] = orders_summary
 
-    # Verify tracked SL/TP orders exist on chain BEFORE LLM analysis
-    # so the LLM prompt includes any missing-order warnings
+    # Verify tracked SL/TP orders exist on chain BEFORE analysis
+    # so the prompt includes any missing-order warnings
     sl_tp_status = {"sl_missing": False, "tp_missing": False}
     if executor.tracker.has_position():
         open_orders_raw = report.get("open_orders_raw", [])
         sl_tp_status = executor.verify_tracked_orders(open_orders_raw)
         if sl_tp_status["sl_missing"]:
-            notify.send(
-                "⚠️ Stop Loss order missing from exchange\n"
-                "Position is unprotected. LLM will attempt to restore."
-            )
+            _notify_sl_missing()
         if sl_tp_status["tp_missing"]:
-            logger.warning("TP order missing from exchange — LLM will be notified")
+            logger.warning("TP order missing from exchange — decision-maker will be notified")
     report["sl_tp_status"] = sl_tp_status
 
-    # Inject risk constraints BEFORE LLM analysis so it knows the hard limits.
-    # This prevents wasted cycles where the LLM proposes a trade that would
-    # be rejected by risk checks — e.g. violating margin budget, risk cap,
+    # Inject risk constraints BEFORE analysis so the decision-maker knows
+    # the hard limits. This prevents wasted cycles where a signal would be
+    # rejected by risk checks — e.g. violating margin budget, risk cap,
     # or proposing a new position while circuit breaker is active.
     mid_price = market.mid_price if market else 0.0
     account_balance = account.available_balance if account else None
@@ -179,19 +253,47 @@ def run_once_single(
     )
     report["risk_context"] = risk_context
 
-    # Inject position memory so LLM can validate entry thesis (Step 0)
+    # Inject position memory so the decision-maker can validate entry thesis (Step 0)
     if executor.tracker.has_position() and account:
         report["position_memory"] = executor.tracker.to_position_memory(
             unrealized_pnl=account.unrealized_pnl
         )
 
-    # Inject cycle-over-cycle diff so LLM sees what changed
+    # Inject cycle-over-cycle diff so the decision-maker sees what changed
     data.inject_cycle_diff(report)
 
     # Inject last-cycle feedback for decision→outcome loop
     fb = _build_last_cycle_feedback(last_cycle)
     if fb:
         report["last_cycle_feedback"] = fb
+
+    return report
+
+
+# ─── Single-Agent Strategy ──────────────────────────────────────────────────
+
+
+def run_once_single(
+    llm: KimiLLM,
+    data: DataProvider,
+    risk: RiskManager,
+    executor: TradeExecutor,
+    trade_logger: TradeLogger,
+    last_cycle: dict | None = None,
+) -> dict:
+    """Single-agent analysis → risk check → execute."""
+    logger.info("=" * 50)
+    logger.info("Starting trading cycle [mode: single-agent]")
+
+    logger.info("Fetching market data...")
+    report = data.get_full_report(address=executor.address)
+
+    try:
+        report = _prepare_cycle_report(
+            data, executor, trade_logger, risk, report, last_cycle
+        )
+    except _AccountStateUnavailable:
+        return _fail_safe_account_unavailable()
 
     logger.info("Requesting single-agent LLM analysis...")
     signal_result = llm.analyze(report)
@@ -228,82 +330,12 @@ def run_once_debate(
     logger.info("Fetching market data...")
     report = data.get_full_report(address=executor.address)
 
-    market = report.get("market")
-    if market:
-        logger.info(
-            "%s mid=%.1f | spread=%.1f(%.4f%%) | funding=%.4f%% | 24h=%.2f%%",
-            config.trading_pair,
-            market.mid_price,
-            market.spread,
-            market.spread_pct,
-            market.funding_rate * 100,
-            market.day_change_pct,
+    try:
+        report = _prepare_cycle_report(
+            data, executor, trade_logger, risk, report, last_cycle
         )
-
-    account = report.get("account")
-    if account:
-        logger.info("Account: %s", account.to_summary())
-    elif config.dry_run:
-        logger.info("Account: NOT AVAILABLE (dry-run — simulation only)")
-    else:
-        logger.warning("Account: NOT AVAILABLE (API error)")
-
-    # Inject performance context
-    perf_ctx = trade_logger.get_llm_context()
-    if perf_ctx:
-        report["performance_context"] = perf_ctx
-
-    # Inject lessons learned from past trades
-    lessons_ctx = trade_logger.get_lessons_context()
-    if lessons_ctx:
-        report["lessons_context"] = lessons_ctx
-
-    # Inject open orders so debaters know existing SL/TP levels
-    orders_summary = executor.tracker.to_orders_summary()
-    if orders_summary:
-        report["open_orders_summary"] = orders_summary
-
-    # Verify tracked SL/TP orders exist on chain BEFORE debate
-    # so the debaters and judge see any missing-order warnings
-    sl_tp_status = {"sl_missing": False, "tp_missing": False}
-    if executor.tracker.has_position():
-        open_orders_raw = report.get("open_orders_raw", [])
-        sl_tp_status = executor.verify_tracked_orders(open_orders_raw)
-        if sl_tp_status["sl_missing"]:
-            notify.send(
-                "⚠️ Stop Loss order missing from exchange\n"
-                "Position is unprotected. Debate will attempt to restore."
-            )
-        if sl_tp_status["tp_missing"]:
-            logger.warning("TP order missing from exchange — debate will be notified")
-    report["sl_tp_status"] = sl_tp_status
-
-    # Inject risk constraints BEFORE debate so agents know the hard limits.
-    # This prevents wasted cycles where the debate produces a signal that
-    # would be rejected by risk checks.
-    mid_price = market.mid_price if market else 0.0
-    account_balance = account.available_balance if account else None
-    current_side = account.position_side if account else "none"
-    risk_context = risk.get_risk_context(
-        mid_price=mid_price,
-        account_balance=account_balance,
-        current_side=current_side,
-    )
-    report["risk_context"] = risk_context
-
-    # Inject position memory so debaters and Judge can validate entry thesis (Step 0)
-    if executor.tracker.has_position() and account:
-        report["position_memory"] = executor.tracker.to_position_memory(
-            unrealized_pnl=account.unrealized_pnl
-        )
-
-    # Inject cycle-over-cycle diff so debaters and Judge see what changed
-    data.inject_cycle_diff(report)
-
-    # Inject last-cycle feedback for decision→outcome loop
-    fb = _build_last_cycle_feedback(last_cycle)
-    if fb:
-        report["last_cycle_feedback"] = fb
+    except _AccountStateUnavailable:
+        return _fail_safe_account_unavailable()
 
     logger.info("Launching multi-agent debate...")
     signal_result, transcript = strategy.analyze_sync(report)
@@ -382,8 +414,23 @@ def _validate_and_execute(
     tracker_entry_before_sync = executor.tracker.entry_price
     tracker_side_before_sync = executor.tracker.side
 
-    # Use the smart sync: handles resting→active, active→gone, recovery
-    executor.sync_with_chain(current_side, current_size, chain_entry)
+    # Use the smart sync: handles resting→active, active→gone, recovery.
+    # CRITICAL: only sync when chain state is actually known. In live mode,
+    # account=None (API failure) must NOT be interpreted as "position gone" —
+    # that would clear the tracker and let a new entry double the real
+    # position (run_once_* already skips the cycle in that case; this guard
+    # is defense in depth). In dry-run there is no chain — the tracker is
+    # the source of truth, so sync is skipped entirely and positions persist
+    # until an explicit CLOSE signal.
+    account_known = not config.dry_run and account is not None
+    executor.sync_with_chain(
+        current_side, current_size, chain_entry, account_known=account_known
+    )
+    if not account_known:
+        logger.debug(
+            "Skipping chain sync (dry_run=%s, account_known=%s)",
+            config.dry_run, account is not None,
+        )
 
     # If a resting limit order timed out and was cancelled, clean up the trade log
     if tracker_was_resting and not executor.tracker.has_resting_order() \
