@@ -91,6 +91,9 @@ class Config:
     max_leverage: int = field(
         default_factory=lambda: int(os.getenv("MAX_LEVERAGE", "3"))
     )
+    min_sl_distance: float = field(
+        default_factory=lambda: float(os.getenv("MIN_SL_DISTANCE", "0.005"))
+    )  # minimum stop-loss distance from entry, as fraction of price (0.5%)
 
     # --- Strategy ---
     strategy_mode: str = field(
@@ -196,10 +199,13 @@ class Config:
                 f"REASONING_EFFORT must be one of {_EFFORT_VALUES}, "
                 f"got '{self.reasoning_effort}'"
             )
-        if self.kimi_reasoning_effort and self.kimi_reasoning_effort not in _EFFORT_VALUES:
+        if self.kimi_reasoning_effort and self.kimi_reasoning_effort not in (
+            "max", "off",
+        ):
             errors.append(
-                f"KIMI_REASONING_EFFORT must be one of {_EFFORT_VALUES}, "
-                f"got '{self.kimi_reasoning_effort}'"
+                f"KIMI_REASONING_EFFORT must be 'max' or 'off' (Kimi K3 only "
+                f"supports reasoning_effort=max; other values are silently "
+                f"ignored by the API), got '{self.kimi_reasoning_effort}'"
             )
         if self.deepseek_reasoning_effort and self.deepseek_reasoning_effort not in _EFFORT_VALUES:
             errors.append(
@@ -242,6 +248,10 @@ class Config:
             errors.append(f"MAX_LEVERAGE must be > 0, got {self.max_leverage}")
         if self.max_position_size <= 0:
             errors.append(f"MAX_POSITION_SIZE must be > 0, got {self.max_position_size}")
+        if self.min_sl_distance <= 0 or self.min_sl_distance >= 0.5:
+            errors.append(
+                f"MIN_SL_DISTANCE must be in (0, 0.5), got {self.min_sl_distance}"
+            )
 
         # Interval
         if self.trading_interval_seconds <= 0:

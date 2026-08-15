@@ -12,6 +12,7 @@ Checks:
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from kimi_quant.config import config
 from kimi_quant.llm import TradingSignal
@@ -35,7 +36,9 @@ class RiskManager:
     """
 
     # Minimum stop loss distance from entry (as fraction of price)
-    MIN_SL_DISTANCE = 0.005  # 0.5% — BTC noise is ~0.3%
+    # Single source of truth lives in Config (MIN_SL_DISTANCE env var) —
+    # data.py reads the same value for its prompt recap.
+    MIN_SL_DISTANCE = config.min_sl_distance  # 0.5% default — BTC noise is ~0.3%
 
     # Minimum risk/reward ratio: |TP - entry| / |SL - entry| must be ≥ this.
     # Prevents trades where the potential loss dwarfs the potential gain.
@@ -58,6 +61,12 @@ class RiskManager:
         self.total_realized_pnl: float = 0.0
         self.initial_balance: float | None = None
 
+        # Daily drawdown tracking — MAX_DAILY_DRAWDOWN applies to the
+        # realized P&L of the CURRENT UTC day only (resets at midnight),
+        # not to the lifetime cumulative P&L.
+        self._daily_pnl: float = 0.0
+        self._daily_date: str = ""  # "YYYY-MM-DD" (UTC)
+
     # ─── Main entry ──────────────────────────────────────────────────────
 
     def validate(
@@ -78,6 +87,7 @@ class RiskManager:
             ),
             self._check_direction(signal, current_position_side),
             self._check_stop_loss_distance(signal, mid_price),
+            self._check_take_profit(signal),
             self._check_risk_reward_ratio(signal, mid_price),
         ]
 
@@ -151,6 +161,8 @@ class RiskManager:
         """Called when a trade closes at a loss."""
         self.consecutive_losses += 1
         self.total_realized_pnl += pnl
+        self._roll_daily()
+        self._daily_pnl += pnl
         if self.consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
             # Only trigger if not already in cooldown (don't extend indefinitely)
             if self.cooldown_remaining <= 0:
@@ -177,6 +189,33 @@ class RiskManager:
         self.consecutive_losses = 0
         self.cooldown_remaining = 0
         self.total_realized_pnl += pnl
+        self._roll_daily()
+        self._daily_pnl += pnl
+
+    def seed_daily_pnl(self, trades: list) -> None:
+        """Seed today's realized P&L from closed trades (startup recovery).
+
+        Called once at startup so the daily drawdown cap is not reset by a
+        restart: trades closed earlier today count against today's cap.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._daily_date = today
+        self._daily_pnl = 0.0
+        for t in trades:
+            closed_at = getattr(t, "closed_at", None)
+            if closed_at and str(closed_at)[:10] == today:
+                self._daily_pnl += getattr(t, "net_pnl", 0.0) or 0.0
+        if self._daily_pnl:
+            logger.info(
+                "Seeded daily P&L: $%.2f (UTC date %s)", self._daily_pnl, today,
+            )
+
+    def _roll_daily(self) -> None:
+        """Reset the daily P&L counter when the UTC date changes."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_date != today:
+            self._daily_date = today
+            self._daily_pnl = 0.0
 
     def tick_cooldown(self) -> None:
         """Decrement cooldown counter each cycle."""
@@ -214,10 +253,11 @@ class RiskManager:
         lines = ["# Risk Constraints (this cycle)\n"]
 
         # ── Circuit Breaker ──────────────────────────────────────────
+        self._roll_daily()
         if self.cooldown_remaining > 0:
             daily_info = ""
             if self.initial_balance and self.initial_balance > 0:
-                drawdown = self.total_realized_pnl / self.initial_balance
+                drawdown = self._daily_pnl / self.initial_balance
                 daily_info = f" | Daily P&L: {drawdown:.1%}"
             lines.append(
                 f"⚠️  CIRCUIT BREAKER ACTIVE — {self.consecutive_losses} "
@@ -235,12 +275,13 @@ class RiskManager:
                 f"Be more conservative.\n"
             )
 
-        if self.initial_balance and self.initial_balance > 0 and self.total_realized_pnl < 0:
-            drawdown = self.total_realized_pnl / self.initial_balance
+        if self.initial_balance and self.initial_balance > 0 and self._daily_pnl < 0:
+            drawdown = self._daily_pnl / self.initial_balance
             if drawdown < -0.02:  # approaching -5% hard cap
                 lines.append(
                     f"⚠️  Daily drawdown: {drawdown:.1%} (hard cap: "
-                    f"{self.MAX_DAILY_DRAWDOWN:.0%}). Reduce risk.\n"
+                    f"{self.MAX_DAILY_DRAWDOWN:.0%}, resets at UTC midnight). "
+                    f"Reduce risk.\n"
                 )
 
         # ── Static thresholds ────────────────────────────────────────
@@ -251,8 +292,11 @@ class RiskManager:
         lines.append(f"- SL min distance: {self.MIN_SL_DISTANCE:.1%} of entry "
                      f"(BTC noise is ~0.3%)")
         lines.append(f"- SL is REQUIRED for LONG/SHORT (no SL → rejected)")
+        lines.append(f"- TP is REQUIRED for LONG/SHORT (no TP → rejected — "
+                     f"prevents bypassing the R:R gate)")
         lines.append(f"- R:R minimum: {self.MIN_RR_RATIO}:1 "
-                     f"(|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.")
+                     f"(|TP-entry| / |SL-entry|) — always enforced because TP "
+                     f"is mandatory")
         lines.append(f"- Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). "
                      f"Factor into P&L.")
         lines.append("")
@@ -297,13 +341,15 @@ class RiskManager:
         if current_side == "long":
             lines.append("- You HOLD a LONG position.")
             lines.append("  → LONG → REJECTED (already long)")
-            lines.append("  → SHORT → OK (opens opposite)")
+            lines.append("  → SHORT → REJECTED without CLOSE — flip requires "
+                         "actions=['CLOSE', 'SHORT']")
             lines.append("  → CLOSE → OK (flattens position)")
             lines.append("  → MODIFY_SL / MODIFY_TP → OK")
         elif current_side == "short":
             lines.append("- You HOLD a SHORT position.")
             lines.append("  → SHORT → REJECTED (already short)")
-            lines.append("  → LONG → OK (opens opposite)")
+            lines.append("  → LONG → REJECTED without CLOSE — flip requires "
+                         "actions=['CLOSE', 'LONG']")
             lines.append("  → CLOSE → OK (flattens position)")
             lines.append("  → MODIFY_SL / MODIFY_TP → OK")
         else:
@@ -372,9 +418,11 @@ class RiskManager:
         if self.cooldown_remaining > 0:
             return RiskCheck(passed=False, reason=self.get_block_reason())
 
-        # Check daily drawdown if we have a reference balance
-        if self.initial_balance and self.total_realized_pnl < 0:
-            drawdown = self.total_realized_pnl / self.initial_balance
+        # Check daily drawdown if we have a reference balance. The cap
+        # applies to TODAY's realized P&L only (rolls over at UTC midnight).
+        self._roll_daily()
+        if self.initial_balance and self._daily_pnl < 0:
+            drawdown = self._daily_pnl / self.initial_balance
             if drawdown < self.MAX_DAILY_DRAWDOWN:
                 return RiskCheck(
                     passed=False,
@@ -472,6 +520,31 @@ class RiskManager:
             return RiskCheck(passed=False, reason="Already holding a long position")
         if signal.action == "SHORT" and current_side == "short":
             return RiskCheck(passed=False, reason="Already holding a short position")
+
+        # Opposite-direction entries while holding a position are REJECTED
+        # unless an explicit CLOSE precedes them (e.g. ["CLOSE", "SHORT"]).
+        # Without this, a lone ["SHORT"] while long would silently REDUCE
+        # (or fully net out) the real position instead of flipping it, while
+        # the tracker believes it is now short — tracker/chain divergence.
+        if signal.action == "LONG" and current_side == "short":
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    "Already holding a SHORT position — opening LONG without "
+                    "CLOSE would silently reduce it. Flip must use "
+                    "actions=['CLOSE', 'LONG']."
+                ),
+            )
+        if signal.action == "SHORT" and current_side == "long":
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    "Already holding a LONG position — opening SHORT without "
+                    "CLOSE would silently reduce it. Flip must use "
+                    "actions=['CLOSE', 'SHORT']."
+                ),
+            )
+
         if signal.action == "CLOSE" and current_side == "none":
             return RiskCheck(passed=False, reason="No position to close")
         if signal.action == "MODIFY_SL" and current_side == "none":
@@ -522,6 +595,30 @@ class RiskManager:
             )
 
         return RiskCheck(passed=True, reason=f"SL distance OK ({sl_distance:.2%})")
+
+    def _check_take_profit(self, signal: TradingSignal) -> RiskCheck:
+        """Require a take profit for new directional trades.
+
+        The R:R >= MIN_RR_RATIO gate is only computable when a TP exists —
+        if TP were optional, an LLM could omit it to bypass the hard R:R
+        rule. Requiring TP closes that loophole and matches the prompt
+        contract ("take_profit: realistic target").
+        """
+        if signal.action not in ("LONG", "SHORT"):
+            return RiskCheck(passed=True, reason="No TP needed")
+
+        if signal.take_profit is None:
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    "Take profit is required for directional trades — "
+                    "omitting it would bypass the minimum R:R check. "
+                    "Set a realistic TP (R:R >= "
+                    f"{self.MIN_RR_RATIO}:1) or output HOLD."
+                ),
+            )
+
+        return RiskCheck(passed=True, reason="TP OK")
 
     def _check_risk_reward_ratio(
         self, signal: TradingSignal, mid_price: float,

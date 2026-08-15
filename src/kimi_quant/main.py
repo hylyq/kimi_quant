@@ -848,6 +848,8 @@ def run_loop():
                 break
         risk.consecutive_losses = consecutive
         risk.total_realized_pnl = stats.net_pnl
+        # Seed TODAY's realized P&L so the daily drawdown cap survives restarts
+        risk.seed_daily_pnl(trade_logger.get_all_trades())
         if consecutive > 0:
             logger.info("Seeded circuit breaker: %d consecutive losses from history",
                         consecutive)

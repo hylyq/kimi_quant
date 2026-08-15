@@ -919,11 +919,11 @@ class DataProvider:
                 size = float(pos_data.get("szi", 0))
                 entry_px = float(pos_data.get("entryPx", 0))
                 unrealized_pnl = float(pos_data.get("unrealizedPnl", 0))
-                leverage_value = pos_data.get("leverage", {}).get("value", 1)
-                if isinstance(leverage_value, str):
-                    leverage = int(leverage_value)
+                leverage_raw = pos_data.get("leverage", {})
+                if isinstance(leverage_raw, dict):
+                    leverage = int(leverage_raw.get("value", 1))
                 else:
-                    leverage = int(leverage_value)
+                    leverage = int(leverage_raw) if leverage_raw else 1
 
                 if size > 0:
                     side = "long"
@@ -1327,7 +1327,7 @@ class DataProvider:
                 max_size=config.max_position_size,
                 min_conf=config.min_confidence,
                 max_lev=config.max_leverage,
-                min_sl_dist=0.005,  # Must match RiskManager.MIN_SL_DISTANCE (can't import: circular)
+                min_sl_dist=config.min_sl_distance,
                 breaker_active=breaker_active,
                 breaker_msg="NEW POSITIONS BLOCKED" if breaker_active else "",
             )
