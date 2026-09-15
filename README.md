@@ -879,6 +879,13 @@ RestartSec=30
 TimeoutStopSec=180
 # Stream logs to journald immediately (visible via journalctl -f)
 Environment=PYTHONUNBUFFERED=1
+# Resource fence: a memory leak must kill THIS process (systemd restarts
+# it), never the whole host. This matters on small VPS boxes — a 2GB
+# server once froze completely (swap thrash, disk IO 100%, no SSH) from
+# an in-process leak with no cgroup limit. Tune to your box; the bot's
+# steady state is roughly 150-300MB.
+MemoryHigh=384M
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
@@ -1600,7 +1607,7 @@ The Judge receives complete information — account context (balance, available 
 | All TFs sideways | HOLD acceptable, but watch for breakouts |
 | All 3 arguments weak + no clear trend | Only default HOLD in this case |
 
-### LangGraph Checkpointing
+### Debate History (JSONL)
 
 Each cycle's complete debate results persisted to `data/debate.jsonl`:
 
@@ -1619,7 +1626,8 @@ One JSON object per line:
 
 - **Resume**: `get_latest_state()` recovers after crash restart
 - **History**: `--history` prints complete debate records
-- **Auto-save**: LangGraph auto-writes checkpoint after each `ainvoke()`
+- **Rotation**: the file auto-rotates past 25MB, keeping the newest 1000 cycles (startup reads the whole file, so unbounded growth slows boot on small servers)
+- **No in-RAM checkpointer**: the graph runs stateless. The previous MemorySaver on a constant thread appended the full cycle state to RAM on every `ainvoke()` with no pruning (~176KB/cycle measured, ~1.4GB over two months on a 2GB host — froze a production server; checkpoints were never read back since recovery uses the JSONL)
 
 ### Cost Note
 
@@ -1668,7 +1676,7 @@ kimi_quant/
 │   ├── tls.py           # curl_cffi Firefox TLS fingerprint spoofing (shared module)
 │   ├── data.py          # Market data (Hyperliquid Info API + K-line cache + ATR + reconnect)
 │   ├── llm.py           # TradingSignal + dual model failover (Kimi/DeepSeek)
-│   ├── debate.py        # Multi-Agent debate + rebuttal round + LangGraph Checkpointing
+│   ├── debate.py        # Multi-Agent debate + rebuttal round + JSONL history (stateless graph)
 │   ├── risk.py          # 7-layer risk checks + circuit breaker state machine
 │   ├── executor.py      # 15/15 SDK coverage + startup recovery + PositionTracker
 │   ├── monitor.py       # WebSocket order monitoring + crash recovery + Flash LLM

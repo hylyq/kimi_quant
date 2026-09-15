@@ -879,6 +879,12 @@ RestartSec=30
 TimeoutStopSec=180
 # 日志立即写入 journald（journalctl -f 实时可见）
 Environment=PYTHONUNBUFFERED=1
+# 资源围栏：内存泄漏只能杀死本进程（systemd 会自动拉起），绝不能拖死整机。
+# 这在小内存 VPS 上至关重要——曾有一台 2G 服务器因为进程内泄漏且无 cgroup
+# 限制而彻底冻结（swap 抖动、磁盘 IO 打满、SSH 无法登录）。按你的机器调整；
+# 机器人稳态内存大约 150-300MB。
+MemoryHigh=384M
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
@@ -1600,7 +1606,7 @@ Judge 接收完整信息——账户上下文（余额、可用保证金、当�
 | 所有 TF 横盘 | HOLD 可接受，但关注突破 |
 | 三方论证都弱 + 无明确趋势 | 仅此时默认 HOLD |
 
-### LangGraph Checkpointing
+### 辩论历史（JSONL）
 
 每个 cycle 的完整辩论结果持久化到 `data/debate.jsonl`：
 
@@ -1619,7 +1625,8 @@ Judge 接收完整信息——账户上下文（余额、可用保证金、当�
 
 - **断点续传**：崩溃重启后 `get_latest_state()` 恢复
 - **历史回溯**：`--history` 打印完整辩论记录
-- **自动保存**：LangGraph 在每次 `ainvoke()` 后自动写 checkpoint
+- **自动轮转**：文件超过 25MB 自动轮转，保留最新 1000 个周期（启动时会全量读取该文件，无限增长会拖慢小内存服务器的启动）
+- **无内存 checkpointer**：图为无状态运行。此前 MemorySaver 在固定 thread 上每次 `ainvoke()` 都把完整周期状态追加进内存且永不清理（实测 ~176KB/周期，两个月 ~1.4GB，曾冻结一台 2G 内存的生产服务器）；而恢复走的是 JSONL，checkpoint 从未被读回
 
 ### 费用注意
 
@@ -1668,7 +1675,7 @@ kimi_quant/
 │   ├── tls.py           # curl_cffi Firefox TLS 指纹伪装（共享模块）
 │   ├── data.py          # 市场数据（Hyperliquid Info API + K线缓存 + ATR + 断线重试）
 │   ├── llm.py           # TradingSignal + 双模型容灾 (Kimi/DeepSeek)
-│   ├── debate.py        # Multi-Agent 辩论 + 反驳轮 + LangGraph Checkpointing
+│   ├── debate.py        # Multi-Agent 辩论 + 反驳轮 + JSONL 历史（无状态图）
 │   ├── risk.py          # 多层风控校验 + 熔断状态机
 │   ├── executor.py      # 15/15 SDK 全覆盖 + 启动恢复 + PositionTracker
 │   ├── monitor.py       # WebSocket 订单监控 + 崩溃自恢复 + Flash LLM

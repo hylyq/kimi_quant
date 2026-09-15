@@ -6,7 +6,7 @@ the final trading decision.
 
 Each cycle's result is persisted to a JSONL file for:
   - Cycle history
-  - Crash recovery (resume from last checkpoint)
+  - Crash recovery (resume from the last recorded cycle)
   - Full traceability for post-trade analysis
 
 Architecture (LangGraph StateGraph):
@@ -53,11 +53,12 @@ import asyncio
 import fcntl
 import json as _json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
@@ -71,12 +72,28 @@ DEFAULT_HISTORY_PATH = str(
     Path(__file__).parent.parent.parent / "data" / "debate.jsonl"
 )
 
+# History rotation: each cycle appends a full debate transcript (~10-20KB).
+# Unbounded, the file grows ~3-5MB/day at 5-min cycles AND is read fully
+# into memory at startup (get_latest_state/get_history) — on a 2GB server
+# both effects hurt. Rotate past this size, keeping the newest entries.
+_HISTORY_MAX_BYTES = 25 * 1024 * 1024  # 25MB
+_HISTORY_KEEP_ENTRIES = 1000          # ~10-20MB of newest cycles
+
 
 # ─── Debate State ────────────────────────────────────────────────────────────
 
 
 class DebateState(TypedDict):
-    """State carried through the debate graph and persisted to checkpointer."""
+    """State carried through the debate graph for one cycle.
+
+    Deliberately NOT persisted to a LangGraph checkpointer: every cycle
+    starts from a fresh initial_state, and "recovery" reads the JSONL
+    history file, so checkpoints would be write-only. Worse, MemorySaver
+    on a constant thread_id appends the full state (~25KB incl. the
+    market prompt) to RAM every cycle with no pruning — measured ~176KB
+    RSS/cycle, ~1.4GB after two months of 10-min cycles on a host that
+    has 2GB total. That leak froze a production server.
+    """
 
     market_prompt: str
     account_summary: str
@@ -539,8 +556,61 @@ def _read_history(history_path: str) -> list[dict[str, Any]]:
     return entries
 
 
+def _rotate_history_if_needed(history_path: str) -> None:
+    """Trim the JSONL history when it grows past the size cap.
+
+    Each entry holds a full debate transcript (~10-20KB); at 5-min cycles
+    the file grows a few MB per day. Unbounded growth hurts twice on a
+    small server: the file itself, and the full-file read that
+    get_history()/get_latest_state() do (every startup, and each
+    `--history` command).
+
+    MUST be called while holding the file's exclusive lock (see
+    _append_history). Rotation is atomic: write a tmp file with the
+    newest entries, then rename over the original.
+    """
+    path = Path(history_path)
+    try:
+        if path.stat().st_size <= _HISTORY_MAX_BYTES:
+            return
+        lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        if len(lines) <= _HISTORY_KEEP_ENTRIES:
+            # Single entries larger than the cap (pathological) — nothing
+            # safe to drop beyond this point.
+            return
+        keep = lines[-_HISTORY_KEEP_ENTRIES:]
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(keep) + "\n")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        logger.warning(
+            "Debate history rotated: %d → %d entries (%.1fMB)",
+            len(lines), len(keep), path.stat().st_size / 1e6,
+        )
+    except Exception as e:
+        # Rotation must never break the append path
+        logger.error("Debate history rotation failed: %s", e)
+
+
 def _append_history(history_path: str, entry: dict[str, Any]) -> None:
-    """Append a single debate cycle entry to the JSONL file."""
+    """Append a single debate cycle entry to the JSONL file.
+
+    Rotation runs AFTER the append, inside the same lock: os.replace()
+    swaps the file's inode, so anything written through this handle after
+    a rotation would land on the orphaned old inode and vanish (the unit
+    test caught exactly that). Appending first means the rotation's full
+    re-read always includes the newest cycle — it can never be the entry
+    that gets trimmed.
+    """
     try:
         Path(history_path).parent.mkdir(parents=True, exist_ok=True)
         with open(history_path, "a") as f:
@@ -548,6 +618,7 @@ def _append_history(history_path: str, entry: dict[str, Any]) -> None:
             try:
                 f.write(_json.dumps(entry, default=str) + "\n")
                 f.flush()
+                _rotate_history_if_needed(history_path)
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception as e:
@@ -560,17 +631,17 @@ def _append_history(history_path: str, entry: dict[str, Any]) -> None:
 class DebateStrategy:
     """Multi-agent debate strategy orchestrated by LangGraph.
 
-    Each cycle's debate is persisted to a JSONL file (debate.jsonl)
-    alongside LangGraph's MemorySaver (intra-session checkpointing).
+    Each cycle's debate is persisted to a JSONL file (debate.jsonl), which
+    is also the crash-recovery source (get_latest_state reads it). The
+    graph itself runs WITHOUT a checkpointer — see DebateState for why
+    (MemorySaver on a constant thread was an unbounded RAM leak that
+    froze a 2GB production server).
 
     Usage:
         strategy = DebateStrategy()
         signal, transcript = strategy.analyze_sync(market_data)
         history = strategy.get_history()
     """
-
-    # Config key passed to graph.ainvoke to identify the trading session
-    THREAD_ID = "btc-perpetual-trading"
 
     def __init__(self, history_path: str | None = None,
                  debate_timeout: int = 60):
@@ -593,17 +664,16 @@ class DebateStrategy:
                 "before the Judge rules (+3 LLM calls/cycle)"
             )
 
-        self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         logger.info("DebateStrategy initialized: %d agents, timeout=%ds",
                      7 if self.rebuttal_enabled else 4, debate_timeout)
 
     def close(self) -> None:
-        """No-op (MemorySaver needs no cleanup)."""
+        """No-op (no checkpointer or background resources to clean up)."""
         pass
 
     def _build_graph(self):
-        """Construct the debate StateGraph with checkpointing.
+        """Construct the debate StateGraph (no checkpointer — see DebateState).
 
         Nodes: debate (parallel bull/bear/hold)
                → rebuttal (optional: debaters counter each other)
@@ -625,7 +695,7 @@ class DebateStrategy:
 
         builder.add_edge("adjudicate", END)
 
-        return builder.compile(checkpointer=self.checkpointer)
+        return builder.compile()
 
     async def _debate_node(self, state: DebateState) -> DebateState:
         """Two-phase debate with prefix-cache warmup.
@@ -863,24 +933,14 @@ class DebateStrategy:
 
     # ─── Public API ──────────────────────────────────────────────────────
 
-    def _make_config(self, thread_id: str | None = None) -> dict:
-        """Build the LangGraph config dict for checkpointing."""
-        return {
-            "configurable": {
-                "thread_id": thread_id or self.THREAD_ID,
-            }
-        }
-
     async def analyze(
         self,
         market_data: dict[str, Any],
-        thread_id: str | None = None,
     ) -> tuple[TradingSignal | None, dict[str, str]]:
         """Run the full debate asynchronously, persisting results to JSONL.
 
         Args:
             market_data: Market snapshot from DataProvider.
-            thread_id: Checkpoint thread ID (default: 'btc-perpetual-trading').
 
         Returns:
             (signal, debate_transcript). Signal is None on failure.
@@ -904,11 +964,10 @@ class DebateStrategy:
             "error": "",
         }
 
-        graph_config = self._make_config(thread_id)
         logger.info("Starting debate [%s]...", cycle_id)
         start = datetime.now(timezone.utc)
 
-        final_state = await self.graph.ainvoke(initial_state, config=graph_config)
+        final_state = await self.graph.ainvoke(initial_state)
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         logger.info("Debate + judgment complete in %.1fs", elapsed)
@@ -972,10 +1031,9 @@ class DebateStrategy:
     def analyze_sync(
         self,
         market_data: dict[str, Any],
-        thread_id: str | None = None,
     ) -> tuple[TradingSignal | None, dict[str, str]]:
         """Synchronous wrapper for analyze()."""
-        return asyncio.run(self.analyze(market_data, thread_id=thread_id))
+        return asyncio.run(self.analyze(market_data))
 
     async def correct_judge(
         self,
@@ -1065,18 +1123,14 @@ Keep everything else the same — only fix what was rejected."""
             self.correct_judge(market_data, original_signal, rejection_reason, transcript)
         )
 
-    def get_history(
-        self, thread_id: str | None = None
-    ) -> list[dict[str, Any]]:
+    def get_history(self) -> list[dict[str, Any]]:
         """Retrieve all debate cycles from the JSONL history file.
 
         Returns list ordered from oldest to newest.
         """
         return _read_history(self._history_path)
 
-    def get_latest_state(
-        self, thread_id: str | None = None
-    ) -> dict[str, Any] | None:
+    def get_latest_state(self) -> dict[str, Any] | None:
         """Get the most recent debate cycle (e.g. for crash recovery)."""
         history = _read_history(self._history_path)
         return history[-1] if history else None

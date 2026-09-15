@@ -5,7 +5,7 @@ execute trades → log results.
 
 Supports two strategy modes:
 - "single": single-agent analysis (KimiLLM)
-- "debate": multi-agent debate with LangGraph checkpointing
+- "debate": multi-agent debate (LangGraph, stateless graph + JSONL history)
 """
 
 import argparse
@@ -930,7 +930,8 @@ def run_loop():
             logger.info("Seeded circuit breaker: %d consecutive losses from history",
                         consecutive)
 
-    # Debate mode: create strategy ONCE (checkpointer lazy-inits on first use)
+    # Debate mode: create strategy ONCE (agents/LLM clients are reused;
+    # the graph itself is stateless — history lives in debate.jsonl)
     strategy = None
     if mode == "debate":
         from kimi_quant.debate import DebateStrategy
