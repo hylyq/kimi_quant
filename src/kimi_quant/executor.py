@@ -404,48 +404,50 @@ class PositionTracker:
     # ─── Display ──────────────────────────────────────────────────────
 
     def to_summary(self) -> str:
-        if self.state == "none":
-            return "No position"
-        state_label = "RESTING" if self.state == "resting" else "ACTIVE"
-        sl_info = f"${self.sl_price:.0f}" if self.sl_price else "NONE"
-        tp_info = f"${self.tp_price:.0f}" if self.tp_price else "NONE"
-        return (
-            f"[{state_label}] {self.side.upper()} {self.size:.4f} {self.coin} "
-            f"@ ${self.entry_price:.1f} SL={sl_info} TP={tp_info} "
-            f"(entry_oid={self.entry_oid}, sl_oid={self.sl_oid}, tp_oid={self.tp_oid})"
-        )
+        with self._lock:
+            if self.state == "none":
+                return "No position"
+            state_label = "RESTING" if self.state == "resting" else "ACTIVE"
+            sl_info = f"${self.sl_price:.0f}" if self.sl_price else "NONE"
+            tp_info = f"${self.tp_price:.0f}" if self.tp_price else "NONE"
+            return (
+                f"[{state_label}] {self.side.upper()} {self.size:.4f} {self.coin} "
+                f"@ ${self.entry_price:.1f} SL={sl_info} TP={tp_info} "
+                f"(entry_oid={self.entry_oid}, sl_oid={self.sl_oid}, tp_oid={self.tp_oid})"
+            )
 
     def to_orders_summary(self) -> str:
         """Generate a compact summary of open orders for LLM context.
 
         Returns empty string if no open orders (no position and no resting).
         """
-        if self.state == "none":
-            return ""
+        with self._lock:
+            if self.state == "none":
+                return ""
 
-        parts = []
-        if self.entry_oid is not None:
-            order_type = "LIMIT" if self.state == "resting" else "filled (position active)"
-            parts.append(f"Entry: oid={self.entry_oid} ({order_type})")
+            parts = []
+            if self.entry_oid is not None:
+                order_type = "LIMIT" if self.state == "resting" else "filled (position active)"
+                parts.append(f"Entry: oid={self.entry_oid} ({order_type})")
 
-        if self.sl_price and self.sl_oid is not None:
-            parts.append(f"Stop Loss: ${self.sl_price:.0f} (oid={self.sl_oid})")
-        elif self.sl_oid is not None:
-            parts.append(f"Stop Loss: oid={self.sl_oid} (price unknown)")
-        else:
-            parts.append("Stop Loss: NOT SET ⚠️")
+            if self.sl_price and self.sl_oid is not None:
+                parts.append(f"Stop Loss: ${self.sl_price:.0f} (oid={self.sl_oid})")
+            elif self.sl_oid is not None:
+                parts.append(f"Stop Loss: oid={self.sl_oid} (price unknown)")
+            else:
+                parts.append("Stop Loss: NOT SET ⚠️")
 
-        if self.tp_price and self.tp_oid is not None:
-            parts.append(f"Take Profit: ${self.tp_price:.0f} (oid={self.tp_oid})")
-        elif self.tp_oid is not None:
-            parts.append(f"Take Profit: oid={self.tp_oid} (price unknown)")
-        else:
-            parts.append("Take Profit: NOT SET")
+            if self.tp_price and self.tp_oid is not None:
+                parts.append(f"Take Profit: ${self.tp_price:.0f} (oid={self.tp_oid})")
+            elif self.tp_oid is not None:
+                parts.append(f"Take Profit: oid={self.tp_oid} (price unknown)")
+            else:
+                parts.append("Take Profit: NOT SET")
 
-        return (
-            f"Open orders for {self.side.upper()} {self.size:.4f} {self.coin}: "
-            + ", ".join(parts)
-        )
+            return (
+                f"Open orders for {self.side.upper()} {self.size:.4f} {self.coin}: "
+                + ", ".join(parts)
+            )
 
     def to_position_memory(self, unrealized_pnl: float = 0.0) -> str:
         """Build the Position Memory section for the LLM prompt.
@@ -456,50 +458,51 @@ class PositionTracker:
 
         Returns empty string if no active position with memory.
         """
-        if self.state != "active" or not self.entry_time or not self.entry_reason:
-            return ""
+        with self._lock:
+            if self.state != "active" or not self.entry_time or not self.entry_reason:
+                return ""
 
-        from datetime import datetime, timezone
+            from datetime import datetime, timezone
 
-        try:
-            opened_at = datetime.fromisoformat(self.entry_time)
-            elapsed = datetime.now(timezone.utc) - opened_at.replace(
-                tzinfo=timezone.utc
+            try:
+                opened_at = datetime.fromisoformat(self.entry_time)
+                elapsed = datetime.now(timezone.utc) - opened_at.replace(
+                    tzinfo=timezone.utc
+                )
+                if elapsed.total_seconds() < 60:
+                    duration = f"{elapsed.total_seconds():.0f}s"
+                elif elapsed.total_seconds() < 3600:
+                    duration = f"{elapsed.total_seconds() / 60:.0f}min"
+                else:
+                    hours = elapsed.total_seconds() / 3600
+                    duration = f"{hours:.1f}h"
+            except (ValueError, TypeError):
+                duration = "unknown"
+
+            notional = self.entry_price * self.size if self.entry_price > 0 else 0
+            u_pnl_pct = (
+                (unrealized_pnl / notional * 100) if notional > 0 else 0.0
             )
-            if elapsed.total_seconds() < 60:
-                duration = f"{elapsed.total_seconds():.0f}s"
-            elif elapsed.total_seconds() < 3600:
-                duration = f"{elapsed.total_seconds() / 60:.0f}min"
-            else:
-                hours = elapsed.total_seconds() / 3600
-                duration = f"{hours:.1f}h"
-        except (ValueError, TypeError):
-            duration = "unknown"
 
-        notional = self.entry_price * self.size if self.entry_price > 0 else 0
-        u_pnl_pct = (
-            (unrealized_pnl / notional * 100) if notional > 0 else 0.0
-        )
-
-        lines = [
-            "# 📌 Position Memory",
-            f"Holding: {self.side.upper()} {self.size:.4f} {self.coin} @ ${self.entry_price:.1f}",
-            f"Opened: {duration} ago | Entry confidence: {self.entry_confidence:.2f}",
-            f"Entry thesis: \"{self.entry_reason[:200]}\"",
-            f"Current uPNL: ${unrealized_pnl:+.2f} ({u_pnl_pct:+.2f}%)",
-        ]
-        if self.peak_favorable > 0 or self.peak_adverse < 0:
+            lines = [
+                "# 📌 Position Memory",
+                f"Holding: {self.side.upper()} {self.size:.4f} {self.coin} @ ${self.entry_price:.1f}",
+                f"Opened: {duration} ago | Entry confidence: {self.entry_confidence:.2f}",
+                f"Entry thesis: \"{self.entry_reason[:200]}\"",
+                f"Current uPNL: ${unrealized_pnl:+.2f} ({u_pnl_pct:+.2f}%)",
+            ]
+            if self.peak_favorable > 0 or self.peak_adverse < 0:
+                lines.append(
+                    f"Best: ${self.peak_favorable:+.2f} | Worst: ${self.peak_adverse:+.2f}"
+                )
             lines.append(
-                f"Best: ${self.peak_favorable:+.2f} | Worst: ${self.peak_adverse:+.2f}"
+                "\n⚠️  Step 0 — THESIS VALIDATION: "
+                "Has the original entry thesis held? "
+                "If the market has negated this thesis, CLOSE the position. "
+                "If it's working, consider MODIFY_SL to lock in profit."
             )
-        lines.append(
-            "\n⚠️  Step 0 — THESIS VALIDATION: "
-            "Has the original entry thesis held? "
-            "If the market has negated this thesis, CLOSE the position. "
-            "If it's working, consider MODIFY_SL to lock in profit."
-        )
 
-        return "\n".join(lines)
+            return "\n".join(lines)
 
 
 def _extract_errors(result: Any, num_orders: int) -> list[str]:
@@ -848,11 +851,26 @@ class TradeExecutor:
     # ─── Chain State Sync (called from main loop each cycle) ─────────────
 
     def sync_with_chain(self, chain_side: str, chain_size: float,
-                        chain_entry: float) -> None:
+                        chain_entry: float, account_known: bool = True) -> None:
         """Sync tracker with on-chain state each cycle.
 
         Called by main.py's _validate_and_execute before risk checks.
+
+        Args:
+            chain_side/chain_size/chain_entry: On-chain position state
+                ("none" / 0 / 0 when flat).
+            account_known: False when the account snapshot could not be
+                fetched (API failure) or in dry-run mode. Sync is then
+                skipped entirely — an UNKNOWN chain state must never be
+                interpreted as "no position", or the tracker would be
+                cleared and a new entry could double the real position.
         """
+        if not account_known:
+            logger.debug(
+                "sync_with_chain skipped (chain state unknown or dry-run)"
+            )
+            return
+
         has_chain_pos = chain_side != "none" and chain_size > 0
         tracker_has = self.tracker.has_position()
         tracker_resting = self.tracker.has_resting_order()

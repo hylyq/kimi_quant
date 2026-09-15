@@ -195,7 +195,8 @@ Guidelines:
 - Cross-reference debater claims against RAW MARKET DATA
 - Divergence = smaller size + tighter stop, NOT automatic HOLD
 - Confidence < 0.65 → skip trade
-- stop_loss mandatory for LONG/SHORT, min 0.5% from entry
+- stop_loss AND take_profit mandatory for LONG/SHORT (SL min 0.5% from entry;
+  TP required — omitting it bypasses the R:R gate and is rejected)
 - If Step 0 found issues (missing SL/TP, stale orders), include the fix
   actions BEFORE any new entry actions from the debate.
 

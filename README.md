@@ -246,6 +246,8 @@ JUDGE_REASONING_EFFORT=max      # Judge always uses max, regardless of provider 
 
 **Resolution order** (highest priority first): Judge override → per-provider env → global `REASONING_EFFORT`.
 
+> ⚠️ **Kimi restriction**: `KIMI_REASONING_EFFORT` only accepts `max` or `off` (Kimi K3's API supports `reasoning_effort=max` only). Other values are rejected at config validation instead of being silently ignored. `DEEPSEEK_REASONING_EFFORT` accepts the full range.
+
 ```bash
 REASONING_EFFORT=max      # Strongest reasoning (default)
 REASONING_EFFORT=high     # High reasoning
@@ -835,10 +837,13 @@ Ctrl+B, D
 tmux attach -t kimi
 ```
 
-### Background (systemd)
+### Run in Background (systemd)
 
 ```bash
-# Create service file
+# 1. Deploy a copy of the repo to a fixed path, then adjust the paths below
+#    cp -r /path/to/kimi_quant ~/kimi_quant && cd ~/kimi_quant && uv sync
+
+# 2. Create the service file — replace <user> with YOUR Linux username
 sudo tee /etc/systemd/system/kimi-quant.service << 'EOF'
 [Unit]
 Description=Kimi Quant Trading Bot
@@ -847,12 +852,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=marvin
-WorkingDirectory=/home/marvin/playground/kimi_quant
-EnvironmentFile=/home/marvin/playground/kimi_quant/.env
-ExecStart=/home/marvin/playground/kimi_quant/.venv/bin/kimi-quant --interval 300
+User=<user>
+WorkingDirectory=/home/<user>/kimi_quant
+# The bot loads .env itself (python-dotenv) — EnvironmentFile is optional.
+# If you keep it, the file must have NO trailing comments (# ...): systemd
+# does not strip them and config values (e.g. float parsing) would break.
+# EnvironmentFile=/home/<user>/kimi_quant/.env
+ExecStart=/home/<user>/kimi_quant/.venv/bin/kimi-quant --interval 300
 Restart=on-failure
 RestartSec=30
+# A debate-mode cycle can exceed the default 90s graceful-stop timeout —
+# raise it so shutdown finishes cleanly instead of being SIGKILLed.
+TimeoutStopSec=180
+# Stream logs to journald immediately (visible via journalctl -f)
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
@@ -865,14 +878,19 @@ sudo systemctl enable --now kimi-quant
 journalctl -u kimi-quant -f
 ```
 
+Notes:
+- Replace `<user>` with your actual Linux username and point the paths at your deployment directory (e.g. `~/projects/kimi_quant`).
+- The bot persists state under `~/.kimi_quant/` (IP seed file + snapshot cache). If you harden the unit (`ProtectHome=` / `ProtectSystem=strict`), whitelist that path with `ReadWritePaths=` or the cache / IP-failover features will silently stop persisting.
+- Per-service overrides (e.g. `NoNewPrivileges=true`): `sudo systemctl edit kimi-quant`
+
 ### Health Monitoring
 
 ```bash
 # Set up periodic alerts (crontab)
 */10 * * * * cd /path/to/kimi_quant && uv run kimi-quant --stats 2>&1 | grep -q "Net P&L.*-[5-9][0-9]" && notify-send "Kimi Quant: Large drawdown warning"
 
-# Check if process is alive
-pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
+# Check if the service is alive
+systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 ```
 
 ## Configuration Reference
@@ -913,6 +931,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `MAX_POSITION_SIZE` | `0.01` | Max position size (**Unit: BTC**, not USD) |
 | `MIN_CONFIDENCE` | `0.7` | Minimum confidence threshold |
 | `MAX_LEVERAGE` | `3` | Maximum leverage |
+| `MIN_SL_DISTANCE` | `0.005` | Minimum stop-loss distance from entry (fraction of price; 0.5% default) |
 | **Strategy** | | |
 | `STRATEGY_MODE` | `single` | `single` or `debate` |
 | `TRADING_INTERVAL` | `600` | Default interval (seconds). LLM can dynamically override via `next_interval` |
@@ -1117,6 +1136,7 @@ A single cycle can execute an ordered sequence of operations. The executor runs 
 - `action`: Legacy format (still supported), used when `actions` is null
 - `entry_price`: **Advisory only** (for risk calculation) — all entries execute as market orders (Ioc), no limit. Set to `null` for current market price estimate, or fill in expected fill price for more accurate risk calculations
 - `stop_loss`: **Mandatory field**, must be provided for LONG/SHORT, ≥ 0.5% from entry
+- `take_profit`: **Mandatory field** for LONG/SHORT — required so the minimum R:R gate is always enforced (omitting TP is rejected, not skipped)
 - `size`: `null` auto-uses `MAX_POSITION_SIZE`
 - `modify_sl_to`: Only used with MODIFY_SL, specifies new stop loss price
 - `modify_tp_to`: Only used with MODIFY_TP, specifies new take profit price
@@ -1156,8 +1176,9 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 ## Hard Limits
 - Min confidence: 0.7 | Max position: 0.001 BTC | Leverage: 3x
 - SL min distance: 0.5% | SL REQUIRED for directional trades
-- SL must sit on the LOSING side of entry (LONG: SL < entry < TP; SHORT reversed)
-- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.
+- SL/TP must sit on the correct side: LONG needs SL < entry < TP, SHORT the mirror
+- TP REQUIRED for directional trades (prevents bypassing the R:R gate)
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|) — always enforced (TP is mandatory)
 - Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). Factor into P&L.
 
 ## Margin Budget (from your account)
@@ -1188,15 +1209,15 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 
 | Layer | Check | Rule |
 |-------|-------|------|
-| 1 | **Circuit Breaker** | 4 consecutive losses → pause 6 cycles; daily drawdown > 5% of equity freeze (UTC day, restart-aware: same-day P&L is re-seeded from trade history so pre-restart losses still count); no cooldown extension during cooldown |
+| 1 | **Circuit Breaker** | 4 consecutive losses → pause 6 cycles; daily drawdown > 5% of equity freeze (daily P&L resets at UTC midnight and is re-seeded from trade history on restart, so the cap always applies to TODAY's losses); no cooldown extension during cooldown |
 | 2 | **Confidence** | >= `MIN_CONFIDENCE` (default 0.7) to execute directional trades |
 | 3 | **Position Cap** | Not exceeding `MAX_POSITION_SIZE` |
 | 4 | **Margin Requirement** | `size × price / leverage` ≤ 95% available balance; reject and suggest appropriate size if exceeded |
 | 5 | **Risk Amount** | Single trade SL loss > 1% account warning, > 2% reject (`\|entry - SL\| × size`) |
-| 6 | **Stop Loss Distance + Side** | ≥ 0.5% from entry (BTC noise ~0.3%, reject below this threshold). Side validated: LONG needs SL < entry < TP, SHORT the mirror — a wrong-side SL (would trigger instantly) or wrong-side TP is rejected, abs()-distance alone can't catch these |
-| 7 | **Risk/Reward Ratio** | ≥ 1.5:1 (`|TP - entry| / |SL - entry|`) when TP is set. Trades with poor R:R (e.g., risking 2% to make 0.5%) are rejected. TP is optional — trades without TP skip this check |
-| 8 | **Direction** | Same-direction position rejected; **naked opposite entry rejected** (bare SHORT while long would orphan the existing position's SL/TP and trade record — flip via `["CLOSE", "SHORT"]`); CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation. MODIFY_SL to the wrong side of current price (instant trigger) is also rejected |
-| — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; missing oid **or no tracked SL at all** (live mode) → prompt warning + push notification. `MODIFY_SL`/`MODIFY_TP` then **re-place** the order automatically (restore path) instead of failing on a dead oid |
+| 6 | **Stop Loss Distance + Side** | ≥ 0.5% from entry (BTC noise ~0.3%, reject below this threshold; configurable via `MIN_SL_DISTANCE`). Side validated: LONG needs SL < entry < TP, SHORT the mirror — a wrong-side SL (would trigger instantly) or wrong-side TP is rejected, abs()-distance alone can't catch these |
+| 7 | **Risk/Reward Ratio** | ≥ 1.5:1 (`|TP - entry| / |SL - entry|`). **Always enforced — TP is mandatory for LONG/SHORT** (omitting TP would bypass this gate) |
+| 8 | **Direction** | Same-direction position rejected; **naked opposite entry rejected** (bare SHORT while long would silently reduce the real position and orphan its SL/TP + trade record — flip via `["CLOSE", "SHORT"]`); CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation. MODIFY_SL to the wrong side of current price (instant trigger) is also rejected |
+| — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; missing oid **or no tracked SL at all** (live mode) → prompt warning + throttled push notification. `MODIFY_SL`/`MODIFY_TP` then **re-place** the order automatically (restore path) instead of failing on a dead oid |
 | — | **SL/TP Real-Time Detection** | WebSocket detects SL/TP fills at millisecond latency → instant push notification (🛑/🎯). Tracker preserves close reason **and actual trigger fill price** across WS-triggered clear() so the next main-loop cycle records accurate close_reason and P&L instead of guessing from a stale mid price |
 | — | **Multi-Operation Fail-Fast** | Any non-HOLD operation in sequence fails → immediately stop subsequent operations, prevent half-completed states |
 
@@ -1445,7 +1466,8 @@ Your confidence must EXCEED 34.5% for positive EV.
 # ⚠️ HARD CONSTRAINTS (repeated from above)
 - Max position: 0.01 BTC | Min confidence: 0.70
 - SL REQUIRED for LONG/SHORT | Min SL distance: 0.5% of entry
-- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP set, enforced.
+- TP REQUIRED for LONG/SHORT (R:R gate always enforced)
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|)
 - Max leverage: 3x
 - Taker fees: ~0.07% round-trip. Factor into P&L estimates.
 - ⛔ CIRCUIT BREAKER ACTIVE: NEW POSITIONS BLOCKED (use HOLD/CLOSE/MODIFY only)
@@ -1631,6 +1653,8 @@ kimi_quant/
 │   ├── notify.py        # WeChat/Feishu push notifications (optional, auto-detect)
 │   ├── deposit.py       # Deposit/transfer/account type management (web3)
 │   └── main.py          # CLI entry point + trading loop
+├── tests/
+│   └── *.py            # Unit tests (uv run pytest — sync/risk/monitor/trade)
 ├── data/
 │   ├── debate.jsonl     # Debate history records (JSONL, fcntl file locks)
 │   └── trades.jsonl     # Trade records JSONL (fcntl file locks, concurrent read/write)
@@ -1641,11 +1665,27 @@ kimi_quant/
 └── README.md
 ```
 
+## Development & Testing
+
+The test suite covers the core trading logic with **zero network access** (no API keys, no Hyperliquid connection needed):
+
+```bash
+uv sync               # installs runtime + dev (pytest) dependencies
+uv run pytest         # run the full suite
+```
+
+| File | Covers |
+|------|--------|
+| `tests/test_sync.py` | PositionTracker / `sync_with_chain()` state machine — including the critical regressions: account-outage fail-safe (tracker survives unknown chain state) and dry-run multi-cycle position persistence |
+| `tests/test_risk.py` | All risk checks: direction (flip requires CLOSE), mandatory TP / R:R gate, SL distance, margin, risk budget, circuit breaker, daily drawdown (UTC reset + startup seeding) |
+| `tests/test_monitor.py` | WebSocket event parsing: batched updates (no dropped events), partial-fill totals, sentinels |
+| `tests/test_trade.py` | Trade P&L/fee math, JSONL persistence round-trip, cycle-feedback helpers |
+
 ## FAQ
 
 ### Q: Can't connect to Hyperliquid API from Alibaba Cloud?
 
-Alibaba Cloud egress gateways perform TLS fingerprint inspection on Python's default SSL library and Reset connections (curl command line works but Python throws `ConnectionResetError` or `SSLError: curl: (35) Recv failure`). This project has built-in four-layer protection:
+Alibaba Cloud egress gateways perform TLS fingerprint inspection on Python's default SSL library and Reset connections (curl command line works but Python throws `ConnectionResetError` or `SSLError: curl: (35) Recv failure`). This project has built-in five-layer protection:
 
 **Layer 1 — TLS Fingerprint Spoofing (curl_cffi)**: The `tls.py` shared module auto-patches Hyperliquid SDK's HTTP client with curl_cffi at import time, impersonating Firefox 147's JA3 TLS fingerprint. `data.py` and `executor.py` share the same patch logic, avoiding duplicate maintenance. Firefox is chosen over Chrome because anti-bot services most aggressively detect Chrome fingerprints (the most commonly impersonated browser); Firefox's TLS cipher suites and extension signals differ and aren't in the primary surveillance scope.
 
@@ -1661,6 +1701,10 @@ Alibaba Cloud egress gateways perform TLS fingerprint inspection on Python's def
 - **Thread-safe**: Safe under the parallel fetch workers
 
 **Layer 4 — Snapshot Disk Cache**: If every retry still fails, `metaAndAssetCtxs` and `l2Book` payloads fall back to the last successful copy on disk (`~/.kimi_quant/cache/`, 1h TTL) — the cycle continues on stale-but-recent data instead of failing outright. Logged as `Using stale cached ... (age=Xs)`.
+
+**Layer 5 — Account-State Fail-Safe (semantic protection)**: Layers 1-4 protect the *network path*, but a different failure mode existed at the *semantic* level: an account API failure returns no account snapshot, and treating that as "position gone" would clear the position tracker — the bot could then open a new position **on top of the real one**. Since the fix:
+- **Live mode + account unavailable** → the whole cycle is skipped (no LLM call, no trading) until account data recovers. `sync_with_chain()` never runs on unknown chain state, so the tracker is never cleared by an outage. A throttled push notification (every 15 min) alerts the operator.
+- **Dry-run** → there is no chain; the tracker is the source of truth, so sync is skipped entirely and positions **persist across cycles until an explicit CLOSE signal** (previously every dry-run position was force-closed the next cycle, making simulated P&L meaningless).
 
 Ensure `curl_cffi` is installed before running on server:
 ```bash
@@ -1869,6 +1913,7 @@ Dry-run involves zero on-chain operations, only validates LLM decision logic. Yo
 - What signals the LLM gives under what market conditions
 - Rough signal win rate (via simulated P&L)
 - System stability (any crashes, API errors)
+- Realistic position lifecycle: dry-run positions persist across cycles until the LLM signals CLOSE (multi-cycle holds, SL/TP management and position memory all behave as in live mode)
 
 ### Q: What's the difference between testnet and mainnet?
 

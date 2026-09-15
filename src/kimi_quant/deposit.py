@@ -463,3 +463,4 @@ def cmd_spot_to_perp(amount: float, force: bool = False) -> None:
     except (ValueError, RuntimeError) as e:
         print(f"Error: {e}")
         raise SystemExit(1) from None
+

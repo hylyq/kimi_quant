@@ -331,7 +331,7 @@ class TradingSignal(BaseModel):
     )
     take_profit: float | None = Field(
         default=None,
-        description="Suggested take profit price",
+        description="Take profit price — MANDATORY for LONG/SHORT (R:R >= 1.5:1); omitting it is rejected by risk control",
     )
     modify_sl_to: float | None = Field(
         default=None,
@@ -514,7 +514,8 @@ Output JSON only (no markdown):
   to use current mid, or provide your best estimate of the fill price for
   accurate risk calculation.)
 - stop_loss: mandatory for directional (min 0.5% from entry)
-- take_profit: realistic target
+- take_profit: MANDATORY for LONG/SHORT (realistic target, R:R ≥ 1.5:1) —
+  omitting it is rejected by risk control
 - modify_sl_to: new SL price (MODIFY_SL only)
 - modify_tp_to: new TP price (MODIFY_TP only)
 - key_factors: 2-4 items

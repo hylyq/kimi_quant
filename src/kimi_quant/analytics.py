@@ -53,7 +53,7 @@ class TradeRecord:
     # Computed
     pnl: float = 0.0
     pnl_pct: float = 0.0
-    fees_est: float = 0.0  # estimated fees (0.02% maker + 0.05% taker)
+    fees_est: float = 0.0  # estimated fees (0.035% taker per side × 2 sides)
 
     def close(
         self,

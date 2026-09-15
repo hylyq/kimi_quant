@@ -246,6 +246,8 @@ JUDGE_REASONING_EFFORT=max      # Judge 始终使用最强推理，不受厂家�
 
 **优先级**（从高到低）：Judge 覆盖 → 厂家专属设置 → 全局 `REASONING_EFFORT`。
 
+> ⚠️ **Kimi 限制**：`KIMI_REASONING_EFFORT` 只接受 `max` 或 `off`（Kimi K3 的 API 仅支持 `reasoning_effort=max`）。其他值会在配置校验时直接报错，而不是被静默忽略。`DEEPSEEK_REASONING_EFFORT` 支持全部档位。
+
 ```bash
 REASONING_EFFORT=max      # 最强推理 (默认)
 REASONING_EFFORT=high     # 高推理
@@ -456,7 +458,6 @@ Redis 配置（可选，默认 localhost:6379）：
   REDIS_HOST=localhost
   REDIS_PORT=6379
   REDIS_DB=0
-```
 ```
 
 程序启动时自动 ping Redis，连通即走通知通道。发送失败自动重连，不会因 Redis 临时重启而永久静默。`priority="high"` 确保离线消息不丢失（Redis 队列暂存，恢复后补发）。
@@ -839,7 +840,10 @@ tmux attach -t kimi
 ### 后台运行 (systemd)
 
 ```bash
-# 创建 service 文件
+# 1. 把项目部署到固定路径，然后按需调整下面所有路径
+#    cp -r /path/to/kimi_quant ~/kimi_quant && cd ~/kimi_quant && uv sync
+
+# 2. 创建 service 文件——把 <user> 替换成你自己的 Linux 用户名
 sudo tee /etc/systemd/system/kimi-quant.service << 'EOF'
 [Unit]
 Description=Kimi Quant Trading Bot
@@ -848,12 +852,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=marvin
-WorkingDirectory=/home/marvin/playground/kimi_quant
-EnvironmentFile=/home/marvin/playground/kimi_quant/.env
-ExecStart=/home/marvin/playground/kimi_quant/.venv/bin/kimi-quant --interval 300
+User=<user>
+WorkingDirectory=/home/<user>/kimi_quant
+# 机器人会自己加载 .env（python-dotenv），EnvironmentFile 可省略。
+# 若要保留，文件里不能有行尾注释（# ...）：systemd 不会去掉行尾注释，
+# 配置值（如 float 解析）会解析失败。
+# EnvironmentFile=/home/<user>/kimi_quant/.env
+ExecStart=/home/<user>/kimi_quant/.venv/bin/kimi-quant --interval 300
 Restart=on-failure
 RestartSec=30
+# debate 模式一个完整周期可能超过默认 90 秒的优雅停机超时——
+# 调大它，让停机干净完成而不是被 SIGKILL 强杀。
+TimeoutStopSec=180
+# 日志立即写入 journald（journalctl -f 实时可见）
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
@@ -866,14 +878,19 @@ sudo systemctl enable --now kimi-quant
 journalctl -u kimi-quant -f
 ```
 
+注意事项：
+- 把 `<user>` 替换成你的实际 Linux 用户名，路径指向你的部署目录（例如 `~/projects/kimi_quant`）。
+- 机器人会把状态持久化到 `~/.kimi_quant/`（IP 种子文件 + 快照缓存）。如果对 unit 做安全加固（`ProtectHome=` / `ProtectSystem=strict`），需用 `ReadWritePaths=` 放行该路径，否则缓存 / IP 故障转移功能会静默失效。
+- 按服务覆盖配置（例如 `NoNewPrivileges=true`）：`sudo systemctl edit kimi-quant`
+
 ### 健康监控
 
 ```bash
 # 设置定时告警（crontab）
 */10 * * * * cd /path/to/kimi_quant && uv run kimi-quant --stats 2>&1 | grep -q "Net P&L.*-[5-9][0-9]" && notify-send "Kimi Quant: 大幅回撤警告"
 
-# 检查进程是否存活
-pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
+# 检查服务是否存活
+systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 ```
 
 ## 配置参考
@@ -914,6 +931,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `MAX_POSITION_SIZE` | `0.01` | 最大仓位 (**单位：BTC**，非 USD) |
 | `MIN_CONFIDENCE` | `0.7` | 最低置信度阈值 |
 | `MAX_LEVERAGE` | `3` | 最大杠杆倍数 |
+| `MIN_SL_DISTANCE` | `0.005` | 止损距入场价的最小距离（价格比例，默认 0.5%） |
 | **策略** | | |
 | `STRATEGY_MODE` | `single` | `single` 或 `debate` |
 | `TRADING_INTERVAL` | `600` | 默认间隔（秒）。LLM 可通过 `next_interval` 动态覆盖 |
@@ -1118,6 +1136,7 @@ Hyperliquid 支持三种账户模式：
 - `action`: 旧格式（仍支持），当 `actions` 为 null 时使用
 - `entry_price`: **仅供参考**（风控计算用）——所有入场单以市价单（Ioc）执行，不设限价。设为 `null` 用当前市价估值，或填入你对成交价的预估以获得更精确的风控计算
 - `stop_loss`: **强制字段**，LONG/SHORT 时必须提供，且距入场价 ≥ 0.5%
+- `take_profit`: **强制字段**（LONG/SHORT 必填）——保证最低 R:R 规则始终生效（省略止盈会被拒绝，而不是跳过检查）
 - `size`: `null` 时自动使用 `MAX_POSITION_SIZE`
 - `modify_sl_to`: 仅 MODIFY_SL 时使用，指定新的止损价格
 - `modify_tp_to`: 仅 MODIFY_TP 时使用，指定新的止盈价格
@@ -1157,8 +1176,9 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 ## Hard Limits
 - Min confidence: 0.7 | Max position: 0.001 BTC | Leverage: 3x
 - SL min distance: 0.5% | SL REQUIRED for directional trades
-- SL must sit on the LOSING side of entry (LONG: SL < entry < TP; SHORT reversed)
-- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.
+- SL/TP must sit on the correct side: LONG needs SL < entry < TP, SHORT the mirror
+- TP REQUIRED for directional trades（防止绕过 R:R 门槛）
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|) — 始终强制执行（TP 为必填）
 - Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). Factor into P&L.
 
 ## Margin Budget (from your account)
@@ -1189,15 +1209,15 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 
 | 层级 | 检查项 | 规则 |
 |------|--------|------|
-| 1 | **熔断机制** | 连续 4 笔亏损 → 暂停 6 个 cycle；日回撤 > 5%（按 UTC 日结算，且重启后会从交易历史重播当日盈亏，重启前的亏损依然计入）；cooldown 内不延长 |
+| 1 | **熔断机制** | 连续 4 笔亏损 → 暂停 6 个 cycle；日回撤 > 5%（每日盈亏按 UTC 零点重置，且重启后从交易历史重播当日盈亏——上限始终只针对**当日**亏损）；cooldown 内不延长 |
 | 2 | **置信度** | >= `MIN_CONFIDENCE` (默认 0.7) 才执行方向性交易 |
 | 3 | **仓位上限** | 不超过 `MAX_POSITION_SIZE` |
 | 4 | **保证金需求** | `size × price / leverage` ≤ 可用余额的 95%，超出则拒绝并建议合理 size |
 | 5 | **风险金额** | 单笔止损亏损 > 1% 账户警告，> 2% 拒绝（`\|entry - SL\| × size`） |
-| 6 | **止损距离 + 方向** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝）。同时校验侧别：做多要求 SL < 入场价 < TP，做空镜像相反——SL 放错侧（下单即触发）或 TP 放错侧都会被拒绝，单纯 abs() 距离检查无法发现这类问题 |
-| 7 | **盈亏比 (R:R)** | ≥ 1.5:1（`|TP - entry| / |SL - entry|`），当设置了止盈时强制执行。盈亏比差的交易（如冒 2% 风险博 0.5% 收益）会被拒绝。止盈为可选字段——未设止盈则跳过此检查 |
-| 8 | **方向** | 已有同向仓位拒绝；**裸反向开仓拒绝**（持多仓时直接 SHORT 会导致现有仓位的 SL/TP 和交易记录失去关联——翻仓必须用 `["CLOSE", "SHORT"]`）；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换。MODIFY_SL 移到现价错误一侧（会立即触发）同样拒绝 |
-| — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`；oid 丢失**或根本没有跟踪的 SL**（live 模式）→ prompt 告警 + 推送通知。随后 `MODIFY_SL`/`MODIFY_TP` 会自动**补下新单**（恢复路径），而不是在已失效的 oid 上失败 |
+| 6 | **止损距离 + 方向** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝；可通过 `MIN_SL_DISTANCE` 配置）。同时校验侧别：做多要求 SL < 入场价 < TP，做空镜像相反——SL 放错侧（下单即触发）或 TP 放错侧都会被拒绝，单纯 abs() 距离检查无法发现这类问题 |
+| 7 | **盈亏比 (R:R)** | ≥ 1.5:1（`|TP - entry| / |SL - entry|`）。**始终强制执行——TP 对 LONG/SHORT 为必填字段**（省略止盈会绕过此门槛，已封堵） |
+| 8 | **方向** | 已有同向仓位拒绝；**裸反向开仓拒绝**（持多仓时直接 SHORT 会静默净额减仓并导致现有仓位的 SL/TP 和交易记录失去关联——翻仓必须用 `["CLOSE", "SHORT"]`）；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换。MODIFY_SL 移到现价错误一侧（会立即触发）同样拒绝 |
+| — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`；oid 丢失**或根本没有跟踪的 SL**（live 模式）→ prompt 告警 + 限频推送通知。随后 `MODIFY_SL`/`MODIFY_TP` 会自动**补下新单**（恢复路径），而不是在已失效的 oid 上失败 |
 | — | **SL/TP 实时检测** | WebSocket 毫秒级感知 SL/TP 触发 → 即时推送（🛑/🎯）。Tracker 在 WS 清除时保留平仓原因**和真实触发成交价**，下一轮主循环记录的 close_reason 和盈亏基于实际成交，而非用可能过期的 mid 价猜测 |
 | — | **多操作失败即停** | 序列中任一非 HOLD 操作失败，立即停止后续操作，防止半完成状态 |
 
@@ -1446,7 +1466,8 @@ Your confidence must EXCEED 34.5% for positive EV.
 # ⚠️ HARD CONSTRAINTS (repeated from above)
 - Max position: 0.01 BTC | Min confidence: 0.70
 - SL REQUIRED for LONG/SHORT | Min SL distance: 0.5% of entry
-- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP set, enforced.
+- TP REQUIRED for LONG/SHORT (R:R gate always enforced)
+- R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|)
 - Max leverage: 3x
 - Taker fees: ~0.07% round-trip. Factor into P&L estimates.
 - ⛔ CIRCUIT BREAKER ACTIVE: NEW POSITIONS BLOCKED (use HOLD/CLOSE/MODIFY only)
@@ -1632,6 +1653,8 @@ kimi_quant/
 │   ├── notify.py        # 微信/飞书消息推送（可选，自动检测）
 │   ├── deposit.py       # 入金/划转/账户类型管理（web3）
 │   └── main.py          # CLI 入口 + 交易循环
+├── tests/
+│   └── *.py            # Unit tests (uv run pytest — sync/risk/monitor/trade)
 ├── data/
 │   ├── debate.jsonl   # 辩论历史记录 (JSONL, fcntl 文件锁)
 │   └── trades.jsonl   # 交易记录 JSONL（fcntl 文件锁，支持并发读写）
@@ -1642,11 +1665,27 @@ kimi_quant/
 └── README.md
 ```
 
+## 开发与测试
+
+测试套件覆盖核心交易逻辑，**完全不需要网络**（无需 API key、无需连接 Hyperliquid）：
+
+```bash
+uv sync               # 安装运行依赖 + 开发依赖（pytest）
+uv run pytest         # 运行全部测试
+```
+
+| 文件 | 覆盖内容 |
+|------|----------|
+| `tests/test_sync.py` | PositionTracker / `sync_with_chain()` 状态机——包括两个关键回归：账户故障兜底（链状态未知时跟踪器不被清空）和 dry-run 多周期持仓保持 |
+| `tests/test_risk.py` | 全部风控检查：方向（反手必须 CLOSE）、TP 必填 / R:R 门槛、止损距离、保证金、风险预算、熔断器、每日回撤（UTC 重置 + 启动播种） |
+| `tests/test_monitor.py` | WebSocket 事件解析：批量更新（不丢事件）、部分成交总量、哨兵消息 |
+| `tests/test_trade.py` | 交易盈亏/手续费计算、JSONL 持久化往返、周期反馈辅助函数 |
+
 ## 常见问题
 
 ### Q: 阿里云服务器无法连接 Hyperliquid API？
 
-阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置四层防护：
+阿里云出口网关会对 Python 默认 SSL 库进行 TLS 指纹检测并 Reset 连接（`curl` 命令行正常但 Python 报 `ConnectionResetError`或 `SSLError: curl: (35) Recv failure`）。本项目已内置五层防护：
 
 **第一层 — TLS 指纹伪装（curl_cffi）**：通过 `tls.py` 共享模块在导入时自动将 Hyperliquid SDK 的 HTTP 客户端替换为 curl_cffi，伪装成 Firefox 147 浏览器的 JA3 TLS 指纹。`data.py` 和 `executor.py` 共用同一套补丁逻辑，避免重复维护。选择 Firefox 而非 Chrome 是因为反爬服务对 Chrome 指纹的检测最严格（Chrome 是最常被仿冒的浏览器），Firefox 的 TLS 密码套件和扩展信号不同，不在重点盯防范围。
 
@@ -1662,6 +1701,10 @@ kimi_quant/
 - **线程安全**：并行 fetch 下安全
 
 **第四层 — 快照磁盘缓存兜底**：若所有重试仍失败，`metaAndAssetCtxs` 和 `l2Book` 数据回退到磁盘上最近一次成功副本（`~/.kimi_quant/cache/`，1 小时 TTL）——周期以降级为陈旧数据继续运行，而不是整段失败。日志表现为 `Using stale cached ... (age=Xs)`。
+
+**第五层 — 账户状态兜底（语义层保护）**：第 1-4 层保护的是**网络路径**，但此前存在一个**语义层**故障模式：账户 API 失败时拿不到账户快照，若把它当作"仓位已平"会清空仓位跟踪器——机器人随后可能在真实仓位之上**重复开仓**。本次修复后：
+- **实盘 + 账户不可用** → 整个周期跳过（不调用 LLM、不交易），直到账户数据恢复。`sync_with_chain()` 在链状态未知时绝不执行，跟踪器不会被故障误清。节流推送通知（每 15 分钟）提醒运维人员。
+- **Dry-run** → 不存在链，tracker 是唯一事实来源，因此完全跳过 sync，仓位**跨周期持续持有直到 LLM 显式发出 CLOSE**（此前每笔 dry-run 仓位都会在下个周期被强制平掉，模拟盈亏毫无意义）。
 
 服务器上运行前确保 `curl_cffi` 已安装：
 ```bash
@@ -1870,6 +1913,7 @@ Dry-run 不涉及任何链上操作，只验证 LLM 决策逻辑。你可以在�
 - LLM 在什么市场条件下会给出什么信号
 - 信号的胜率大概如何（通过模拟盈亏）
 - 系统是否稳定（有无崩溃、API 报错）
+- 真实的持仓生命周期：dry-run 仓位跨周期持续持有，直到 LLM 发出 CLOSE（多周期持仓、止损止盈管理、仓位记忆都与实盘一致）
 
 ### Q: 测试网和主网有什么区别？
 
