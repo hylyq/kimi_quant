@@ -468,6 +468,17 @@ After the LLM places orders, they may fill at any time between cycles (especiall
 
 **OrderMonitor + FlashReporter** solves this: real-time order state subscription via Hyperliquid WebSocket, millisecond-level sync to position tracker, and cheap Flash model for Chinese push notifications.
 
+> **⚠️ Not running in dry-run mode**: this module starts ONLY when `DRY_RUN=false`. In dry-run there are no real orders, so the WebSocket never produces events and both `OrderMonitor` and `FlashReporter` are skipped entirely — no order push notifications, no Flash model calls (main-loop notifications like startup/open-simulate/risk-reject still work, they just never go through the Flash model). To verify this module, run with `DRY_RUN=false` (testnet + `DRY_RUN=false` is the zero-cost way) and look for these startup log lines:
+>
+> ```
+> OrderMonitor started (address=0x...)
+> WebSocket subscribed: orderUpdates(#1) + userFills(#2)
+> FlashReporter started (model=deepseek-v4-flash, llm=enabled)   ← "fallback-only" = no API key, template notifications
+> Flash LLM health check OK (model=deepseek-v4-flash)             ← Flash model actually reachable
+> ```
+>
+> If the Flash model later fails (rate limit, invalid model name), notifications degrade to fixed templates and the LLM is retried after a cooldown — pushes never disappear silently. Receiving NO order pushes at all means the monitor didn't start, not that the Flash model is down.
+
 ### Architecture
 
 ```
@@ -553,7 +564,7 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash model (cheap & fast)
 
 | Config | Default | Description |
 |--------|---------|-------------|
-| `MONITOR_ENABLED` | `true` | Enable/disable real-time monitoring (auto-disabled in dry-run) |
+| `MONITOR_ENABLED` | `true` | Enable/disable real-time monitoring. **Requires `DRY_RUN=false`** — the monitor (and Flash model) never starts in dry-run mode |
 | `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash model name. ~$0.02/1M tokens, <1s latency |
 | `MONITOR_FLASH_API_KEY` | Same as `DEEPSEEK_API_KEY` | Flash model API Key. Leave blank to reuse DeepSeek key |
 | `MONITOR_FLASH_BASE_URL` | Same as `DEEPSEEK_BASE_URL` | Flash model API endpoint |

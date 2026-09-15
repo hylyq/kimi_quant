@@ -468,6 +468,17 @@ Redis 配置（可选，默认 localhost:6379）：
 
 **OrderMonitor + FlashReporter** 解决了这个问题：通过 Hyperliquid WebSocket **实时**订阅订单状态变化，毫秒级同步到持仓追踪器，并用便宜的 Flash 模型生成中文推送通知。
 
+> **⚠️ dry-run 模式下本模块完全不启动**：只有 `DRY_RUN=false` 时才会创建 OrderMonitor 和 FlashReporter。dry-run 没有真实订单，WebSocket 不会产生任何事件，因此推送模型一次都不会被调用——订单类推送一条也不会发（主循环的通知如启动/模拟开仓/风控拒绝仍然正常，只是它们不经过 Flash 模型）。想验证本模块，用 `DRY_RUN=false` 运行（testnet + `DRY_RUN=false` 即可零成本验证），并在启动日志中确认这几行：
+>
+> ```
+> OrderMonitor started (address=0x...)
+> WebSocket subscribed: orderUpdates(#1) + userFills(#2)
+> FlashReporter started (model=deepseek-v4-flash, llm=enabled)   ← "fallback-only" = 没有 API key，退化为模板通知
+> Flash LLM health check OK (model=deepseek-v4-flash)             ← Flash 模型真实可达
+> ```
+>
+> 如果 Flash 模型运行中调用失败（限流、模型名错误等），通知会退化为固定中文模板并在冷却后自动重试 LLM——**推送不会静默消失**。如果连一条订单推送都收不到，说明 monitor 根本没启动（即还在 dry-run），而不是 Flash 模型挂了。
+
 ### 架构
 
 ```
@@ -553,7 +564,7 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash 模型（便宜快速）
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `MONITOR_ENABLED` | `true` | 开启/关闭实时监控（dry-run 模式下自动禁用） |
+| `MONITOR_ENABLED` | `true` | 开启/关闭实时监控。**必须 `DRY_RUN=false` 才生效**——dry-run 模式下监控（及 Flash 模型）完全不启动 |
 | `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash 模型名称。约 ¥0.14/1M tokens，<1s 延迟 |
 | `MONITOR_FLASH_API_KEY` | 同 `DEEPSEEK_API_KEY` | Flash 模型 API Key。不配则复用 DeepSeek key |
 | `MONITOR_FLASH_BASE_URL` | 同 `DEEPSEEK_BASE_URL` | Flash 模型 API 端点 |
