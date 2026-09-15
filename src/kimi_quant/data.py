@@ -324,6 +324,8 @@ def _build_constraint_recap(
     min_sl_dist: float,
     breaker_active: bool = False,
     breaker_msg: str = "",
+    max_sl_dist: float | None = None,
+    min_hold_minutes: int = 0,
 ) -> str:
     """Build a short constraint recap for the END of the prompt (recency effect).
 
@@ -334,15 +336,75 @@ def _build_constraint_recap(
     lines = [
         "# ⚠️ HARD CONSTRAINTS (repeated from above)",
         f"- Max position: {max_size} BTC | Min confidence: {min_conf:.2f}",
-        f"- SL REQUIRED for LONG/SHORT | Min SL distance: {min_sl_dist:.1%} of entry",
+        f"- SL REQUIRED for LONG/SHORT | SL distance band: "
+        f"{min_sl_dist:.1%}"
+        + (f"–{max_sl_dist:.1%}" if max_sl_dist is not None else "")
+        + " of entry",
         f"- Max leverage: {max_lev}x",
     ]
+    if min_hold_minutes > 0:
+        lines.append(
+            f"- CLOSE discipline: no CLOSE before {min_hold_minutes}min hold "
+            f"(unless price moved ≥50% of SL distance or confidence ≥0.90) "
+            f"— manage with HOLD/MODIFY_SL/MODIFY_TP instead"
+        )
     if breaker_active:
         lines.append(
             f"- ⛔ CIRCUIT BREAKER ACTIVE: {breaker_msg} — "
             f"LONG/SHORT will be REJECTED, use HOLD/CLOSE/MODIFY_SL/MODIFY_TP only"
         )
     lines.append("- Output JSON only, no markdown formatting.")
+    return "\n".join(lines)
+
+
+def _build_entry_discipline(timeframes: list) -> str:
+    """Chase/extension warning computed from the 5m/15m summaries.
+
+    Live-data autopsy: entries clustered at local extremes (buying 68,705
+    after a run-up, shorting 77,827 the day before continuation). This puts
+    an explicit "price is already extended" number in front of the LLM:
+    the window's move measured in units of the random-walk expectation
+    (per-candle ATR × √candles). A steady grind ≈ 1×; a chase-worthy spike
+    ≫ 1×.
+    """
+    best: tuple[float, str, Any] | None = None
+    for t in timeframes:
+        if t.interval not in ("5m", "15m"):
+            continue
+        if t.atr_pct <= 0 or t.num_candles <= 0:
+            continue
+        expected = t.atr_pct * (t.num_candles ** 0.5)
+        if expected <= 0:
+            continue
+        ratio = abs(t.change_pct) / expected
+        if best is None or ratio > best[0]:
+            best = (ratio, t.interval, t)
+    if best is None:
+        return ""
+
+    ratio, interval, tf = best
+    lines = ["# 🚦 Entry Discipline"]
+    lines.append(
+        f"{interval} momentum: {tf.change_pct:+.2f}% over the last "
+        f"{tf.duration_hours:.0f}h = {ratio:.1f}× the random-walk "
+        f"expectation ({tf.num_candles} candles × {tf.atr_pct:.2f}% ATR)"
+    )
+    if ratio >= 1.5:
+        lines.append(
+            "⚠️ EXTENDED: short-term momentum is ≥1.5× the random-walk "
+            "expectation. Chasing here buys local tops / sells local "
+            "bottoms. Wait for a pullback or a confirmation close."
+        )
+
+    tf_1h = next((t for t in timeframes if t.interval == "1h"), None)
+    tf_4h = next((t for t in timeframes if t.interval == "4h"), None)
+    if tf_1h is not None and tf_4h is not None:
+        t1, t4 = tf_1h.trend, tf_4h.trend
+        if t1 in ("up", "down") and t1 == t4:
+            lines.append(
+                f"Trend 1h+4h: {t1.upper()} — counter-trend entries need "
+                f"confidence ≥ 0.80 or they are REJECTED by risk control."
+            )
     return "\n".join(lines)
 
 
@@ -504,6 +566,20 @@ class MarketAnalysis:
     account: AccountSnapshot | None
     performance_context: str = ""
 
+    @staticmethod
+    def _entry_execution_note() -> str:
+        if config.entry_order_type == "maker":
+            return (
+                "entries execute as PASSIVE MAKER limits (GTC, clamped to "
+                "the book: buy ≤ bid / sell ≥ ask, maker fee 0.015%) — set "
+                "entry_price where you actually want to rest the order; an "
+                "unfilled entry is cancelled after 3 cycles"
+            )
+        return (
+            "entries execute as market (Ioc) taker orders (0.045% fee) — "
+            "entry_price is informational only"
+        )
+
     def to_llm_prompt(self) -> str:
         """Build the full LLM prompt from all analysis components."""
         parts = [_build_time_context(), "\n"]
@@ -523,6 +599,10 @@ class MarketAnalysis:
             regime = _build_volatility_regime(self.timeframes)
             if regime:
                 parts.append("\n" + regime)
+            # Chase/extension warning — computed, not vibes
+            discipline = _build_entry_discipline(self.timeframes)
+            if discipline:
+                parts.append("\n" + discipline)
         else:
             parts.append("  (Candle data unavailable — testnet or API error)")
 
@@ -552,9 +632,9 @@ class MarketAnalysis:
             f"Higher TF (4h>1h>15m>5m) carry more weight. "
             f"Confluence → higher confidence. Divergence → follow higher TF, "
             f"reduce size, tighten SL. Stop loss min 0.5% from entry.\n"
-            f"All entry orders execute as market (Ioc) orders — "
-            f"entry_price is informational only (use it to indicate your "
-            f"expected fill level for risk calculations).\n"
+            f"Entry execution: {self._entry_execution_note()}\n"
+            f"Exit discipline: prefer the exchange-side SL/TP over manual CLOSE — "
+            f"risk control rejects noise CLOSEs (see Close Discipline constraints).\n"
             f"Output via `actions` array. Use [\"CLOSE\", \"SHORT\"] to flip, "
             f"[\"MODIFY_SL\", \"MODIFY_TP\"] to adjust both stops. "
             f"Single action: [\"LONG\"], [\"HOLD\"], etc.\n"
@@ -1368,6 +1448,11 @@ class DataProvider:
             if lessons:
                 prompt += "\n" + lessons
 
+            # Inject confidence calibration / exit attribution
+            calibration = report.get("calibration_context", "")
+            if calibration:
+                prompt += "\n" + calibration
+
             # Inject performance context if present
             perf = report.get("performance_context", "")
             if perf:
@@ -1383,6 +1468,8 @@ class DataProvider:
                 min_sl_dist=config.min_sl_distance,
                 breaker_active=breaker_active,
                 breaker_msg="NEW POSITIONS BLOCKED" if breaker_active else "",
+                max_sl_dist=config.max_sl_distance,
+                min_hold_minutes=config.min_hold_minutes,
             )
             prompt += "\n" + recap
             return prompt

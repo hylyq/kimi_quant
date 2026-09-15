@@ -178,3 +178,64 @@ def test_execute_hold_not_a_failure(executor):
         action="HOLD", confidence=0.4, reasoning="wait"))
     assert result["executed"] is False
     assert result["action"] == "HOLD"
+
+
+# ─── Passive price clamping (maker entries) ───────────────────────────────
+
+
+from kimi_quant.executor import _clamp_passive_price
+
+
+def test_aggressive_buy_clamped_to_bid():
+    # LLM wants to buy at the ask — clamp to the bid so it rests as maker
+    assert _clamp_passive_price(100_050.0, 100_000.0, 100_050.0, True) == 100_000.0
+
+
+def test_passive_buy_kept():
+    assert _clamp_passive_price(99_800.0, 100_000.0, 100_050.0, True) == 99_800.0
+
+
+def test_aggressive_sell_clamped_to_ask():
+    assert _clamp_passive_price(99_900.0, 100_000.0, 100_050.0, False) == 100_050.0
+
+
+def test_passive_sell_kept():
+    assert _clamp_passive_price(100_200.0, 100_000.0, 100_050.0, False) == 100_200.0
+
+
+# ─── ensure_protective_orders (dry-run no-op / no position) ──────────────
+
+
+def test_ensure_protective_orders_noop_without_position():
+    ex = TradeExecutor()  # dry-run (conftest)
+    assert ex.ensure_protective_orders() == {"sl_placed": False, "tp_placed": False}
+
+
+def test_ensure_protective_orders_noop_in_dry_run():
+    ex = TradeExecutor()
+    ex.tracker.update_from_open(
+        "long", 0.01, 100_000.0, {},
+        sl_price=99_000.0, tp_price=102_000.0,
+    )
+    ex.tracker.state = "active"
+    # Dry-run: no orders exist to place — must not raise or "place" anything
+    assert ex.ensure_protective_orders() == {"sl_placed": False, "tp_placed": False}
+
+
+# ─── Maker fill flow: resting → filled → protection pending ──────────────
+
+
+def test_maker_flow_resting_then_ws_fill_retains_planned_sl_tp():
+    t = PositionTracker()
+    # What _open_position_maker records when the GTC order is acked:
+    t.update_from_open("long", 0.01, 99_950.0, {"entry": 42},
+                       sl_price=99_000.0, tp_price=102_000.0)
+    assert t.state == "resting"
+    assert t.sl_oid is None and t.tp_oid is None  # deferred until fill
+    # WS reports the fill:
+    t.apply_ws_event(make_event(EventType.ORDER_FILLED, 42, price=99_950.0))
+    assert t.state == "active"
+    # Planned levels survive so ensure_protective_orders can use them:
+    assert t.sl_price == pytest.approx(99_000.0)
+    assert t.tp_price == pytest.approx(102_000.0)
+    assert t.sl_oid is None  # still unplaced → ensure will handle it

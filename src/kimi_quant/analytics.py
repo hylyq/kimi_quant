@@ -24,11 +24,12 @@ DEFAULT_LOG_PATH = str(
     Path(__file__).parent.parent.parent / "data" / "trades.jsonl"
 )
 
-# Hyperliquid standard fee rates (as of 2026-07).
-# All entry orders use Ioc (market) execution → taker fee on both sides.
-TAKER_FEE_RATE = 0.00035   # 0.035% per side
-MAKER_FEE_RATE = 0.00010   # 0.010% per side (not used for Ioc entries)
-ROUNDTRIP_TAKER_FEE = TAKER_FEE_RATE * 2  # 0.07% round-trip
+# Hyperliquid base-tier fee rates, verified against live fills
+# (2026-07/08 trade history: every taker fill priced at exactly 4.5bp of
+# notional, the two 7/18 maker entries at 1.5bp).
+TAKER_FEE_RATE = 0.00045   # 0.045% per taker side
+MAKER_FEE_RATE = 0.00015   # 0.015% per maker side
+ROUNDTRIP_TAKER_FEE = TAKER_FEE_RATE * 2  # 0.09% round-trip
 
 
 # ─── Trade Record ────────────────────────────────────────────────────────
@@ -45,6 +46,14 @@ class TradeRecord:
     entry_price: float
     dry_run: bool = False  # True if this is a simulated trade
 
+    # Signal at entry — for confidence calibration (live data showed the
+    # 0.7+ gate had zero discrimination: every trade passed it, 74% lost).
+    # planned_* record the thesis as proposed; compare against exit to see
+    # whether the plan or the management decided the outcome.
+    entry_confidence: float = 0.0
+    planned_sl: float = 0.0
+    planned_tp: float = 0.0
+
     # Exit
     closed_at: str | None = None
     exit_price: float = 0.0
@@ -53,7 +62,8 @@ class TradeRecord:
     # Computed
     pnl: float = 0.0
     pnl_pct: float = 0.0
-    fees_est: float = 0.0  # estimated fees (0.035% taker per side × 2 sides)
+    fees_est: float = 0.0  # estimated fees (taker per side × 2 sides)
+    entry_type: str = "market"  # "market" | "maker" — entry execution type
 
     def close(
         self,
@@ -78,11 +88,12 @@ class TradeRecord:
             else 0.0
         )
 
-        # Estimated fees: taker on both sides (all entries use Ioc market orders).
-        # Entry notional + exit notional, each at the taker rate.
+        # Estimated fees: exit is always taker (market close / market
+        # trigger); entry pays maker only for passive-limit entries.
+        entry_rate = MAKER_FEE_RATE if self.entry_type == "maker" else TAKER_FEE_RATE
         entry_notional = self.entry_price * self.size
         exit_notional = exit_price * self.size
-        self.fees_est = (entry_notional + exit_notional) * TAKER_FEE_RATE
+        self.fees_est = entry_notional * entry_rate + exit_notional * TAKER_FEE_RATE
 
     @property
     def is_win(self) -> bool:
@@ -101,6 +112,9 @@ class TradeRecord:
             "size": self.size,
             "entry_price": self.entry_price,
             "dry_run": self.dry_run,
+            "entry_confidence": self.entry_confidence,
+            "planned_sl": self.planned_sl,
+            "planned_tp": self.planned_tp,
             "closed_at": self.closed_at,
             "exit_price": self.exit_price,
             "close_reason": self.close_reason,
@@ -109,6 +123,7 @@ class TradeRecord:
             "fees_est": round(self.fees_est, 2),
             "net_pnl": round(self.net_pnl, 2),
             "is_win": self.is_win,
+            "entry_type": self.entry_type,
         }
 
 
@@ -161,6 +176,10 @@ class TradeLogger:
     def open_trade(
         self, side: str, size: float, entry_price: float,
         dry_run: bool = False,
+        entry_confidence: float = 0.0,
+        planned_sl: float = 0.0,
+        planned_tp: float = 0.0,
+        entry_type: str = "market",
     ) -> TradeRecord:
         """Record a new trade opening."""
         if self._pending is not None:
@@ -176,12 +195,17 @@ class TradeLogger:
             size=size,
             entry_price=entry_price,
             dry_run=dry_run,
+            entry_confidence=entry_confidence,
+            planned_sl=planned_sl,
+            planned_tp=planned_tp,
+            entry_type=entry_type,
         )
         self._pending = trade
         mode = " (dry-run)" if dry_run else ""
         logger.info(
-            "Trade opened%s: %s %.4f @ $%.1f",
+            "Trade opened%s: %s %.4f @ $%.1f (conf=%.2f, SL=$%.0f, TP=$%.0f, %s)",
             mode, side.upper(), size, entry_price,
+            entry_confidence, planned_sl, planned_tp, entry_type,
         )
         return trade
 
@@ -427,6 +451,90 @@ class TradeLogger:
 
         return "\n".join(lines)
 
+    def get_calibration_context(self) -> str:
+        """Confidence calibration + exit attribution for the LLM prompt.
+
+        Two questions the live trade history could not answer but the next
+        generation of records can:
+          1. Does higher stated confidence actually win more? (Bucketed
+             win rates — if 0.70–0.85 all win ~26%, the gate is decorative.)
+          2. Where do losses come from — exchange SL/TP hits, or the LLM
+             closing early? ("signal" closes bleeding fees = churn.)
+
+        Returns empty string with fewer than 5 confidence-tagged real trades
+        (not enough evidence to steer the LLM yet).
+        """
+        real = [t for t in self._closed if not t.dry_run and t.closed_at]
+        tagged = [t for t in real if t.entry_confidence > 0]
+        if len(tagged) < 5:
+            return ""
+
+        lines = ["\n# 🎯 Confidence Calibration (your real trades)"]
+
+        buckets: dict[float, list[TradeRecord]] = {}
+        for t in tagged:
+            key = round(t.entry_confidence * 20) / 20  # 0.05-wide buckets
+            buckets.setdefault(key, []).append(t)
+
+        for key in sorted(buckets):
+            ts = buckets[key]
+            wins = sum(1 for t in ts if t.is_win)
+            net = sum(t.net_pnl for t in ts)
+            lines.append(
+                f"- conf {key:.2f}–{key + 0.05:.2f}: {len(ts)} trades, "
+                f"{wins}/{len(ts)} wins ({wins / len(ts):.0%}), "
+                f"net ${net:+.2f}"
+            )
+
+        # Actionable calibration guidance
+        strong = [t for t in tagged if t.entry_confidence >= 0.8]
+        weak = [t for t in tagged if t.entry_confidence < 0.8]
+        if len(strong) >= 3 and len(weak) >= 3:
+            strong_wr = sum(1 for t in strong if t.is_win) / len(strong)
+            weak_wr = sum(1 for t in weak if t.is_win) / len(weak)
+            if strong_wr <= weak_wr + 0.05:
+                lines.append(
+                    "⚠️ Your high-confidence signals are NOT outperforming: "
+                    "treat confidence as uncalibrated. Be stricter — demand "
+                    "stronger evidence before assigning 0.8+."
+                )
+            elif weak_wr < 0.35:
+                lines.append(
+                    "⚠️ Signals below 0.8 lose most of the time — prefer "
+                    "waiting for 0.8+ setups or HOLD."
+                )
+
+        # Exit attribution — churn visibility
+        lines.append("\n## Exit Attribution")
+        for reason in ("signal", "stop_loss", "take_profit", "manual"):
+            ts = [t for t in real if t.close_reason == reason]
+            if not ts:
+                continue
+            wins = sum(1 for t in ts if t.is_win)
+            net = sum(t.net_pnl for t in ts)
+            label = {
+                "signal": "LLM CLOSE",
+                "stop_loss": "SL hit",
+                "take_profit": "TP hit",
+                "manual": "manual/unknown",
+            }[reason]
+            lines.append(
+                f"- {label}: {len(ts)} trades, {wins}/{len(ts)} wins, "
+                f"net ${net:+.2f}"
+            )
+
+        sig = [t for t in real if t.close_reason == "signal"]
+        if len(sig) >= 3:
+            sig_net = sum(t.net_pnl for t in sig)
+            if sig_net < 0:
+                lines.append(
+                    "⚠️ Your own CLOSE decisions are net negative while SL/TP "
+                    "handles the rest — default to HOLD/MODIFY_SL and let "
+                    "the exchange-side orders exit."
+                )
+
+        return "\n".join(lines)
+
     # ─── Persistence ─────────────────────────────────────────────────────
 
     def _append_to_file(self, trade: TradeRecord) -> None:
@@ -464,12 +572,16 @@ class TradeLogger:
                                 size=data["size"],
                                 entry_price=data["entry_price"],
                                 dry_run=data.get("dry_run", False),
+                                entry_confidence=data.get("entry_confidence", 0.0),
+                                planned_sl=data.get("planned_sl", 0.0),
+                                planned_tp=data.get("planned_tp", 0.0),
                                 closed_at=data.get("closed_at"),
                                 exit_price=data.get("exit_price", 0),
                                 close_reason=data.get("close_reason", ""),
                                 pnl=data.get("pnl", 0),
                                 pnl_pct=data.get("pnl_pct", 0),
                                 fees_est=data.get("fees_est", 0),
+                                entry_type=data.get("entry_type", "market"),
                             )
                             self._closed.append(trade)
                         except Exception:

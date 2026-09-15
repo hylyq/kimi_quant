@@ -76,6 +76,17 @@ def _is_trigger_order(order: dict) -> bool:
     return False
 
 
+def _clamp_passive_price(desired: float, bid: float, ask: float, is_buy: bool) -> float:
+    """Clamp a desired entry price to the passive side of the book.
+
+    A buy at/above the ask (or a sell at/below the bid) crosses the spread
+    and fills as taker — exactly what maker mode exists to avoid.
+    """
+    if is_buy:
+        return min(desired, bid)
+    return max(desired, ask)
+
+
 # ─── Order State Tracking ────────────────────────────────────────────────
 
 
@@ -985,11 +996,39 @@ class TradeExecutor:
 
     # ─── Open Position ───────────────────────────────────────────────────
 
+    def _best_bid_ask(self) -> tuple[float, float]:
+        """Fetch top-of-book prices for passive entry pricing."""
+        from kimi_quant.data import retry_api_call
+
+        try:
+            book = retry_api_call(
+                lambda: self.info.l2_snapshot(self.coin),
+                description="l2_snapshot (maker entry)",
+                max_retries=2,
+            )
+            levels = book.get("levels", [[], []])
+            bid = float(levels[0][0]["px"]) if levels[0] else 0.0
+            ask = float(levels[1][0]["px"]) if len(levels) > 1 and levels[1] else 0.0
+            return bid, ask
+        except Exception as e:
+            logger.warning("l2_snapshot failed while pricing maker entry: %s", e)
+            return 0.0, 0.0
+
     def _open_position(self, signal: TradingSignal, is_buy: bool) -> dict:
         """Open a position with stop loss and take profit.
 
-        After placing orders, marks tracker as "resting".
-        The next cycle's sync_with_chain() will confirm or cancel.
+        Market mode: Ioc entry + SL + TP placed atomically; the tracker's
+        brief "resting" state is confirmed next cycle.
+
+        Maker mode (ENTRY_ORDER_TYPE=maker): a passive GTC limit clamped to
+        the book (buy ≤ best bid / sell ≥ best ask) so the entry fills as
+        MAKER (1.5bp instead of 4.5bp — live data showed fees were 54% of
+        the net loss). SL/TP cannot be attached to an unfilled entry
+        (reduce-only requires the position), so they are placed by
+        ensure_protective_orders() as soon as the fill is confirmed; the
+        entry may simply never fill — that is accepted (fewer, better-timed
+        entries) and the resting order is cancelled after
+        max_resting_cycles.
         """
         size = signal.size or config.max_position_size
         side = "long" if is_buy else "short"
@@ -1021,6 +1060,9 @@ class TradeExecutor:
                 "take_profit": signal.take_profit,
                 "reasoning": signal.reasoning,
             }
+
+        if config.entry_order_type == "maker":
+            return self._open_position_maker(signal, is_buy, size)
 
         try:
             # Set leverage first
@@ -1178,6 +1220,146 @@ class TradeExecutor:
             f"${signal.take_profit:.0f}" if signal.take_profit else "NO",
         )
         return orders
+
+    def _open_position_maker(
+        self, signal: TradingSignal, is_buy: bool, size: float
+    ) -> dict:
+        """Place a passive GTC limit entry (maker fee on fill).
+
+        The limit price is the LLM's entry_price clamped to the passive side
+        of the book: min(entry, best_bid) for buys, max(entry, best_ask) for
+        sells. An aggressive LLM price would cross the spread and fill as
+        taker — exactly the behavior maker mode exists to avoid.
+        """
+        side = "long" if is_buy else "short"
+
+        try:
+            self.exchange.update_leverage(config.max_leverage, self.coin)
+
+            bid, ask = self._best_bid_ask()
+            if bid <= 0 or ask <= 0:
+                return {
+                    "action": signal.action,
+                    "executed": False,
+                    "error": "Order book unavailable — refusing to place a "
+                             "blind maker entry",
+                    "reasoning": signal.reasoning,
+                }
+
+            desired = signal.entry_price or ((bid + ask) / 2)
+            px = _round_to_tick(
+                _clamp_passive_price(desired, bid, ask, is_buy),
+                self._tick_size,
+            )
+
+            result = self.exchange.order(
+                name=self.coin,
+                is_buy=is_buy,
+                sz=size,
+                limit_px=px,
+                order_type={"limit": {"tif": "Gtc"}},
+            )
+
+            errors = _extract_errors(result, 1)
+            if errors:
+                logger.error("Maker entry rejected by exchange: %s", errors)
+                return {
+                    "action": signal.action,
+                    "executed": False,
+                    "error": f"Exchange rejected order: {errors}",
+                    "reasoning": signal.reasoning,
+                }
+
+            oid = _parse_single_oid(result)
+            self.tracker.update_from_open(
+                side, size, px, {"entry": oid},
+                sl_price=signal.stop_loss or 0.0,
+                tp_price=signal.take_profit or 0.0,
+                entry_reason=signal.reasoning or "",
+                entry_confidence=signal.confidence,
+            )
+
+            logger.info(
+                "MAKER entry placed: %s %.4f %s @ $%.1f "
+                "(book %s/%s, SL/TP deferred until fill; cancel after %d unfilled cycles)",
+                "BUY" if is_buy else "SELL", size, self.coin, px, bid, ask,
+                self.tracker.max_resting_cycles,
+            )
+
+            return {
+                "action": signal.action,
+                "executed": True,
+                "dry_run": False,
+                "side": side,
+                "size": size,
+                "entry_price": px,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "oids": {"entry": oid, "sl": None, "tp": None},
+                "result": result,
+                "resting": True,
+                "reasoning": signal.reasoning,
+            }
+
+        except Exception as e:
+            logger.error("Maker entry failed: %s", e, exc_info=True)
+            return {
+                "action": signal.action,
+                "executed": False,
+                "error": str(e),
+                "reasoning": signal.reasoning,
+            }
+
+    def ensure_protective_orders(self) -> dict:
+        """Place missing SL/TP trigger orders for the active position.
+
+        Maker entries cannot attach SL/TP at placement time (reduce-only
+        orders require the position to exist), so this runs every cycle
+        after chain sync: as soon as the fill is confirmed, protection goes
+        up. It also restores orders lost on chain without waiting for the
+        LLM to notice and emit MODIFY_SL.
+
+        Intended worst-case exposure is one cycle (the main loop caps its
+        sleep at 120s while an entry is resting, so a fill is picked up
+        quickly). Failures are logged, not raised — the cycle-start
+        verify_tracked_orders() path keeps nagging until it succeeds.
+        """
+        out = {"sl_placed": False, "tp_placed": False}
+        if self.dry_run or not self.tracker.has_position():
+            return out
+
+        with self.tracker._lock:
+            size = self.tracker.size
+            sl_oid, sl_px = self.tracker.sl_oid, self.tracker.sl_price
+            tp_oid, tp_px = self.tracker.tp_oid, self.tracker.tp_price
+
+        if sl_oid is None and sl_px > 0 and size > 0:
+            result, oid = self._place_protective_trigger(sl_px, "sl", size)
+            if result.get("executed") and oid is not None:
+                self.tracker.record_sl(oid, sl_px)
+                out["sl_placed"] = True
+                logger.info("Protection: SL placed @ $%.1f (order #%s)",
+                            sl_px, oid)
+            else:
+                logger.error(
+                    "Protection: FAILED to place SL @ $%.1f — position "
+                    "unprotected, will retry next cycle", sl_px,
+                )
+
+        if tp_oid is None and tp_px > 0 and size > 0:
+            result, oid = self._place_protective_trigger(tp_px, "tp", size)
+            if result.get("executed") and oid is not None:
+                self.tracker.record_tp(oid, tp_px)
+                out["tp_placed"] = True
+                logger.info("Protection: TP placed @ $%.1f (order #%s)",
+                            tp_px, oid)
+            else:
+                logger.warning(
+                    "Protection: FAILED to place TP @ $%.1f — will retry "
+                    "next cycle (SL still protects the position)", tp_px,
+                )
+
+        return out
 
     # ─── Close Position ──────────────────────────────────────────────────
 

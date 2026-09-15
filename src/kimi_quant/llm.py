@@ -321,9 +321,11 @@ class TradingSignal(BaseModel):
     )
     entry_price: float | None = Field(
         default=None,
-        description="Estimated entry price for risk calculation. "
-                    "Informational only — all entries execute as market/Ioc orders. "
-                    "Set to null to use current mid, or provide your best estimate.",
+        description="Desired entry price. With maker entries (ENTRY_ORDER_TYPE=maker) "
+                    "this is where your limit rests (clamped to the passive side of "
+                    "the book — buy ≤ bid, sell ≥ ask), so set it deliberately. "
+                    "With market entries it is informational only (used for risk "
+                    "math); set to null to use current mid.",
     )
     stop_loss: float | None = Field(
         default=None,
@@ -449,25 +451,36 @@ Step 0 — ASSESS EXISTING STATE FIRST (before any market analysis):
   a. If you HAVE a position: is it still valid? Check whether the trend that
      justified entry is intact. If the original thesis is broken, CLOSE it.
      If it's working, consider MODIFY_SL to lock in profit or move to breakeven.
-  b. Check open orders: are the tracked SL/TP orders actually on the chain?
+  b. CLOSE DISCIPLINE: risk control REJECTS CLOSEs made within 30min of entry
+     unless price has moved ≥50% of the SL distance or your confidence is
+     ≥0.90. Do not propose reflexive closes on next-cycle noise — the trade
+     was opened with a multi-hour thesis (SL ≥0.5%, R:R ≥1.5); give it time
+     or manage it with MODIFY_SL. Your trade history shows early manual
+     closes were the largest fee leak.
+  c. Check open orders: are the tracked SL/TP orders actually on the chain?
      If SL/TP are MISSING from chain → position is UNPROTECTED → use MODIFY_SL
      or MODIFY_TP immediately, or CLOSE. This is the highest priority action.
      (MODIFY_SL re-places the order automatically when it is gone.)
-  c. Are there stale/manual orders on chain not matching your strategy?
+  d. Are there stale/manual orders on chain not matching your strategy?
      Clean them up with CANCEL_STALE (cancels untracked orders only).
-  d. Are SL/TP levels still appropriate for current volatility (ATR)?
+  e. Are SL/TP levels still appropriate for current volatility (ATR)?
      Tighten if volatility dropped, widen if it spiked.
 
 Step 1 — ANALYZE MARKET (only after completing Step 0):
   1. Higher TF trend = anchor (4h > 1h > 15m > 5m). Don't fight it.
-  2. Order book: bid walls = support, ask walls = resistance. Thin books = noise.
-  3. Funding: very positive → crowded longs (reversal risk); negative → shorts paying (squeeze risk).
-  4. Multi-TF confluence → higher confidence. Divergence → follow higher TF, reduce size.
-  5. When uncertain, HOLD. Confidence must EXCEED the breakeven win-rate from
+     Entries opposing BOTH the 1h and 4h trend need confidence ≥ 0.80 —
+     they are REJECTED below that.
+  2. Don't chase: check the Entry Discipline section — if short-term
+     momentum is ≥1.5× the random-walk expectation, wait for a pullback
+     instead of buying the local top / selling the local bottom.
+  3. Order book: bid walls = support, ask walls = resistance. Thin books = noise.
+  4. Funding: very positive → crowded longs (reversal risk); negative → shorts paying (squeeze risk).
+  5. Multi-TF confluence → higher confidence. Divergence → follow higher TF, reduce size.
+  6. When uncertain, HOLD. Confidence must EXCEED the breakeven win-rate from
      the EV Check section (usually 30-40%). R:R below 1.5:1 is HARD REJECTED
      regardless of confidence — widen TP or skip the trade.
      Confidence < 0.7 → skip trade.
-  6. If you decided to modify SL/TP in Step 0, include those actions BEFORE
+  7. If you decided to modify SL/TP in Step 0, include those actions BEFORE
      any new entry actions in the `actions` array.
 
 Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing):
@@ -488,8 +501,9 @@ Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing
      → If hope > data, reduce confidence by 0.15 or output HOLD.
 
   5. R:R VERIFICATION: R:R = |TP - entry| / |SL - entry|. Must be ≥ 1.5:1.
-     After ~0.07% round-trip taker fees, a 0.5% move is only ~0.43% net profit.
-     Small TP distances are eaten by fees. Widen TP or skip the trade.
+     After ~0.09% round-trip taker fees (0.06% with maker entries), a 0.5%
+     move is only ~0.41% net profit. Small TP distances are eaten by fees.
+     Widen TP or skip the trade.
      → If R:R < 1.5:1: widen TP or output HOLD.
 
   If the combined check raises serious doubts → HOLD is the correct decision.
@@ -509,10 +523,10 @@ Output JSON only (no markdown):
 - confidence: 0.0-1.0
 - reasoning: brief synthesis
 - size: BTC amount (null for CLOSE/HOLD)
-- entry_price: estimated entry price for risk calc (informational — all entries
-  execute as market orders via Ioc. You do NOT need to set this. Set to null
-  to use current mid, or provide your best estimate of the fill price for
-  accurate risk calculation.)
+- entry_price: desired entry price. With maker entries this is where your
+  limit order rests (clamped to the passive side of the book: buy ≤ bid,
+  sell ≥ ask) — set it where you actually want to fill; unfilled orders are
+  cancelled after 3 cycles. With market entries it is informational only.
 - stop_loss: mandatory for directional (min 0.5% from entry)
 - take_profit: MANDATORY for LONG/SHORT (realistic target, R:R ≥ 1.5:1) —
   omitting it is rejected by risk control
@@ -609,6 +623,11 @@ Please adjust your signal. Here are your options (pick the ONE that applies):
   E. DIRECTION ERROR (LONG while long, naked SHORT while long, CLOSE with
      no position) → use the correct action for the current position state;
      flip with ["CLOSE", "SHORT"] / ["CLOSE", "LONG"].
+  F. DISCIPLINE REJECTION (close discipline, counter-trend confidence,
+     SL too wide, negative EV) → these gates exist because the trade history
+     showed they lose money. Do NOT propose the same trade again — output
+     HOLD, or re-propose with the required fix (wider TP, tighter SL,
+     ≥0.80 confidence for counter-trend).
 
 Keep everything else the same — only fix what was rejected."""
 

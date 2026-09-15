@@ -22,8 +22,9 @@ def test_long_pnl_and_net_after_fees(logger):
     assert trade.pnl == pytest.approx(10.0)          # 1000 * 0.01
     assert trade.pnl_pct == pytest.approx(1.0)
     assert trade.is_win
-    # fees = (100000 + 101000) * 0.01 * 0.00035
-    assert trade.fees_est == pytest.approx((100000 + 101000) * 0.01 * 0.00035)
+    # fees = entry*maker|taker + exit*taker; default entry is market/taker
+    # (rates verified against live fills: 4.5bp taker per side)
+    assert trade.fees_est == pytest.approx((100000 + 101000) * 0.01 * 0.00045)
     assert trade.net_pnl == pytest.approx(trade.pnl - trade.fees_est)
 
 

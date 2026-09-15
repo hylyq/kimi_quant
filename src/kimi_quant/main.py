@@ -32,7 +32,7 @@ from kimi_quant.executor import TradeExecutor
 from kimi_quant.llm import KimiLLM
 from kimi_quant.monitor import FlashReporter, OrderMonitor
 from kimi_quant.notify import notify
-from kimi_quant.risk import RiskManager
+from kimi_quant.risk import PositionContext, RiskManager
 logger = logging.getLogger("kimi_quant")
 
 # Graceful shutdown flag
@@ -221,6 +221,11 @@ def _prepare_cycle_report(
     lessons_ctx = trade_logger.get_lessons_context()
     if lessons_ctx:
         report["lessons_context"] = lessons_ctx
+
+    # Inject confidence calibration + exit attribution (real trades only)
+    calib_ctx = trade_logger.get_calibration_context()
+    if calib_ctx:
+        report["calibration_context"] = calib_ctx
 
     # Inject open orders so the decision-maker knows existing SL/TP levels
     orders_summary = executor.tracker.to_orders_summary()
@@ -413,6 +418,25 @@ def _validate_and_execute(
     tracker_was_resting = executor.tracker.has_resting_order()
     tracker_entry_before_sync = executor.tracker.entry_price
     tracker_side_before_sync = executor.tracker.side
+    # Position context for the close-discipline gate (holds entry time/SL
+    # of the position the LLM might want to CLOSE this cycle)
+    position_ctx = PositionContext(
+        side=tracker_side_before_sync,
+        entry_price=tracker_entry_before_sync,
+        sl_price=executor.tracker.sl_price,
+        entry_time=executor.tracker.entry_time,
+    )
+
+    # Higher-timeframe trends for the counter-trend gate
+    analysis = report.get("analysis")
+    trend_1h = ""
+    trend_4h = ""
+    if analysis and getattr(analysis, "timeframes", None):
+        for tf in analysis.timeframes:
+            if tf.interval == "1h":
+                trend_1h = tf.trend
+            elif tf.interval == "4h":
+                trend_4h = tf.trend
 
     # Use the smart sync: handles resting→active, active→gone, recovery.
     # CRITICAL: only sync when chain state is actually known. In live mode,
@@ -464,6 +488,15 @@ def _validate_and_execute(
 
     logger.info("Position: %s", executor.tracker.to_summary())
 
+    # Protective-order safety net: maker entries defer SL/TP until the fill
+    # is confirmed, and orders occasionally go missing on chain. This runs
+    # every cycle so a confirmed fill gets protected within one (short)
+    # cycle instead of waiting for the LLM to notice and emit MODIFY_SL.
+    try:
+        executor.ensure_protective_orders()
+    except Exception as e:
+        logger.error("ensure_protective_orders failed (non-fatal): %s", e)
+
     # Track MAE/MFE for position memory context
     if account and executor.tracker.has_position():
         executor.tracker.update_pnl_extremes(account.unrealized_pnl)
@@ -482,11 +515,30 @@ def _validate_and_execute(
     # ── Phase 2: Risk validation (multi-action aware) ──
     actions = signal_result.get_actions()
 
+    # Size normalization BEFORE validation: clamp to the risk budgets so
+    # every trade risks ~the same fraction of the account (live data showed
+    # 4× size variance with no risk normalization). Floor to 5 decimals —
+    # Hyperliquid's BTC sz precision — so we never round UP past a budget.
+    if (any(a in ("LONG", "SHORT") for a in actions)
+            and mid_price > 0):
+        original_size = signal_result.size
+        clamped = risk.clamp_size(signal_result, mid_price, account_balance)
+        floored = int(clamped * 1e5) / 1e5  # BTC szDecimals = 5
+        if floored > 0 and (original_size is None or floored < original_size):
+            signal_result.size = floored
+            logger.info(
+                "Size normalized by risk budgets: %s → %.5f BTC",
+                "max/default" if original_size is None else f"{original_size:.5f}",
+                floored,
+            )
+
     def _validate(sig: Any) -> Any:
         """Run risk validation and return the check result."""
         return risk.validate_sequence(
             sig, current_size, current_side,
             mid_price=mid_price, account_balance=account_balance,
+            position_ctx=position_ctx,
+            trend_1h=trend_1h, trend_4h=trend_4h,
         )
 
     risk_check = _validate(signal_result)
@@ -581,6 +633,13 @@ def _validate_and_execute(
         trade_logger.open_trade(
             side=side, size=size, entry_price=entry_price,
             dry_run=executor.dry_run,
+            entry_confidence=signal_result.confidence,
+            planned_sl=signal_result.stop_loss or 0.0,
+            planned_tp=signal_result.take_profit or 0.0,
+            entry_type=(
+                "maker" if (config.entry_order_type == "maker"
+                            and not executor.dry_run) else "market"
+            ),
         )
         trade_opened_this_cycle = True
         notional = size * entry_price
@@ -642,6 +701,13 @@ def _validate_and_execute(
                 side=flip_side, size=flip_size,
                 entry_price=flip_entry_price,
                 dry_run=executor.dry_run,
+                entry_confidence=signal_result.confidence,
+                planned_sl=signal_result.stop_loss or 0.0,
+                planned_tp=signal_result.take_profit or 0.0,
+                entry_type=(
+                    "maker" if (config.entry_order_type == "maker"
+                                and not executor.dry_run) else "market"
+                ),
             )
             trade_opened_this_cycle = True
             notional = flip_size * flip_entry_price
@@ -928,6 +994,16 @@ def run_loop():
             else:
                 next_interval = config.trading_interval_seconds
 
+            # A resting maker entry needs a fast fill check: cap the sleep so
+            # a fill is confirmed and SL/TP protection goes up within ~2min
+            # instead of one full interval.
+            if executor.tracker.has_resting_order() and next_interval > 120:
+                logger.info(
+                    "Resting entry outstanding — capping sleep at 120s "
+                    "for fill confirmation"
+                )
+                next_interval = 120
+
         except Exception:
             logger.error("Cycle %d failed — continuing", cycle_count, exc_info=True)
             # Notify on first error, then every 10th to avoid spam
@@ -1018,12 +1094,20 @@ def cmd_stats():
     print("=== Recent Trades ===")
     for t in all_trades[-10:]:
         tag = "[SIM]" if t.dry_run else "[LIVE]"
+        conf = f"conf={t.entry_confidence:.2f}" if t.entry_confidence else "conf=N/A"
         print(
             f"{t.opened_at[:19]} {tag} | {t.side.upper():5s} | "
             f"in: ${t.entry_price:>8.1f} → out: ${t.exit_price:>8.1f} | "
             f"P&L: ${t.pnl:+7.2f} ({t.pnl_pct:+.2f}%) | "
-            f"{t.close_reason}"
+            f"{t.close_reason} | {conf}"
         )
+
+    # Confidence calibration + exit attribution (real trades only)
+    calib = trade_logger.get_calibration_context()
+    if calib:
+        print()
+        print("=== Confidence Calibration & Exit Attribution ===")
+        print(calib.strip())
 
 
 def cmd_history():

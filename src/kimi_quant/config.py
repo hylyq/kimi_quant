@@ -94,6 +94,36 @@ class Config:
     min_sl_distance: float = field(
         default_factory=lambda: float(os.getenv("MIN_SL_DISTANCE", "0.005"))
     )  # minimum stop-loss distance from entry, as fraction of price (0.5%)
+    max_sl_distance: float = field(
+        default_factory=lambda: float(os.getenv("MAX_SL_DISTANCE", "0.015"))
+    )  # maximum stop-loss distance from entry (1.5%) — wider stops let single
+    #   trades risk more than the whole edge is worth (live data showed
+    #   realized adverse moves up to 1.28% while most wins capped near 1.2%)
+
+    # --- Entry execution ---
+    entry_order_type: str = field(
+        default_factory=lambda: os.getenv("ENTRY_ORDER_TYPE", "market")
+    )  # "market" = Ioc taker entry (current behavior); "maker" = passive GTC
+    #   limit clamped to the book (pays maker fee, may not fill — the resting
+    #   order is cancelled after MAX_RESTING_CYCLES unfilled cycles)
+
+    # --- Close discipline (anti-churn) ---
+    # Live-data autopsy: ~1/3 of round trips exited within one 10-min cycle
+    # at 1-30bps moves — pure fee donation. CLOSE is therefore gated.
+    min_hold_minutes: int = field(
+        default_factory=lambda: int(os.getenv("MIN_HOLD_MINUTES", "30"))
+    )  # LLM-initiated CLOSE blocked before this much time has passed …
+    close_min_move_frac: float = field(
+        default_factory=lambda: float(os.getenv("CLOSE_MIN_MOVE_FRAC", "0.5"))
+    )  # … unless price has traveled this fraction of the SL distance, …
+    close_override_confidence: float = field(
+        default_factory=lambda: float(os.getenv("CLOSE_OVERRIDE_CONFIDENCE", "0.90"))
+    )  # … or the LLM signals ≥ this confidence (thesis clearly invalidated).
+    counter_trend_min_confidence: float = field(
+        default_factory=lambda: float(
+            os.getenv("COUNTER_TREND_MIN_CONFIDENCE", "0.80")
+        )
+    )  # entries opposing BOTH the 1h and 4h trend need at least this confidence
 
     # --- Strategy ---
     strategy_mode: str = field(
@@ -252,6 +282,35 @@ class Config:
         if self.min_sl_distance <= 0 or self.min_sl_distance >= 0.5:
             errors.append(
                 f"MIN_SL_DISTANCE must be in (0, 0.5), got {self.min_sl_distance}"
+            )
+        if self.max_sl_distance <= self.min_sl_distance:
+            errors.append(
+                f"MAX_SL_DISTANCE ({self.max_sl_distance}) must be greater "
+                f"than MIN_SL_DISTANCE ({self.min_sl_distance})"
+            )
+        if self.entry_order_type not in ("market", "maker"):
+            errors.append(
+                f"ENTRY_ORDER_TYPE must be 'market' or 'maker', "
+                f"got '{self.entry_order_type}'"
+            )
+        if self.min_hold_minutes < 0:
+            errors.append(
+                f"MIN_HOLD_MINUTES must be >= 0, got {self.min_hold_minutes}"
+            )
+        if not 0 < self.close_min_move_frac <= 1:
+            errors.append(
+                f"CLOSE_MIN_MOVE_FRAC must be in (0, 1], "
+                f"got {self.close_min_move_frac}"
+            )
+        if not 0 <= self.close_override_confidence <= 1:
+            errors.append(
+                f"CLOSE_OVERRIDE_CONFIDENCE must be in [0, 1], "
+                f"got {self.close_override_confidence}"
+            )
+        if not 0 <= self.counter_trend_min_confidence <= 1:
+            errors.append(
+                f"COUNTER_TREND_MIN_CONFIDENCE must be in [0, 1], "
+                f"got {self.counter_trend_min_confidence}"
             )
 
         # Interval

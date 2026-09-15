@@ -347,3 +347,217 @@ def test_cancel_stale_allowed_during_cooldown(risk):
     risk.consecutive_losses = 4
     sig = TradingSignal(action="CANCEL_STALE", confidence=0.1, reasoning="r")
     assert risk.validate(sig, 0.0, "none").passed
+
+
+# ─── Close discipline (anti-churn) ────────────────────────────────────────
+
+from datetime import datetime, timedelta, timezone
+
+from kimi_quant.risk import PositionContext
+
+
+def _ctx(minutes_ago: float = 0.0, entry: float = 100000.0, sl: float = 99000.0):
+    """PositionContext for a LONG opened `minutes_ago`."""
+    return PositionContext(
+        side="long",
+        entry_price=entry,
+        sl_price=sl,
+        entry_time=(
+            datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+        ).isoformat(),
+    )
+
+
+def test_early_close_blocked(risk):
+    """CLOSE one cycle after entry with no price movement → rejected."""
+    check = risk.validate_sequence(
+        _sig(["CLOSE"], confidence=0.8),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100000.0,
+        position_ctx=_ctx(minutes_ago=10),  # held 10min, price unchanged
+    )
+    assert not check.passed
+    assert "close discipline" in check.reason.lower()
+
+
+def test_close_allowed_after_min_hold(risk):
+    check = risk.validate_sequence(
+        _sig(["CLOSE"], confidence=0.8),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100000.0,
+        position_ctx=_ctx(minutes_ago=45),  # > 30min
+    )
+    assert check.passed
+
+
+def test_close_allowed_after_real_move(risk):
+    # SL distance = 1000 (1%); price moved 600 = 60% of SL distance
+    check = risk.validate_sequence(
+        _sig(["CLOSE"], confidence=0.8),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100600.0,
+        position_ctx=_ctx(minutes_ago=10),
+    )
+    assert check.passed
+
+
+def test_close_allowed_with_override_confidence(risk):
+    check = risk.validate_sequence(
+        _sig(["CLOSE"], confidence=0.93),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100000.0,
+        position_ctx=_ctx(minutes_ago=10),
+    )
+    assert check.passed
+
+
+def test_close_fails_open_without_context(risk):
+    """Recovered position (no entry_time) must never trap capital."""
+    check = risk.validate_sequence(
+        _sig(["CLOSE"], confidence=0.8),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100000.0,
+        position_ctx=PositionContext(
+            side="long", entry_price=100000.0, sl_price=99000.0, entry_time=""
+        ),
+    )
+    assert check.passed
+
+
+def test_flip_with_early_close_blocked(risk):
+    """The CLOSE inside ["CLOSE", "SHORT"] is subject to the same gate."""
+    check = risk.validate_sequence(
+        _sig(["CLOSE", "SHORT"], confidence=0.8, sl=101000.0, tp=98500.0),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100000.0,
+        position_ctx=_ctx(minutes_ago=10),
+    )
+    assert not check.passed
+    assert "close discipline" in check.reason.lower()
+
+
+def test_sl_tp_exits_unaffected(risk):
+    """HOLD/MODIFY_SL while position is young are never blocked."""
+    check = risk.validate_sequence(
+        _sig(["MODIFY_SL"], modify_sl_to=99500.0),
+        current_position_size=0.01,
+        current_position_side="long",
+        mid_price=100200.0,
+        position_ctx=_ctx(minutes_ago=5),
+    )
+    assert check.passed
+
+
+# ─── SL distance band (max) ───────────────────────────────────────────────
+
+
+def test_sl_too_wide_rejected(risk):
+    check = risk.validate_sequence(
+        _sig(["LONG"], sl=97000.0, tp=106000.0),  # SL 3% away, R:R 2:1
+        mid_price=MID,
+    )
+    assert not check.passed
+    assert "too wide" in check.reason
+
+
+# ─── Expected value gate ──────────────────────────────────────────────────
+
+
+def test_ev_gate_rejects_confidence_below_breakeven(risk):
+    """R:R 1:1 → breakeven 50%; confidence 45% is negative-EV."""
+    risk.min_confidence = 0.4
+    risk.MIN_RR_RATIO = 1.0
+    check = risk.validate_sequence(
+        _sig(["LONG"], confidence=0.45, sl=99000.0, tp=101000.0),
+        mid_price=MID,
+    )
+    assert not check.passed
+    assert "expected value" in check.reason.lower()
+
+
+def test_ev_gate_passes_when_confidence_exceeds_breakeven(risk):
+    risk.min_confidence = 0.4
+    risk.MIN_RR_RATIO = 1.0
+    check = risk.validate_sequence(
+        _sig(["LONG"], confidence=0.6, sl=99000.0, tp=101000.0),
+        mid_price=MID,
+    )
+    assert check.passed
+
+
+def test_tp_fee_floor_rejects_penny_targets(risk):
+    """A TP closer than 3× round-trip fees can never pay for itself."""
+    risk.MIN_RR_RATIO = 0.5
+    risk.MIN_SL_DISTANCE = 0.001
+    check = risk.validate_sequence(
+        _sig(["LONG"], sl=99900.0, tp=100100.0),  # reward 0.1% < 0.27%
+        mid_price=MID,
+    )
+    assert not check.passed
+    assert "cannot pay" in check.reason
+
+
+# ─── Trend alignment gate ─────────────────────────────────────────────────
+
+
+def test_counter_trend_short_rejected(risk):
+    check = risk.validate_sequence(
+        _sig(["SHORT"], confidence=0.75, sl=101000.0, tp=98500.0),
+        mid_price=MID,
+        trend_1h="up", trend_4h="up",
+    )
+    assert not check.passed
+    assert "Counter-trend" in check.reason
+
+
+def test_counter_trend_short_allowed_with_high_confidence(risk):
+    check = risk.validate_sequence(
+        _sig(["SHORT"], confidence=0.85, sl=101000.0, tp=98500.0),
+        mid_price=MID,
+        trend_1h="up", trend_4h="up",
+    )
+    assert check.passed
+
+
+def test_with_trend_entry_ignores_gate(risk):
+    check = risk.validate_sequence(
+        _sig(["LONG"], confidence=0.75),
+        mid_price=MID,
+        trend_1h="up", trend_4h="up",
+    )
+    assert check.passed
+
+
+def test_sideways_trend_is_neutral(risk):
+    check = risk.validate_sequence(
+        _sig(["SHORT"], confidence=0.75, sl=101000.0, tp=98500.0),
+        mid_price=MID,
+        trend_1h="sideways", trend_4h="up",
+    )
+    assert check.passed
+
+
+# ─── Size normalization ───────────────────────────────────────────────────
+
+
+def test_clamp_size_caps_by_risk_budget(risk):
+    # balance $100, leverage 3 (conftest): margin cap = 0.95*100*3/100000
+    # = 0.00285; risk cap with 1% SL = 100*0.01/1000 = 0.001 → 0.001 wins
+    sig = _sig(["LONG"], size=0.01, sl=99000.0)
+    assert risk.clamp_size(sig, 100000.0, 100.0) == pytest.approx(0.001)
+
+
+def test_clamp_size_respects_hard_position_cap(risk):
+    sig = _sig(["LONG"], size=0.05, sl=99000.0)  # above max (0.01, conftest)
+    assert risk.clamp_size(sig, 100000.0, None) == pytest.approx(0.01)
+
+
+def test_clamp_size_defaults_when_size_missing(risk):
+    sig = _sig(["LONG"], size=None, sl=99000.0)
+    assert risk.clamp_size(sig, 100000.0, None) == pytest.approx(0.01)

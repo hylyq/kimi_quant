@@ -6,9 +6,13 @@ Checks:
   3. Margin requirement (position notional / leverage ≤ 95% available balance)
   4. Risk amount (|entry - SL| × size ≤ 2% of balance)
   5. Direction validation (no redundant or naked opposite trades)
-  6. Stop loss distance + side (SL must sit on the losing side of entry)
-  7. Take profit side + minimum risk/reward ratio
-  8. Drawdown circuit breaker (pause after consecutive losses)
+  6. Close discipline (block noise CLOSEs churned within one cycle)
+  7. Stop loss distance band + side (SL must sit on the losing side of entry)
+  8. Take profit side + minimum risk/reward ratio
+  9. Expected value (confidence must exceed the breakeven win rate;
+     TP must clear round-trip fees)
+ 10. Trend alignment (counter-trend entries need higher confidence)
+ 11. Drawdown circuit breaker (pause after consecutive losses)
 """
 
 import logging
@@ -20,6 +24,46 @@ from kimi_quant.llm import TradingSignal
 from kimi_quant.notify import notify
 
 logger = logging.getLogger(__name__)
+
+# Hyperliquid base-tier fees, verified against live fills (2026-07/08 CSV:
+# every taker fill priced at exactly 4.5bp, maker fills at 1.5bp).
+TAKER_FEE_RATE = 0.00045   # 0.045% per taker side
+MAKER_FEE_RATE = 0.00015   # 0.015% per maker side
+
+
+@dataclass
+class PositionContext:
+    """Snapshot of the currently open position (from PositionTracker).
+
+    Used by the close-discipline gate: CLOSE is blocked while the trade is
+    younger than MIN_HOLD_MINUTES AND price hasn't traveled a meaningful
+    fraction of the SL distance — the live-data autopsy showed ~1/3 of round
+    trips exiting within one 10-min cycle at 1-30bps moves (pure fee churn).
+    """
+
+    side: str = "none"        # "long" | "short" | "none"
+    entry_price: float = 0.0
+    sl_price: float = 0.0
+    entry_time: str = ""      # ISO timestamp ("" = unknown, gate fails open)
+
+    @property
+    def known(self) -> bool:
+        return (
+            self.side in ("long", "short")
+            and self.entry_price > 0
+            and bool(self.entry_time)
+        )
+
+    def held_minutes(self) -> float:
+        if not self.entry_time:
+            return 0.0
+        try:
+            opened = datetime.fromisoformat(self.entry_time)
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+        except (ValueError, TypeError):
+            return 0.0
 
 
 @dataclass
@@ -41,11 +85,29 @@ class RiskManager:
     # data.py reads the same value for its prompt recap.
     MIN_SL_DISTANCE = config.min_sl_distance  # 0.5% default — BTC noise is ~0.3%
 
+    # Maximum stop loss distance — live data showed realized adverse moves up
+    # to 1.28% (worse than the best win at 1.20%): wide stops silently invert
+    # the R:R the 1.5:1 gate is supposed to guarantee.
+    MAX_SL_DISTANCE = config.max_sl_distance  # 1.5% default
+
     # Minimum risk/reward ratio: |TP - entry| / |SL - entry| must be ≥ this.
     # Prevents trades where the potential loss dwarfs the potential gain.
     # TP is REQUIRED for LONG/SHORT (see _check_take_profit), so this gate
     # always applies to directional entries.
     MIN_RR_RATIO = 1.5  # reward must be at least 1.5× the risk
+
+    # Close discipline (anti-churn). Values from Config so they can be tuned
+    # via env without touching code.
+    MIN_HOLD_MINUTES = config.min_hold_minutes
+    CLOSE_MIN_MOVE_FRAC = config.close_min_move_frac
+    CLOSE_OVERRIDE_CONFIDENCE = config.close_override_confidence
+
+    # Counter-trend entries (opposing BOTH 1h and 4h trend) need this much
+    COUNTER_TREND_MIN_CONFIDENCE = config.counter_trend_min_confidence
+
+    # A TP closer to entry than this multiple of the round-trip fee can never
+    # pay for its own execution — reject regardless of R:R math.
+    MIN_TP_FEE_MULTIPLE = 3.0  # × round-trip taker fee (0.09%) → TP ≥ 0.27%
 
     # Circuit breaker
     MAX_CONSECUTIVE_LOSSES = 4
@@ -82,6 +144,9 @@ class RiskManager:
         current_position_side: str = "none",
         mid_price: float = 0.0,
         account_balance: float | None = None,
+        position_ctx: PositionContext | None = None,
+        trend_1h: str = "",
+        trend_4h: str = "",
     ) -> RiskCheck:
         """Run all risk checks. Returns first failure or success."""
         checks = [
@@ -92,9 +157,14 @@ class RiskManager:
                 mid_price, account_balance,
             ),
             self._check_direction(signal, current_position_side),
+            self._check_close_discipline(
+                signal, mid_price, current_position_side, position_ctx,
+            ),
             self._check_stop_loss_distance(signal, mid_price, current_position_side),
             self._check_take_profit(signal),
             self._check_risk_reward_ratio(signal, mid_price, current_position_side),
+            self._check_expected_value(signal, mid_price),
+            self._check_trend_alignment(signal, trend_1h, trend_4h),
         ]
 
         for check in checks:
@@ -112,6 +182,9 @@ class RiskManager:
         current_position_side: str = "none",
         mid_price: float = 0.0,
         account_balance: float | None = None,
+        position_ctx: PositionContext | None = None,
+        trend_1h: str = "",
+        trend_4h: str = "",
     ) -> RiskCheck:
         """Validate a multi-action sequence with simulated state transitions.
 
@@ -141,6 +214,8 @@ class RiskManager:
             )
             check = self.validate(
                 temp, sim_size, sim_side, mid_price, account_balance,
+                position_ctx=position_ctx,
+                trend_1h=trend_1h, trend_4h=trend_4h,
             )
             if not check.passed:
                 logger.warning(
@@ -241,6 +316,45 @@ class RiskManager:
             f"{self.cooldown_remaining} cycles remaining in cooldown"
         )
 
+    def clamp_size(
+        self,
+        signal: TradingSignal,
+        mid_price: float,
+        account_balance: float | None,
+    ) -> float:
+        """Return the signal's size clamped to every risk budget.
+
+        Live data showed per-trade sizes varying 4× (0.0002–0.0008 BTC) with
+        no corresponding risk normalization. Callers should mutate
+        signal.size to the returned value BEFORE validation so every trade
+        risks approximately the same fraction of the account.
+
+        Budgets applied (most restrictive wins):
+          - MAX_POSITION_SIZE (hard cap)
+          - margin: notional / leverage ≤ 95% of available balance
+          - risk: |entry - SL| × size ≤ 1% of balance (the warn level —
+            the 2% hard cap stays a rejection in _check_position_size)
+        """
+        size = signal.size or self.max_position
+        entry = signal.entry_price or mid_price
+        if size <= 0 or entry <= 0:
+            return max(0.0, min(size, self.max_position))
+
+        size = min(size, self.max_position)
+
+        if account_balance and account_balance > 0:
+            max_margin = account_balance * 0.95
+            size = min(size, (max_margin * self.max_leverage) / entry)
+
+            if signal.stop_loss:
+                risk_per_unit = abs(entry - signal.stop_loss)
+                if risk_per_unit > 0:
+                    size = min(
+                        size, (account_balance * 0.01) / risk_per_unit
+                    )
+
+        return size
+
     # ─── LLM Context ────────────────────────────────────────────────────
 
     def get_risk_context(
@@ -296,7 +410,8 @@ class RiskManager:
         lines.append(f"- Min confidence: {self.min_confidence}")
         lines.append(f"- Max position size: {self.max_position} BTC")
         lines.append(f"- Max leverage: {self.max_leverage}x")
-        lines.append(f"- SL min distance: {self.MIN_SL_DISTANCE:.1%} of entry "
+        lines.append(f"- SL distance band: {self.MIN_SL_DISTANCE:.1%}–"
+                     f"{self.MAX_SL_DISTANCE:.1%} of entry "
                      f"(BTC noise is ~0.3%)")
         lines.append(f"- SL is REQUIRED for LONG/SHORT (no SL → rejected)")
         lines.append(f"- TP is REQUIRED for LONG/SHORT (no TP → rejected — "
@@ -304,8 +419,26 @@ class RiskManager:
         lines.append(f"- R:R minimum: {self.MIN_RR_RATIO}:1 "
                      f"(|TP-entry| / |SL-entry|) — always enforced because TP "
                      f"is mandatory")
-        lines.append(f"- Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). "
-                     f"Factor into P&L.")
+        lines.append(f"- Counter-trend (vs BOTH 1h and 4h trend): confidence "
+                     f"≥ {self.COUNTER_TREND_MIN_CONFIDENCE:.2f}")
+        lines.append(f"- EV gate: confidence must EXCEED the breakeven win "
+                     f"rate 1/(1+R:R) — enforced in code, not just requested")
+        lines.append(f"- Fees: taker 0.09% round-trip (entry+exit market). "
+                     f"With maker entries (passive limit) entry pays 0.015% "
+                     f"→ 0.06% round-trip. Factor into P&L.")
+        lines.append("")
+
+        # ── Close discipline ─────────────────────────────────────────
+        lines.append("## Close Discipline (if you hold a position)")
+        lines.append(
+            f"CLOSE is REJECTED while the position is younger than "
+            f"{self.MIN_HOLD_MINUTES}min AND price has moved less than "
+            f"{self.CLOSE_MIN_MOVE_FRAC:.0%} of the SL distance from entry. "
+            f"Early CLOSE needs confidence ≥ "
+            f"{self.CLOSE_OVERRIDE_CONFIDENCE:.2f}. "
+            f"Exits belong to the exchange-side SL/TP orders — manage the "
+            f"trade with MODIFY_SL / MODIFY_TP / HOLD instead of churning."
+        )
         lines.append("")
 
         # ── Margin budget (dynamic) ──────────────────────────────────
@@ -368,8 +501,9 @@ class RiskManager:
         lines.append("")
         lines.append("## Expected Value (EV) Check")
         lines.append(
-            "Round-trip taker fees: ~0.07% of notional (entry + exit are "
-            "both market/Ioc orders). Factor fee cost into your P&L estimate."
+            "Round-trip taker fees: ~0.09% of notional (entry + exit are "
+            "both market/Ioc orders; maker entries pay ~0.06%). "
+            "Factor fee cost into your P&L estimate."
         )
         lines.append(f"Hard limit: R:R ≥ {self.MIN_RR_RATIO}:1 "
                      f"(|TP - entry| / |SL - entry|). "
@@ -551,6 +685,69 @@ class RiskManager:
 
         return RiskCheck(passed=True, reason="Direction OK")
 
+    def _check_close_discipline(
+        self,
+        signal: TradingSignal,
+        mid_price: float,
+        current_side: str,
+        position_ctx: PositionContext | None,
+    ) -> RiskCheck:
+        """Block noise CLOSEs — the single biggest fee leak in live data.
+
+        A CLOSE within MIN_HOLD_MINUTES of entry is allowed only when:
+          - price has traveled ≥ CLOSE_MIN_MOVE_FRAC of the SL distance
+            (the trade has actually been tested), or
+          - the signal's confidence ≥ CLOSE_OVERRIDE_CONFIDENCE (the LLM is
+            emphatic that the thesis is invalidated).
+        Exits via the exchange-side SL/TP trigger orders are unaffected —
+        this gate only sees LLM-initiated CLOSE actions.
+
+        Fails open when position context is unknown (recovered position,
+        missing entry_time) — blocking an exit from a position we don't
+        understand would be worse than the churn it prevents.
+        """
+        if signal.action != "CLOSE" or current_side == "none":
+            return RiskCheck(passed=True, reason="No close to discipline-check")
+
+        if position_ctx is None or not position_ctx.known:
+            return RiskCheck(
+                passed=True, reason="Position context unknown — close allowed"
+            )
+
+        held = position_ctx.held_minutes()
+        if held >= self.MIN_HOLD_MINUTES:
+            return RiskCheck(passed=True, reason=f"Held {held:.0f}min — close allowed")
+
+        move_frac = 0.0
+        if position_ctx.sl_price > 0 and mid_price > 0:
+            sl_distance = abs(position_ctx.entry_price - position_ctx.sl_price)
+            if sl_distance > 0:
+                move_frac = abs(mid_price - position_ctx.entry_price) / sl_distance
+        if move_frac >= self.CLOSE_MIN_MOVE_FRAC:
+            return RiskCheck(
+                passed=True,
+                reason=f"Price moved {move_frac:.0%} of SL distance — close allowed",
+            )
+
+        if signal.confidence >= self.CLOSE_OVERRIDE_CONFIDENCE:
+            return RiskCheck(
+                passed=True,
+                reason=f"High-confidence close ({signal.confidence:.2f}) allowed",
+            )
+
+        return RiskCheck(
+            passed=False,
+            reason=(
+                f"CLOSE blocked by close discipline: held {held:.0f}min "
+                f"(< {self.MIN_HOLD_MINUTES}min), price moved "
+                f"{move_frac:.0%} of SL distance "
+                f"(< {self.CLOSE_MIN_MOVE_FRAC:.0%}). "
+                f"Let the exchange-side SL/TP do their job, or use "
+                f"HOLD / MODIFY_SL. CLOSE now needs confidence ≥ "
+                f"{self.CLOSE_OVERRIDE_CONFIDENCE:.2f}."
+            ),
+        )
+
     def _check_stop_loss_distance(
         self,
         signal: TradingSignal,
@@ -611,11 +808,20 @@ class RiskManager:
                 ),
             )
 
-        # Also warn if SL is excessively far (>10%)
-        if sl_distance > 0.10:
-            logger.warning(
-                "Stop loss distance %.1f%% is very wide — risk/reward may be poor",
-                sl_distance * 100,
+        # Hard cap: a distant "invalidation" level looks safe in R:R math but
+        # risks more per trade than the strategy's edge is worth. Live data:
+        # losses up to 1.28% of price vs best win 1.20%.
+        if sl_distance > self.MAX_SL_DISTANCE:
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    f"Stop loss distance {sl_distance:.2%} is too wide "
+                    f"(max {self.MAX_SL_DISTANCE:.2%}). "
+                    f"Entry=${entry:.0f} SL=${signal.stop_loss:.0f}. "
+                    f"Reduce size and tighten SL, or skip the trade — "
+                    f"if the invalidation level is that far away, the "
+                    f"setup's R:R cannot survive the fees."
+                ),
             )
 
         return RiskCheck(passed=True, reason=f"SL distance OK ({sl_distance:.2%})")
@@ -743,3 +949,113 @@ class RiskManager:
             )
 
         return RiskCheck(passed=True, reason=f"R:R OK ({rr_ratio:.1f}:1)")
+
+    def _check_expected_value(
+        self, signal: TradingSignal, mid_price: float,
+    ) -> RiskCheck:
+        """Enforce in code what the prompt only used to suggest.
+
+        1. Breakeven win rate: at R:R = reward/risk, a trader needs to win
+           1/(1+RR) of the time to break even. The LLM's stated confidence
+           is supposed to be that win probability — if it isn't higher than
+           breakeven, the trade is negative-EV by the LLM's own numbers.
+           (The prompt has asked for this since early versions; live data
+           showed 26% realized win rate against a 41% breakeven, so it is
+           now a hard gate.)
+        2. Fee floor: a TP nearer than MIN_TP_FEE_MULTIPLE × the round-trip
+           taker fee cannot pay for its own execution. With R:R ≥ 1.5 and
+           SL ≥ 0.5% this rarely binds, but it guards configs that loosen
+           those knobs.
+        """
+        if signal.action not in ("LONG", "SHORT"):
+            return RiskCheck(passed=True, reason="No EV needed")
+
+        if signal.stop_loss is None or signal.take_profit is None:
+            return RiskCheck(passed=True, reason="TP not set — EV not enforced")
+
+        entry = signal.entry_price or mid_price
+        if entry <= 0:
+            return RiskCheck(passed=True, reason="Cannot validate EV")
+
+        risk_distance = abs(entry - signal.stop_loss)
+        reward_distance = abs(signal.take_profit - entry)
+        if risk_distance <= 0:
+            return RiskCheck(passed=True, reason="Cannot validate EV")
+
+        rr_ratio = reward_distance / risk_distance
+        breakeven = 1.0 / (1.0 + rr_ratio)
+
+        if signal.confidence <= breakeven:
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    f"Negative expected value: R:R {rr_ratio:.1f}:1 implies a "
+                    f"breakeven win rate of {breakeven:.0%}, but your "
+                    f"confidence is only {signal.confidence:.0%}. "
+                    f"Either widen TP (higher R:R) or output HOLD."
+                ),
+            )
+
+        reward_frac = reward_distance / entry
+        min_reward = self.MIN_TP_FEE_MULTIPLE * TAKER_FEE_RATE * 2
+        if reward_frac < min_reward:
+            return RiskCheck(
+                passed=False,
+                reason=(
+                    f"Take profit is only {reward_frac:.2%} from entry — below "
+                    f"{min_reward:.2%} ({self.MIN_TP_FEE_MULTIPLE:.0f}× the "
+                    f"round-trip taker fee). The trade cannot pay for its own "
+                    f"execution. Widen TP or output HOLD."
+                ),
+            )
+
+        return RiskCheck(
+            passed=True,
+            reason=f"EV OK (breakeven {breakeven:.0%} < confidence "
+                   f"{signal.confidence:.0%})",
+        )
+
+    def _check_trend_alignment(
+        self, signal: TradingSignal, trend_1h: str, trend_4h: str,
+    ) -> RiskCheck:
+        """Counter-trend entries must carry extra confidence.
+
+        Live-data pattern: shorts placed into strong uptrends (e.g. shorting
+        77,827 on 8/26 right before continuation to 84k+) at ordinary
+        confidence. When BOTH the 1h and 4h trends oppose the entry, require
+        confidence ≥ COUNTER_TREND_MIN_CONFIDENCE.
+        """
+        if signal.action not in ("LONG", "SHORT"):
+            return RiskCheck(passed=True, reason="No trend check needed")
+
+        if not trend_1h or not trend_4h:
+            return RiskCheck(passed=True, reason="Trend data unavailable")
+
+        t1, t4 = trend_1h.lower(), trend_4h.lower()
+        if t1 not in ("up", "down") or t4 not in ("up", "down"):
+            return RiskCheck(passed=True, reason="Trend neutral/unknown")
+
+        counter = (
+            (signal.action == "LONG" and t1 == "down" and t4 == "down")
+            or (signal.action == "SHORT" and t1 == "up" and t4 == "up")
+        )
+        if not counter:
+            return RiskCheck(passed=True, reason="Trend aligned/neutral")
+
+        if signal.confidence >= self.COUNTER_TREND_MIN_CONFIDENCE:
+            return RiskCheck(
+                passed=True,
+                reason=f"Counter-trend with high confidence "
+                       f"({signal.confidence:.2f}) — allowed",
+            )
+
+        return RiskCheck(
+            passed=False,
+            reason=(
+                f"Counter-trend entry: 1h={t1}, 4h={t4} both oppose a "
+                f"{signal.action}. Requires confidence ≥ "
+                f"{self.COUNTER_TREND_MIN_CONFIDENCE:.2f} "
+                f"(got {signal.confidence:.2f}). Wait for the trend to break "
+                f"or let this one go."
+            ),
+        )

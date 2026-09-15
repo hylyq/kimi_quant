@@ -11,7 +11,9 @@
 - 🔄 **决策反馈闭环**：上周期决策→结果自动注入，"上次说等回踩 → 现在回踩了"的自主学习
 
 ### 风控与安全
-- 🛡️ **七层风控**：熔断、置信度、仓位、保证金、风险金额、止损距离、方向限制
+- 🛡️ **多层风控**：熔断、置信度、仓位、保证金、风险金额、止损距离区间（0.5%–1.5%）、方向限制、期望值硬校验（confidence 必须超过盈亏平衡胜率）、逆势门槛（同时逆 1h+4h 趋势需 confidence ≥0.80）、平仓纪律（反 churn：早期 LLM CLOSE 被拒）
+- 🛡️ **费用感知执行**：taker 0.045%/边强制计入风控——TP 距离必须覆盖 3× 双边手续费；可选 `ENTRY_ORDER_TYPE=maker` 被动限价入场（0.015%/边），成交确认后自动补挂 SL/TP
+- 📊 **置信度校准**：每笔交易记录入场 confidence，分桶胜率 + 退出归因（LLM 平仓 vs SL/TP 触发）反馈进 prompt
 - 🔁 **风控拒绝修正**：信号被拒后给 LLM 一次调整机会（如放宽止损、减小仓位）
 - 💰 **Tick Size 自动对齐**：所有订单价格自动取整至交易所最小价格单位，防止整组订单被拒
 - 🔍 **SL/TP 链上验证**：每周期交叉对比 tracker 与链上挂单，丢失立即告警并恢复
@@ -113,7 +115,7 @@
 │  4. 偏差审计: 数据证据(0-10) ___ vs 主观期望(0-10) ___   │
 │     → 期望 > 证据 → confidence -0.15 或 HOLD            │
 │  5. R:R 验证: R:R = |TP-entry|/|SL-entry|. 必须 ≥ 1.5:1. │
-│     扣除 ~0.07% taker 手续费后，小止盈很容易被吃掉。       │
+│     扣除 ~0.09% taker 手续费后，小止盈很容易被吃掉。       │
 │     → R:R < 1.5:1 → 放宽 TP 或 HOLD                       │
 │  综合检查引发严重疑虑 → HOLD 是正确决策，永远有下一笔交易   │
 └─────────────────────────────────────────────────────┘
@@ -130,7 +132,7 @@
 ```
 ┌──────────────┐    ┌─────────────────┐    ┌──────────────┐    ┌──────────────────┐
 │  DataProvider │───▶│    策略引擎      │───▶│  RiskManager │───▶│  TradeExecutor   │
-│  (Hyperliquid)│    │ single / debate │    │  (七层风控)   │    │  (全订单生命周期)  │
+│  (Hyperliquid)│    │ single / debate │    │  (多层风控)   │    │  (全订单生命周期)  │
 └──────────────┘    └─────────────────┘    └──────────────┘    └──────────────────┘
       ▲                      │                                           │
       │                      ▼                                           │
@@ -152,7 +154,7 @@
 
 1. **DataProvider** — 行情数据走主网（`meta_and_asset_ctxs`，含 mark/oracle/funding/OI），多周期 K 线 TTL 缓存。同步查询链上全部挂单（`open_orders`）。**周期间 diff**：自动对比上一轮快照，注入 `# 📊 Since Last Cycle (X.Xmin ago)` 区块——因为 LLM 自主控制唤醒间隔，diff 标注实际耗时让 LLM 正确评估变化幅度
 2. **策略引擎** — Single：单次 LLM 分析；Debate：三 Agent 辩论 + Judge 裁决（60s 超时），可选**反驳轮**（辩手互驳后再裁决）。所有 Agent 接收相同的市场数据（行情、多周期 K 线、订单簿、资金费率、风控约束、周期间 diff）；Judge 额外看到三方论证后可交叉验证。两种模式均遵循 Step 0→Step 1→Step 1.5 决策工作流
-3. **RiskManager** — 七层风控校验 + `validate_sequence()` 多操作状态模拟（支持翻转 CLOSE+LONG/SHORT 风控通过）。**风控拒绝 → LLM 一次更正**：拒绝原因反馈给原始决策者，修正后重新验证，通过则执行（可通过 `RISK_CORRECTION_ENABLED` 关闭）
+3. **RiskManager** — 多层风控校验 + `validate_sequence()` 多操作状态模拟（支持翻转 CLOSE+LONG/SHORT 风控通过）。**风控拒绝 → LLM 一次更正**：拒绝原因反馈给原始决策者，修正后重新验证，通过则执行（可通过 `RISK_CORRECTION_ENABLED` 关闭）
 4. **TradeExecutor** — 启动恢复 + resting/active 状态机 + SL/TP 价格追踪 + 多操作顺序执行（失败即停）+ 15/15 SDK 全覆盖
 5. **TradeLogger** — 盈亏分析 + LLM 表现反馈（自省循环）
 6. **OrderMonitor** — WebSocket 实时订阅订单状态变化（成交/部分成交/取消/清算），毫秒级同步到 PositionTracker，使 LLM 在下一周期看到最新状态
@@ -943,6 +945,12 @@ systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 | `MIN_CONFIDENCE` | `0.7` | 最低置信度阈值 |
 | `MAX_LEVERAGE` | `3` | 最大杠杆倍数 |
 | `MIN_SL_DISTANCE` | `0.005` | 止损距入场价的最小距离（价格比例，默认 0.5%） |
+| `MAX_SL_DISTANCE` | `0.015` | 止损距入场价的最大距离（默认 1.5%）——实盘数据显示单笔亏损曾达价格 1.28%，过宽止损会被直接拒绝 |
+| `ENTRY_ORDER_TYPE` | `market` | `market` = Ioc taker 入场（0.045%/边）；`maker` = 钳制到盘口被动侧的 GTC 限价（成交侧 0.015%/边，3 个周期未成交自动撤单，成交确认后自动补挂 SL/TP） |
+| `MIN_HOLD_MINUTES` | `30` | 平仓纪律：持仓不足此时长时，LLM 的 CLOSE 会被拒绝（除非价格已走过 ≥50% 止损距离） |
+| `CLOSE_MIN_MOVE_FRAC` | `0.5` | 平仓纪律：允许提前平仓所需的价格行程（占止损距离的比例） |
+| `CLOSE_OVERRIDE_CONFIDENCE` | `0.90` | 平仓纪律：confidence ≥ 此值时允许任意时刻 CLOSE（thesis 明确失效） |
+| `COUNTER_TREND_MIN_CONFIDENCE` | `0.80` | 同时逆 1h 和 4h 趋势的入场需要至少此 confidence |
 | **策略** | | |
 | `STRATEGY_MODE` | `single` | `single` 或 `debate` |
 | `TRADING_INTERVAL` | `600` | 默认间隔（秒）。LLM 可通过 `next_interval` 动态覆盖 |
@@ -1225,8 +1233,12 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 3 | **仓位上限** | 不超过 `MAX_POSITION_SIZE` |
 | 4 | **保证金需求** | `size × price / leverage` ≤ 可用余额的 95%，超出则拒绝并建议合理 size |
 | 5 | **风险金额** | 单笔止损亏损 > 1% 账户警告，> 2% 拒绝（`\|entry - SL\| × size`） |
-| 6 | **止损距离 + 方向** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝；可通过 `MIN_SL_DISTANCE` 配置）。同时校验侧别：做多要求 SL < 入场价 < TP，做空镜像相反——SL 放错侧（下单即触发）或 TP 放错侧都会被拒绝，单纯 abs() 距离检查无法发现这类问题 |
+| 6 | **止损距离区间 + 方向** | 0.5%–1.5% 距入场价（下限：BTC 噪音 ~0.3%；上限 `MAX_SL_DISTANCE`：实盘曾出现 1.28% 的单笔逆向波动，比最好的盈利还大）。同时校验侧别：做多要求 SL < 入场价 < TP，做空镜像相反——SL 放错侧（下单即触发）或 TP 放错侧都会被拒绝，单纯 abs() 距离检查无法发现这类问题 |
 | 7 | **盈亏比 (R:R)** | ≥ 1.5:1（`|TP - entry| / |SL - entry|`）。**始终强制执行——TP 对 LONG/SHORT 为必填字段**（省略止盈会绕过此门槛，已封堵） |
+| 9 | **期望值 (EV)** | confidence 必须超过盈亏平衡胜率 `1/(1+R:R)`（代码强制，不再只写在 prompt 里）；TP 距离必须 ≥ 3× 双边 taker 手续费（0.09%），否则拒绝——付不起自己手续费的交易 |
+| 10 | **逆势门槛** | 同时逆 1h 和 4h 趋势的入场需 confidence ≥ `COUNTER_TREND_MIN_CONFIDENCE`（默认 0.80）——实盘中 8/26 在 77827 逆势做空正好空在延续前夜 |
+| 11 | **平仓纪律（反 churn）** | 持仓 < `MIN_HOLD_MINUTES`（30min）且价格行程 < 50% 止损距离时，LLM 的 CLOSE 被拒绝（confidence ≥ 0.90 除外；仓位信息未知时放行）。交易所侧 SL/TP 触发不受影响——实盘中 1/3 的回合在一个 10 分钟周期内以 1–30bp 的价差平仓，纯属手续费损耗 |
+| — | **仓位归一化** | `clamp_size` 在风控前把 size 钳到硬上限 + 保证金预算 + 1% 风险预算（取最小），消除实盘中 4 倍的单笔风险波动 |
 | 8 | **方向** | 已有同向仓位拒绝；**裸反向开仓拒绝**（持多仓时直接 SHORT 会静默净额减仓并导致现有仓位的 SL/TP 和交易记录失去关联——翻仓必须用 `["CLOSE", "SHORT"]`）；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换。MODIFY_SL 移到现价错误一侧（会立即触发）同样拒绝 |
 | — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`；oid 丢失**或根本没有跟踪的 SL**（live 模式）→ prompt 告警 + 限频推送通知。随后 `MODIFY_SL`/`MODIFY_TP` 会自动**补下新单**（恢复路径），而不是在已失效的 oid 上失败 |
 | — | **SL/TP 实时检测** | WebSocket 毫秒级感知 SL/TP 触发 → 即时推送（🛑/🎯）。Tracker 在 WS 清除时保留平仓原因**和真实触发成交价**，下一轮主循环记录的 close_reason 和盈亏基于实际成交，而非用可能过期的 mid 价猜测 |
@@ -1657,7 +1669,7 @@ kimi_quant/
 │   ├── data.py          # 市场数据（Hyperliquid Info API + K线缓存 + ATR + 断线重试）
 │   ├── llm.py           # TradingSignal + 双模型容灾 (Kimi/DeepSeek)
 │   ├── debate.py        # Multi-Agent 辩论 + 反驳轮 + LangGraph Checkpointing
-│   ├── risk.py          # 七层风控校验 + 熔断状态机
+│   ├── risk.py          # 多层风控校验 + 熔断状态机
 │   ├── executor.py      # 15/15 SDK 全覆盖 + 启动恢复 + PositionTracker
 │   ├── monitor.py       # WebSocket 订单监控 + 崩溃自恢复 + Flash LLM
 │   ├── analytics.py     # TradeLogger — 盈亏分析 + LLM 自省反馈
@@ -1943,7 +1955,7 @@ Dry-run 不涉及任何链上操作，只验证 LLM 决策逻辑。你可以在�
 
 ### Q: LLM 会不会乱下单？
 
-有七层风控 + 上下文预注入 + **拒绝修正**三重保护。即使 LLM 给出不合理信号，风控层也会拒绝。且 LLM 在决策前已经看到了当前的风控约束（熔断状态、保证金预算、风险预算），大幅降低了提出无效操作的概率。万一仍被拒绝，系统还会给 LLM 一次修正机会（见 [风控拒绝反馈修正](#风控拒绝反馈修正risk-correction)）。常见被拒绝的情况：
+有多层风控 + 上下文预注入 + **拒绝修正**三重保护。即使 LLM 给出不合理信号，风控层也会拒绝。且 LLM 在决策前已经看到了当前的风控约束（熔断状态、保证金预算、风险预算），大幅降低了提出无效操作的概率。万一仍被拒绝，系统还会给 LLM 一次修正机会（见 [风控拒绝反馈修正](#风控拒绝反馈修正risk-correction)）。常见被拒绝的情况：
 - 置信度 < 0.7
 - 保证金需求超过可用余额的 95%
 - 单笔风险 > 2% 账户

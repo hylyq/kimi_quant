@@ -11,7 +11,9 @@
 - 🔄 **Decision Feedback Loop**: Previous cycle's decision→outcome auto-injected, "you said wait for pullback → now it's pulled back" autonomous learning
 
 ### Risk Control & Safety
-- 🛡️ **Seven-Layer Risk Control**: Circuit breaker, confidence, position size, margin, risk amount, stop-loss distance, direction constraints
+- 🛡️ **Multi-Layer Risk Control**: Circuit breaker, confidence, position size, margin, risk amount, stop-loss distance band (0.5%–1.5%), direction constraints, expected-value gate (confidence must exceed the breakeven win rate), counter-trend confidence floor, and close discipline (anti-churn gate for early LLM CLOSEs)
+- 🛡️ **Fee-Aware Execution**: taker fees (0.045%/side) are enforced in checks — TP must clear 3× round-trip fees; optional `ENTRY_ORDER_TYPE=maker` places passive GTC entries (0.015%/side) with SL/TP auto-placed on fill confirmation
+- 📊 **Confidence Calibration**: every trade records its entry confidence; bucketed win rates and exit attribution (LLM CLOSE vs SL/TP hit) feed back into the prompt
 - 🔁 **Risk Correction**: Rejected signals get one LLM revision opportunity (e.g., widen SL, reduce size)
 - 💰 **Tick Size Auto-Alignment**: All order prices auto-round to exchange minimum price unit, preventing batch order rejections
 - 🔍 **SL/TP On-Chain Verification**: Cross-reference tracker vs on-chain orders every cycle; missing orders trigger immediate alert and recovery
@@ -113,7 +115,7 @@ Regardless of strategy mode, the LLM follows a **mandatory two-step decision pro
 │  4. Bias Audit: Evidence (0-10) ___ vs Expectation (0-10) ___ │
 │     → Expectation > evidence → confidence -0.15 or HOLD       │
 │  5. R:R VERIFICATION: R:R = |TP-entry|/|SL-entry|. ≥ 1.5:1.   │
-│     After ~0.07% taker fees, small TP moves are eaten by costs.│
+│     After ~0.09% taker fees, small TP moves are eaten by costs.│
 │     → R:R < 1.5:1 → widen TP or HOLD                           │
 │  Any serious doubt → HOLD is correct. There's always next.     │
 └─────────────────────────────────────────────────────────────┘
@@ -152,7 +154,7 @@ This design is enforced through three-layer prompting (System Prompt + User Prom
 
 1. **DataProvider** — Market data via mainnet (`meta_and_asset_ctxs`, with mark/oracle/funding/OI), multi-TF K-line TTL cache. Syncs all on-chain open orders (`open_orders`). **Inter-cycle diff**: auto-compares with previous snapshot, injecting a `# 📊 Since Last Cycle (X.Xmin ago)` block — because the LLM controls its wake interval, the diff annotates actual elapsed time for correct change assessment
 2. **Strategy Engine** — Single: one LLM analysis; Debate: 3-agent debate + Judge ruling (60s timeout), optional **rebuttal round** (debaters rebut each other before ruling). All agents receive identical market data (prices, multi-TF K-lines, order book, funding rate, risk constraints, inter-cycle diff); Judge additionally sees all three arguments for cross-verification. Both modes follow the Step 0→Step 1→Step 1.5 decision workflow
-3. **RiskManager** — Seven-layer risk checks + `validate_sequence()` multi-operation state simulation (supports CLOSE+LONG/SHORT flip through risk). **Risk rejection → LLM one correction**: rejection reason fed back to the original decision-maker; corrected signal re-validated and executed if passed (can be disabled via `RISK_CORRECTION_ENABLED`)
+3. **RiskManager** — Multi-layer risk checks + `validate_sequence()` multi-operation state simulation (supports CLOSE+LONG/SHORT flip through risk). **Risk rejection → LLM one correction**: rejection reason fed back to the original decision-maker; corrected signal re-validated and executed if passed (can be disabled via `RISK_CORRECTION_ENABLED`)
 4. **TradeExecutor** — Startup recovery + resting/active state machine + SL/TP price tracking + multi-operation sequential execution (fail-fast) + 15/15 SDK coverage
 5. **TradeLogger** — P&L analysis + LLM performance feedback (introspection loop)
 6. **OrderMonitor** — WebSocket real-time order state subscription (filled/partial/canceled/liquidated), millisecond-level sync to PositionTracker, giving the LLM the latest state next cycle
@@ -943,6 +945,12 @@ systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 | `MIN_CONFIDENCE` | `0.7` | Minimum confidence threshold |
 | `MAX_LEVERAGE` | `3` | Maximum leverage |
 | `MIN_SL_DISTANCE` | `0.005` | Minimum stop-loss distance from entry (fraction of price; 0.5% default) |
+| `MAX_SL_DISTANCE` | `0.015` | Maximum stop-loss distance (1.5% default) — wider stops are rejected: live data showed single-trade losses up to 1.28% of price |
+| `ENTRY_ORDER_TYPE` | `market` | `market` = Ioc taker entry (0.045%/side); `maker` = passive GTC limit clamped to the book (0.015%/side on fill, cancelled after 3 unfilled cycles; SL/TP placed automatically once the fill confirms) |
+| `MIN_HOLD_MINUTES` | `30` | Close discipline: LLM CLOSE blocked before this hold time unless price moved ≥50% of the SL distance |
+| `CLOSE_MIN_MOVE_FRAC` | `0.5` | Close discipline: fraction of the SL distance price must travel before an early CLOSE is allowed |
+| `CLOSE_OVERRIDE_CONFIDENCE` | `0.90` | Close discipline: confidence at or above this always allows CLOSE (thesis clearly invalidated) |
+| `COUNTER_TREND_MIN_CONFIDENCE` | `0.80` | Entries opposing BOTH the 1h and 4h trend need at least this confidence |
 | **Strategy** | | |
 | `STRATEGY_MODE` | `single` | `single` or `debate` |
 | `TRADING_INTERVAL` | `600` | Default interval (seconds). LLM can dynamically override via `next_interval` |
@@ -1225,8 +1233,12 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 | 3 | **Position Cap** | Not exceeding `MAX_POSITION_SIZE` |
 | 4 | **Margin Requirement** | `size × price / leverage` ≤ 95% available balance; reject and suggest appropriate size if exceeded |
 | 5 | **Risk Amount** | Single trade SL loss > 1% account warning, > 2% reject (`\|entry - SL\| × size`) |
-| 6 | **Stop Loss Distance + Side** | ≥ 0.5% from entry (BTC noise ~0.3%, reject below this threshold; configurable via `MIN_SL_DISTANCE`). Side validated: LONG needs SL < entry < TP, SHORT the mirror — a wrong-side SL (would trigger instantly) or wrong-side TP is rejected, abs()-distance alone can't catch these |
+| 6 | **Stop Loss Distance + Side** | 0.5%–1.5% band from entry (floor: BTC noise ~0.3%; ceiling `MAX_SL_DISTANCE`: live data showed single-trade adverse moves up to 1.28% of price, larger than the best win). Side validated: LONG needs SL < entry < TP, SHORT the mirror — a wrong-side SL (would trigger instantly) or wrong-side TP is rejected, abs()-distance alone can't catch these |
 | 7 | **Risk/Reward Ratio** | ≥ 1.5:1 (`|TP - entry| / |SL - entry|`). **Always enforced — TP is mandatory for LONG/SHORT** (omitting TP would bypass this gate) |
+| 9 | **Expected Value** | confidence must exceed the breakeven win rate `1/(1+R:R)` (enforced in code, not just prompted); TP distance must be ≥ 3× round-trip taker fees (0.09%) — trades that can't pay their own fees are rejected |
+| 10 | **Trend Alignment** | entries opposing BOTH the 1h and 4h trend need confidence ≥ `COUNTER_TREND_MIN_CONFIDENCE` (default 0.80) |
+| 11 | **Close Discipline (anti-churn)** | LLM CLOSE rejected while held < `MIN_HOLD_MINUTES` (30min) AND price has traveled < 50% of the SL distance (confidence ≥ 0.90 overrides; unknown position context fails open). Exchange-side SL/TP exits are never affected — live data showed 1/3 of round trips closing within one 10-min cycle at 1–30bps moves, pure fee churn |
+| — | **Size Normalization** | `clamp_size` clamps size to the hard cap + margin budget + 1% risk budget before validation, eliminating the 4× per-trade risk variance observed live |
 | 8 | **Direction** | Same-direction position rejected; **naked opposite entry rejected** (bare SHORT while long would silently reduce the real position and orphan its SL/TP + trade record — flip via `["CLOSE", "SHORT"]`); CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation. MODIFY_SL to the wrong side of current price (instant trigger) is also rejected |
 | — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; missing oid **or no tracked SL at all** (live mode) → prompt warning + throttled push notification. `MODIFY_SL`/`MODIFY_TP` then **re-place** the order automatically (restore path) instead of failing on a dead oid |
 | — | **SL/TP Real-Time Detection** | WebSocket detects SL/TP fills at millisecond latency → instant push notification (🛑/🎯). Tracker preserves close reason **and actual trigger fill price** across WS-triggered clear() so the next main-loop cycle records accurate close_reason and P&L instead of guessing from a stale mid price |
@@ -1943,7 +1955,7 @@ Default 300s (5min) is a balanced choice.
 
 ### Q: Will the LLM place random orders?
 
-There's triple protection: seven-layer risk control + context pre-injection + **rejection correction**. Even if the LLM gives unreasonable signals, the risk layer rejects them. And the LLM already sees current risk constraints before deciding (circuit breaker state, margin budget, risk budget), significantly reducing invalid operation probability. If still rejected, the system gives the LLM one correction chance (see [Risk Rejection Feedback Correction](#risk-rejection-feedback-correction)). Common rejection cases:
+There's triple protection: multi-layer risk control + context pre-injection + **rejection correction**. Even if the LLM gives unreasonable signals, the risk layer rejects them. And the LLM already sees current risk constraints before deciding (circuit breaker state, margin budget, risk budget), significantly reducing invalid operation probability. If still rejected, the system gives the LLM one correction chance (see [Risk Rejection Feedback Correction](#risk-rejection-feedback-correction)). Common rejection cases:
 - Confidence < 0.7
 - Margin requirement > 95% available balance
 - Single trade risk > 2% account

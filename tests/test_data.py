@@ -90,3 +90,39 @@ def test_no_tmp_files_left_behind(monkeypatch, tmp_path):
     cache.fetch(lambda: {"a": 2})
     leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
+
+
+# ─── Entry discipline (chase / counter-trend context) ─────────────────────
+
+
+from kimi_quant.data import TimeframeSummary as TS, _build_entry_discipline
+
+
+def _tf(interval, trend, chg, atr_pct, n=60):
+    per_candle_h = {"5m": 5 / 60, "15m": 0.25, "1h": 1.0, "4h": 4.0}[interval]
+    return TS(interval=interval, num_candles=n, duration_hours=n * per_candle_h,
+              trend=trend, change_pct=chg, current_close=80000, period_open=80000 - chg * 800,
+              period_high=80200, period_low=78900, current_range_pct=0.3,
+              total_volume=900, avg_volume=950, volume_trend="steady",
+              atr=80000 * atr_pct / 100, atr_pct=atr_pct)
+
+
+def test_steady_grind_is_not_extended():
+    tfs = [_tf("15m", "up", 0.35, 0.15), _tf("1h", "up", 1.4, 0.48), _tf("4h", "up", 4.5, 0.88)]
+    # 0.35% / (0.15% × √60) = 0.30× — a calm grind must NOT warn
+    ctx = _build_entry_discipline(tfs)
+    assert "EXTENDED" not in ctx
+    assert "Trend 1h+4h: UP" in ctx
+
+
+def test_spike_is_flagged_extended():
+    # +2.5% over the 15m window vs 0.15% ATR → 2.5/(0.15×√60) = 2.2×
+    tfs = [_tf("15m", "up", 2.5, 0.15), _tf("1h", "up", 2.8, 0.48), _tf("4h", "up", 3.0, 0.88)]
+    ctx = _build_entry_discipline(tfs)
+    assert "EXTENDED" in ctx
+    assert "2.2×" in ctx
+
+
+def test_no_short_timeframes_no_crash():
+    assert _build_entry_discipline([_tf("1h", "up", 3.0, 0.5), _tf("4h", "up", 5.0, 0.9)]) == ""
+    assert _build_entry_discipline([]) == ""
