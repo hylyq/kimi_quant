@@ -10,7 +10,10 @@ Provides structured market data for the LLM to analyze:
 
 import json
 import logging
+import os
 import random
+import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -112,45 +115,82 @@ _SNAPSHOT_MAX_AGE = 3600  # 1h — refuse to trade on older data
 class _SnapshotCache:
     """Disk-cache fail-safe for a single snapshot payload.
 
-    Wraps a fetch callable: on success the payload is written to disk; on
-    failure a recent cached copy (default max_age 1h) is returned instead, so
-    a network outage degrades the cycle to stale data rather than failing it
-    outright. If no cache exists yet, the original error propagates.
+    Wraps a fetch callable with three protections:
+      - Single-flight + freshness TTL: concurrent fetchers of the same key
+        (e.g. market snapshot and order book both need the L2 book) share
+        one in-flight request and one result within `fresh_ttl` seconds.
+      - Stale fallback: on failure a recent cached copy (max_age, default 1h)
+        is returned, degrading the cycle to stale data instead of failing it.
+      - Atomic persistence: written via tmp-file + rename so a crash or a
+        concurrent writer can never leave a truncated JSON behind.
+
+    If no cache exists yet, the original error propagates.
     """
 
-    def __init__(self, key: str, max_age: float = _SNAPSHOT_MAX_AGE):
+    def __init__(self, key: str, max_age: float = _SNAPSHOT_MAX_AGE,
+                 fresh_ttl: float = 0.0):
         self.key = key
         self.max_age = max_age
+        self.fresh_ttl = fresh_ttl
         self._mem: tuple[float, Any] | None = None
         self._path = _CACHE_DIR / f"{key}.json"
+        self._flight_lock = threading.Lock()
 
     def fetch(self, fn: Callable[[], Any]) -> Any:
-        try:
-            data = fn()
-        except Exception as e:
-            stale = self._load()
-            if stale is not None:
-                age = time.time() - stale[0]
-                logger.warning(
-                    "Using stale cached %s (age=%.0fs) after error: %s",
-                    self.key, age, e,
-                )
-                return stale[1]
-            raise
-        self._save(time.time(), data)
-        return data
+        # Single-flight: the lock serializes fetches for this key, so the
+        # second concurrent caller finds the fresh result of the first.
+        with self._flight_lock:
+            if (
+                self._mem is not None
+                and self.fresh_ttl > 0
+                and time.time() - self._mem[0] < self.fresh_ttl
+            ):
+                return self._mem[1]
+            try:
+                data = fn()
+            except Exception as e:
+                stale = self._load()
+                if stale is not None:
+                    age = time.time() - stale[0]
+                    logger.warning(
+                        "Using stale cached %s (age=%.0fs) after error: %s",
+                        self.key, age, e,
+                    )
+                    return stale[1]
+                raise
+            self._save(time.time(), data)
+            return data
 
     def _save(self, ts: float, data: Any) -> None:
         try:
             _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps({"ts": ts, "data": data}))
+            payload = json.dumps({"ts": ts, "data": data})
+            # Atomic write: a concurrent reader/crash never sees a partial file.
+            fd, tmp = tempfile.mkstemp(
+                dir=_CACHE_DIR, prefix=f"{self.key}.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(payload)
+                os.replace(tmp, self._path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
             self._mem = (ts, data)
         except Exception as e:
             logger.debug("snapshot cache write failed (%s): %s", self.key, e)
 
     def _load(self) -> tuple[float, Any] | None:
         if self._mem is not None:
-            return self._mem
+            # In-memory copies must respect max_age too — otherwise a
+            # long-running process would serve arbitrarily old data during
+            # an extended outage.
+            if time.time() - self._mem[0] <= self.max_age:
+                return self._mem
+            return None
         try:
             payload = json.loads(self._path.read_text())
             ts = float(payload["ts"])
@@ -576,9 +616,14 @@ class DataProvider:
         self._candle_cache: dict[str, tuple[float, list[dict]]] = {}
         # Previous cycle snapshot for cycle-over-cycle diff
         self._previous_snapshot: dict[str, Any] = {}
-        # Disk-cache fail-safes for critical snapshot payloads
+        # Disk-cache fail-safes for critical snapshot payloads.
+        # L2 gets a short freshness TTL: the market snapshot and the order
+        # book both need the same L2 payload each cycle — without it the
+        # two parallel fetchers double the API calls and disk writes.
         self._meta_ctx_cache = _SnapshotCache("meta_asset_ctxs")
-        self._l2_cache = _SnapshotCache(f"l2_book_{self.coin.lower()}")
+        self._l2_cache = _SnapshotCache(
+            f"l2_book_{self.coin.lower()}", fresh_ttl=3.0,
+        )
 
         logger.info(
             "DataProvider initialized (testnet=%s, coin=%s, curl_cffi=%s)",
@@ -858,25 +903,35 @@ class DataProvider:
 
             rates = [float(h["fundingRate"]) for h in history]
             current = rates[-1]
-            # Funding updates ~hourly on Hyperliquid
+            # Funding updates ~hourly on Hyperliquid.
+            # avg_1h  = mean of the two most recent hourly rates.
+            # avg_8h  = mean of the last 8 hourly rates (an actual 8h window).
+            # baseline = mean of everything older in the 24h lookback —
+            #   the reference the current rate is drifting away from.
             recent_1h = rates[-2:] if len(rates) >= 2 else rates
             avg_1h = sum(recent_1h) / len(recent_1h)
-            older = rates[:-4] if len(rates) > 4 else rates[:1]
-            avg_8h = sum(older) / len(older) if older else current
+            window_8h = rates[-8:]
+            avg_8h = sum(window_8h) / len(window_8h)
+            older = rates[:-8]
+            baseline = (sum(older) / len(older)) if older else avg_8h
 
-            if current > avg_8h * 1.5:
+            # Sign-safe drift detection: scale comparisons by |avg_8h| so a
+            # near-zero or negative average can't flip the thresholds.
+            drift = current - baseline
+            scale = max(abs(avg_8h), 1e-6)
+            if drift > 0.5 * scale and current > avg_8h:
                 trend = "rising (longs paying more)"
                 interpretation = (
                     "Funding increasing — longs are becoming more aggressive, "
                     "potential overcrowding on the long side."
                 )
-            elif current < avg_8h * 0.5 and current < 0:
+            elif drift < -0.5 * scale and current < 0:
                 trend = "falling (shorts paying more)"
                 interpretation = (
                     "Funding turning negative — shorts are becoming aggressive, "
                     "potential short squeeze setup."
                 )
-            elif abs(current - avg_8h) < avg_8h * 0.3:
+            elif abs(current - avg_8h) <= 0.3 * scale:
                 trend = "stable"
                 interpretation = "Funding stable, no extreme positioning detected."
             else:
@@ -1268,9 +1323,8 @@ class DataProvider:
                     prompt += f"  oid={oid} {side} {sz:.4f} BTC @ ${px:.1f}\n"
                 prompt += (
                     "If these orders are stale (from a previous run) or conflict "
-                    "with your current strategy, you should cancel them before "
-                    "placing new ones. Use CLOSE or consider using the cancel "
-                    "functions to clean up.\n"
+                    "with your current strategy, clean them up with CANCEL_STALE "
+                    "(it cancels untracked orders only — your SL/TP are safe).\n"
                 )
 
             # Inject tracker-known open orders (SL/TP oids with richer context)
@@ -1321,7 +1375,6 @@ class DataProvider:
 
             # Constraint recap at the VERY END (recency effect — LLM sees
             # these right before generating its output JSON)
-            risk_ctx = report.get("risk_context", "")
             breaker_active = "CIRCUIT BREAKER ACTIVE" in risk_ctx
             recap = _build_constraint_recap(
                 max_size=config.max_position_size,

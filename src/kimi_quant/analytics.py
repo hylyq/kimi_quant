@@ -86,7 +86,9 @@ class TradeRecord:
 
     @property
     def is_win(self) -> bool:
-        return self.pnl > 0
+        # Net of fees: a $1 gross gain on a $5 fee bill is a loss, and the
+        # circuit breaker / stats should count it that way.
+        return (self.pnl - self.fees_est) > 0
 
     @property
     def net_pnl(self) -> float:

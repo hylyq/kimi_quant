@@ -104,9 +104,10 @@ class Config:
     )  # "" = use PRIMARY_LLM; set to "kimi" or "deepseek" to override Judge model
     judge_model: str = field(
         default_factory=lambda: os.getenv("JUDGE_MODEL", "")
-    )  # "" = use provider default; set to override Judge's specific model version
-    #   (e.g. "deepseek-v4-pro", "kimi-k3"). Only meaningful when judge_primary_llm
-    #   is also set — the model name must match the selected provider.
+    )  # "" = use provider default; set to override the Judge's model version
+    #   (e.g. "deepseek-v4-pro", "kimi-k3"). Applied ONLY to the Judge's
+    #   provider — JUDGE_PRIMARY_LLM if set, otherwise PRIMARY_LLM. The model
+    #   name must match that provider.
     judge_reasoning_effort: str = field(
         default_factory=lambda: os.getenv("JUDGE_REASONING_EFFORT", "")
     )  # "" = use global REASONING_EFFORT; set to override Judge's reasoning effort

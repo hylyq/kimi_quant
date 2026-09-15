@@ -114,9 +114,11 @@ class PositionTracker:
     max_resting_cycles: int = 3  # cancel limit order after this many unfilled cycles
 
     # WS→main-loop bridge: when the WebSocket clears the tracker before the
-    # main loop can capture pre-sync state, this field preserves the close
-    # reason ("stop_loss" | "take_profit" | None) so P&L recording is accurate.
+    # main loop can capture pre-sync state, these fields preserve the close
+    # reason ("stop_loss" | "take_profit" | None) and the actual fill price
+    # so P&L recording is accurate.
     _last_ws_close_reason: str | None = None
+    _last_ws_close_price: float = 0.0
 
     # Thread safety: the main loop and the WebSocket monitor both access
     # tracker state. All public mutations must hold this lock.
@@ -137,17 +139,20 @@ class PositionTracker:
     def should_cancel_resting(self) -> bool:
         return self.state == "resting" and self.resting_cycles >= self.max_resting_cycles
 
-    def consume_ws_close_reason(self) -> str | None:
-        """Return and clear the last WS close reason (if any).
+    def consume_ws_close(self) -> tuple[str | None, float]:
+        """Return and clear the last WS close (reason, fill_price).
 
         Called by the main loop after sync_with_chain to get the accurate
-        close reason when the WebSocket beat the main loop to clearing the
-        tracker. Returns "stop_loss", "take_profit", or None.
+        close reason and actual trigger fill price when the WebSocket beat
+        the main loop to clearing the tracker.
+        Returns ("stop_loss"|"take_profit"|None, fill_price).
         """
         with self._lock:
             reason = self._last_ws_close_reason
+            price = self._last_ws_close_price
             self._last_ws_close_reason = None
-            return reason
+            self._last_ws_close_price = 0.0
+            return reason, price
 
     # ─── Mutations (thread-safe via _lock) ───────────────────────────
 
@@ -164,14 +169,71 @@ class PositionTracker:
             self.sl_price = 0.0
             self.tp_price = 0.0
             self.resting_cycles = 0
-            # Reset position memory (but NOT _last_ws_close_reason —
-            # the main loop needs it after clear() to record the correct
-            # close_reason. It is consumed via consume_ws_close_reason().)
+            # Reset position memory (but NOT _last_ws_close_reason/_price —
+            # the main loop needs them after clear() to record the correct
+            # close_reason and exit price. They are consumed via
+            # consume_ws_close()).
             self.entry_time = ""
             self.entry_reason = ""
             self.entry_confidence = 0.0
             self.peak_favorable = 0.0
             self.peak_adverse = 0.0
+
+    def recover_position(
+        self, side: str, size: float, entry_price: float,
+    ) -> None:
+        """Rebuild an active position from chain state (startup / re-sync)."""
+        with self._lock:
+            self.coin = config.trading_pair
+            self.side = side
+            self.size = size
+            self.entry_price = entry_price
+            self.state = "active"
+            self.resting_cycles = 0
+
+    def sync_active(
+        self, chain_side: str, chain_size: float, chain_entry: float,
+    ) -> None:
+        """Refresh an active position from chain state, side included.
+
+        The side is corrected when it drifts (e.g. an external/manual trade
+        flipped the position) — SL/TP order direction is derived from it.
+        """
+        with self._lock:
+            if chain_side not in ("none", "") and chain_side != self.side:
+                logger.warning(
+                    "Side mismatch: tracker=%s chain=%s — adopting chain side",
+                    self.side, chain_side,
+                )
+                self.side = chain_side
+            if chain_entry > 0:
+                self.entry_price = chain_entry
+            if chain_size > 0:
+                self.size = chain_size
+
+    def record_sl(self, oid: int | None, price: float) -> None:
+        """Update the tracked SL order (after modify/restore/recovery)."""
+        with self._lock:
+            self.sl_oid = oid
+            self.sl_price = price
+
+    def record_tp(self, oid: int | None, price: float) -> None:
+        """Update the tracked TP order (after modify/restore/recovery)."""
+        with self._lock:
+            self.tp_oid = oid
+            self.tp_price = price
+
+    def clear_oid(self, kind: str) -> None:
+        """Forget one tracked order by kind: 'entry' | 'sl' | 'tp'."""
+        with self._lock:
+            if kind == "entry":
+                self.entry_oid = None
+            elif kind == "sl":
+                self.sl_oid = None
+                self.sl_price = 0.0
+            elif kind == "tp":
+                self.tp_oid = None
+                self.tp_price = 0.0
 
     def update_from_open(
         self,
@@ -285,6 +347,7 @@ class PositionTracker:
                         oid, event.fill_price,
                     )
                     self._last_ws_close_reason = "stop_loss"
+                    self._last_ws_close_price = event.fill_price
                     self.clear()
                     return f"sl_filled oid={oid}"
 
@@ -295,6 +358,7 @@ class PositionTracker:
                         oid, event.fill_price,
                     )
                     self._last_ws_close_reason = "take_profit"
+                    self._last_ws_close_price = event.fill_price
                     self.clear()
                     return f"tp_filled oid={oid}"
 
@@ -496,6 +560,16 @@ def _parse_oids_from_result(result: Any, num_orders: int) -> dict[str, int | Non
     return oids
 
 
+def _parse_single_oid(result: Any) -> int | None:
+    """Extract the order id from a single (non-bulk) order response."""
+    try:
+        status = result["response"]["data"]["statuses"][0]
+        oid = status.get("resting", {}).get("oid") or status.get("filled", {}).get("oid")
+        return int(oid) if oid is not None else None
+    except Exception:
+        return None
+
+
 # ─── Trade Executor ──────────────────────────────────────────────────────
 
 
@@ -577,11 +651,7 @@ class TradeExecutor:
                         side = "long" if size > 0 else "short"
                         size = abs(size)
                         entry_px = float(p.get("entryPx", 0))
-                        self.tracker.side = side
-                        self.tracker.size = size
-                        self.tracker.entry_price = entry_px
-                        self.tracker.state = "active"
-                        self.tracker.coin = self.coin
+                        self.tracker.recover_position(side, size, entry_px)
                         logger.info(
                             "Recovered position: %s %.4f @ $%.1f",
                             side.upper(), size, entry_px,
@@ -618,18 +688,14 @@ class TradeExecutor:
                         # Infer SL vs TP from price relative to entry
                         if limit_px < self.tracker.entry_price:
                             if self.tracker.side == "long":
-                                self.tracker.sl_oid = oid
-                                self.tracker.sl_price = limit_px
+                                self.tracker.record_sl(oid, limit_px)
                             else:
-                                self.tracker.tp_oid = oid
-                                self.tracker.tp_price = limit_px
+                                self.tracker.record_tp(oid, limit_px)
                         else:
                             if self.tracker.side == "long":
-                                self.tracker.tp_oid = oid
-                                self.tracker.tp_price = limit_px
+                                self.tracker.record_tp(oid, limit_px)
                             else:
-                                self.tracker.sl_oid = oid
-                                self.tracker.sl_price = limit_px
+                                self.tracker.record_sl(oid, limit_px)
                         logger.info(
                             "Recovered SL/TP order #%d (price=$%.1f)", oid, limit_px
                         )
@@ -734,6 +800,9 @@ class TradeExecutor:
         elif action == "MODIFY_TP":
             return self._handle_modify_tp(signal)
 
+        elif action == "CANCEL_STALE":
+            return self._cancel_stale_orders()
+
         elif action in ("LONG", "SHORT"):
             return self._open_position(
                 signal, is_buy=(action == "LONG")
@@ -826,27 +895,24 @@ class TradeExecutor:
             # main.py records the trade via TradeLogger before clearing
             self.tracker.clear()
 
-        # Case 4: Active position → still there (update entry/size from chain)
+        # Case 4: Active position → still there (refresh entry/size/side from chain)
         elif tracker_has and has_chain_pos:
-            if chain_entry > 0:
-                self.tracker.entry_price = chain_entry
-            if chain_size > 0:
-                self.tracker.size = chain_size
+            self.tracker.sync_active(chain_side, chain_size, chain_entry)
 
         # Case 5: No tracker position but chain has one (recovery)
         elif not tracker_has and not tracker_resting and has_chain_pos:
             logger.warning("Chain has position but tracker doesn't — recovering.")
-            self.tracker.side = chain_side
-            self.tracker.size = chain_size
-            self.tracker.entry_price = chain_entry
-            self.tracker.state = "active"
-            self.tracker.coin = self.coin
+            self.tracker.recover_position(chain_side, chain_size, chain_entry)
 
     def verify_tracked_orders(self, open_orders_raw: list[dict]) -> dict:
         """Cross-reference tracker SL/TP oids against chain open orders.
 
         Called each cycle when there's an active position. Returns a dict
         indicating which tracked orders are missing from the exchange.
+
+        An SL with no tracked oid also counts as missing (live mode only —
+        dry-run trackers never carry oids): an unprotected position is the
+        same problem whether the order was cancelled, never placed, or lost.
 
         Args:
             open_orders_raw: List of open order dicts from the chain API.
@@ -868,14 +934,21 @@ class TradeExecutor:
                     chain_oids.add(int(oid))
 
         # Check SL
-        if self.tracker.sl_oid is not None and self.tracker.sl_oid not in chain_oids:
+        if self.tracker.sl_oid is None:
+            if not self.dry_run:
+                logger.warning(
+                    "No SL order tracked (never placed or cancelled) — "
+                    "position is unprotected."
+                )
+                result["sl_missing"] = True
+        elif self.tracker.sl_oid not in chain_oids:
             logger.warning(
                 "SL order #%d ($%.0f) NOT FOUND on chain! Position is unprotected.",
                 self.tracker.sl_oid, self.tracker.sl_price,
             )
             result["sl_missing"] = True
 
-        # Check TP
+        # Check TP (only when we expect one — TP is optional)
         if self.tracker.tp_oid is not None and self.tracker.tp_oid not in chain_oids:
             logger.warning(
                 "TP order #%d ($%.0f) NOT FOUND on chain!",
@@ -1014,12 +1087,26 @@ class TradeExecutor:
         orders: list[dict] = []
 
         # Order 0: Open position — always market order via Ioc
+        from kimi_quant.data import retry_api_call
+
         try:
-            mids = self.info.all_mids()
+            mids = retry_api_call(
+                lambda: self.info.all_mids(),
+                description="all_mids (entry pricing)",
+                max_retries=2,
+            )
             mid = float(mids.get(self.coin, 0))
-        except Exception:
+        except Exception as e:
+            logger.warning("all_mids failed while pricing entry: %s", e)
             mid = 0
-        buffer = mid * 0.02 if mid > 0 else 1000  # 2% buffer
+        if mid <= 0:
+            # Without a mid we cannot build a marketable Ioc limit — a buy
+            # would silently no-fill (limit far below the ask). Abort cleanly.
+            raise ValueError(
+                "Cannot price market order: all_mids unavailable for "
+                f"{self.coin} — refusing to place a blind Ioc order"
+            )
+        buffer = mid * 0.02  # 2% buffer
         px = mid + buffer if is_buy else max(mid - buffer, 1)
         orders.append({
             "coin": self.coin,
@@ -1109,11 +1196,11 @@ class TradeExecutor:
             result = self.exchange.cancel(self.coin, oid)
             logger.info("Order #%d cancelled", oid)
             if oid == self.tracker.entry_oid:
-                self.tracker.entry_oid = None
+                self.tracker.clear_oid("entry")
             elif oid == self.tracker.sl_oid:
-                self.tracker.sl_oid = None
+                self.tracker.clear_oid("sl")
             elif oid == self.tracker.tp_oid:
-                self.tracker.tp_oid = None
+                self.tracker.clear_oid("tp")
             return {"action": "cancel", "executed": True, "result": result}
         except Exception as e:
             logger.error("Failed to cancel order #%d: %s", oid, e)
@@ -1236,8 +1323,84 @@ class TradeExecutor:
 
     # ─── LLM-triggered Stop Loss Modification ────────────────────────────
 
+    def _oid_on_chain(self, oid: int) -> bool:
+        """Check whether a tracked order still exists on the exchange.
+
+        Returns True when the check itself fails — the caller then falls
+        through to a normal modify attempt instead of spuriously re-placing
+        an order that might still be live.
+        """
+        from kimi_quant.data import retry_api_call
+
+        try:
+            orders = retry_api_call(
+                lambda: self.info.open_orders(self.address),
+                description="open_orders (SL/TP verify)",
+                max_retries=1,
+            )
+        except Exception as e:
+            logger.warning("Could not verify order #%d on chain: %s", oid, e)
+            return True
+        return any(
+            int(o.get("oid", -1)) == oid
+            for o in orders
+            if o.get("coin") == self.coin
+        )
+
+    def _place_protective_trigger(
+        self, price: float, tpsl: str, size: float,
+    ) -> tuple[dict, int | None]:
+        """Place a NEW reduce-only SL/TP trigger order (restore path).
+
+        Used when the tracked order is gone from the chain (cancelled,
+        never placed, or lost) — MODIFY on a dead oid can only fail.
+        Returns (result_dict, new_oid).
+        """
+        px = _round_to_tick(price, self._tick_size)
+        is_buy = (self.tracker.side == "short")  # closing a short = buy
+        try:
+            result = self.exchange.order(
+                name=self.coin,
+                is_buy=is_buy,
+                sz=size,
+                limit_px=px,
+                order_type={
+                    "trigger": {"triggerPx": px, "isMarket": True, "tpsl": tpsl}
+                },
+                reduce_only=True,
+            )
+        except Exception as e:
+            logger.error("Failed to place %s order @ $%.1f: %s", tpsl, px, e)
+            return (
+                {"action": f"place_{tpsl}", "executed": False, "error": str(e)},
+                None,
+            )
+
+        errors = _extract_errors(result, 1)
+        if errors:
+            logger.error("Exchange rejected %s order: %s", tpsl, errors)
+            return (
+                {
+                    "action": f"place_{tpsl}",
+                    "executed": False,
+                    "error": f"Exchange rejected order: {errors}",
+                },
+                None,
+            )
+
+        oid = _parse_single_oid(result)
+        return (
+            {"action": f"place_{tpsl}", "executed": True, "result": result},
+            oid,
+        )
+
     def _handle_modify_sl(self, signal: TradingSignal) -> dict:
-        """Move stop loss using tracked oid. Requires active position."""
+        """Set or move the stop loss. Requires an active position.
+
+        Restore path: when the tracked SL order no longer exists on chain
+        (cancelled via WS, manually, or never placed), a NEW trigger order
+        is placed instead of modifying a dead oid.
+        """
         new_sl = signal.modify_sl_to or signal.stop_loss
         if new_sl is None:
             return {"action": "MODIFY_SL", "executed": False,
@@ -1251,27 +1414,48 @@ class TradeExecutor:
         new_sl = _round_to_tick(new_sl, self._tick_size)
 
         if self.dry_run:
-            self.tracker.sl_price = new_sl
+            self.tracker.record_sl(sl_oid, new_sl)
             return {
                 "action": "MODIFY_SL", "executed": True, "dry_run": True,
                 "sl_oid": sl_oid, "new_sl": new_sl,
                 "reasoning": signal.reasoning,
             }
 
-        if sl_oid is None:
-            return {"action": "MODIFY_SL", "executed": False,
-                    "reason": "No tracked SL order ID."}
+        # Restore path: no tracked oid, or the tracked order is gone.
+        if sl_oid is None or not self._oid_on_chain(sl_oid):
+            if sl_oid is not None:
+                logger.warning(
+                    "SL order #%d no longer on chain — placing a fresh SL", sl_oid
+                )
+            result, oid = self._place_protective_trigger(
+                new_sl, tpsl="sl", size=self.tracker.size,
+            )
+            if result.get("executed") and oid is not None:
+                self.tracker.record_sl(oid, new_sl)
+                logger.info("MODIFY_SL: restored new SL order #%d @ $%.1f",
+                            oid, new_sl)
+                result["new_sl"] = new_sl
+                result["sl_oid"] = oid
+                result["restored"] = True
+            return result
 
         logger.info("MODIFY_SL: moving SL #%d to $%.1f", sl_oid, new_sl)
-        self.tracker.sl_price = new_sl  # track the new SL price for LLM visibility
-        return self.modify_stop_loss(
+        result = self.modify_stop_loss(
             oid=sl_oid, new_price=new_sl,
             is_buy=(self.tracker.side == "short"),
             size=self.tracker.size,
         )
+        # Only publish the new price after the exchange accepted it.
+        if result.get("executed"):
+            self.tracker.record_sl(sl_oid, new_sl)
+        return result
 
     def _handle_modify_tp(self, signal: TradingSignal) -> dict:
-        """Move take profit using tracked oid. Requires active position."""
+        """Set or move the take profit. Requires an active position.
+
+        Mirrors _handle_modify_sl, including the restore path (place a new
+        trigger order when the tracked one is gone from the chain).
+        """
         new_tp = signal.modify_tp_to or signal.take_profit
         if new_tp is None:
             return {"action": "MODIFY_TP", "executed": False,
@@ -1285,24 +1469,97 @@ class TradeExecutor:
         new_tp = _round_to_tick(new_tp, self._tick_size)
 
         if self.dry_run:
-            self.tracker.tp_price = new_tp
+            self.tracker.record_tp(tp_oid, new_tp)
             return {
                 "action": "MODIFY_TP", "executed": True, "dry_run": True,
                 "tp_oid": tp_oid, "new_tp": new_tp,
                 "reasoning": signal.reasoning,
             }
 
-        if tp_oid is None:
-            return {"action": "MODIFY_TP", "executed": False,
-                    "reason": "No tracked TP order ID."}
+        # Restore path: no tracked oid, or the tracked order is gone.
+        if tp_oid is None or not self._oid_on_chain(tp_oid):
+            if tp_oid is not None:
+                logger.warning(
+                    "TP order #%d no longer on chain — placing a fresh TP", tp_oid
+                )
+            result, oid = self._place_protective_trigger(
+                new_tp, tpsl="tp", size=self.tracker.size,
+            )
+            if result.get("executed") and oid is not None:
+                self.tracker.record_tp(oid, new_tp)
+                logger.info("MODIFY_TP: restored new TP order #%d @ $%.1f",
+                            oid, new_tp)
+                result["new_tp"] = new_tp
+                result["tp_oid"] = oid
+                result["restored"] = True
+            return result
 
         logger.info("MODIFY_TP: moving TP #%d to $%.1f", tp_oid, new_tp)
-        self.tracker.tp_price = new_tp  # track the new TP price for LLM visibility
-        return self.modify_take_profit(
+        result = self.modify_take_profit(
             oid=tp_oid, new_price=new_tp,
             is_buy=(self.tracker.side == "short"),
             size=self.tracker.size,
         )
+        if result.get("executed"):
+            self.tracker.record_tp(tp_oid, new_tp)
+        return result
+
+    # ─── Stale Order Cleanup ───────────────────────────────────────────
+
+    def _cancel_stale_orders(self) -> dict:
+        """Cancel open orders for our coin that the tracker doesn't own.
+
+        Tracked entry/SL/TP oids are preserved; anything else (leftovers
+        from a failed open, manual orders, orphaned flips) is cancelled.
+        With no position and no resting order, everything is cancelled.
+        """
+        if self.dry_run:
+            logger.info("DRY RUN: Would cancel stale %s orders", self.coin)
+            return {"action": "CANCEL_STALE", "executed": True, "dry_run": True}
+
+        from kimi_quant.data import retry_api_call
+
+        try:
+            orders = retry_api_call(
+                lambda: self.info.open_orders(self.address),
+                description="open_orders (stale cleanup)",
+            )
+        except Exception as e:
+            return {"action": "CANCEL_STALE", "executed": False, "error": str(e)}
+
+        protected = {
+            oid for oid in (
+                self.tracker.entry_oid, self.tracker.sl_oid, self.tracker.tp_oid,
+            ) if oid is not None
+        }
+
+        stale = [
+            o for o in orders
+            if o.get("coin") == self.coin and int(o.get("oid", -1)) not in protected
+        ]
+        if not stale:
+            logger.info("CANCEL_STALE: no stale orders found")
+            return {"action": "CANCEL_STALE", "executed": True, "cancelled": 0}
+
+        cancelled = 0
+        errors: list[str] = []
+        for o in stale:
+            oid = int(o["oid"])
+            try:
+                self.exchange.cancel(self.coin, oid)
+                cancelled += 1
+                logger.info("CANCEL_STALE: cancelled order #%d ($%.1f)",
+                            oid, float(o.get("limitPx", 0)))
+            except Exception as e:
+                errors.append(f"#{oid}: {e}")
+                logger.warning("CANCEL_STALE: failed to cancel #%d: %s", oid, e)
+
+        return {
+            "action": "CANCEL_STALE",
+            "executed": cancelled > 0 or not errors,
+            "cancelled": cancelled,
+            "errors": errors,
+        }
 
     # ─── Margin Management ───────────────────────────────────────────────
 

@@ -396,12 +396,13 @@ def _validate_and_execute(
     if not executor.tracker.has_position() and not executor.tracker.has_resting_order():
         # Check if trade_logger has a pending trade that was just closed by SL/TP
         if trade_logger.has_pending and current_side == "none":
-            ws_reason = executor.tracker.consume_ws_close_reason()
+            ws_reason, ws_price = executor.tracker.consume_ws_close()
             _record_close_from_chain(
                 trade_logger, report,
                 entry_price=tracker_entry_before_sync,
                 side=tracker_side_before_sync,
                 ws_reason=ws_reason,
+                ws_price=ws_price,
             )
             # Record the P&L result for circuit breaker tracking
             stats = trade_logger.get_stats()
@@ -420,10 +421,13 @@ def _validate_and_execute(
     if account and executor.tracker.has_position():
         executor.tracker.update_pnl_extremes(account.unrealized_pnl)
 
-    # Set initial balance for drawdown tracking on first cycle
-    if risk.initial_balance is None and account_balance and account_balance > 0:
-        risk.initial_balance = account_balance
-        logger.info("Initial balance set: $%.2f", account_balance)
+    # Set initial balance for drawdown tracking on first cycle.
+    # Uses TOTAL equity — available balance shrinks whenever margin is
+    # tied up in a position, which would distort drawdown percentages.
+    total_equity = account.balance if account else None
+    if risk.initial_balance is None and total_equity and total_equity > 0:
+        risk.initial_balance = total_equity
+        logger.info("Initial balance set: $%.2f", total_equity)
 
     # Tick circuit breaker cooldown
     risk.tick_cooldown()
@@ -539,7 +543,7 @@ def _validate_and_execute(
         notify.send(
             f"📈 {action_label} {size} BTC @ ${entry_price:.0f}\n"
             f"Notional: ${notional:.0f} | Margin: ${margin:.2f} | Leverage: {config.max_leverage}x\n"
-            f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
+            f"SL: ${signal_result.stop_loss or 0:.0f} | TP: ${signal_result.take_profit or 0:.0f}\n"
             f"Confidence: {signal_result.confidence:.2f} | Balance: ${total_balance:.2f}"
         )
 
@@ -601,7 +605,7 @@ def _validate_and_execute(
                 f"📈 {action_label} {flip_size} BTC @ ${flip_entry_price:.0f}\n"
                 f"Notional: ${notional:.0f} | Margin: ${margin:.2f} | "
                 f"Leverage: {config.max_leverage}x\n"
-                f"SL: ${signal_result.stop_loss:.0f} | TP: ${signal_result.take_profit:.0f}\n"
+                f"SL: ${signal_result.stop_loss or 0:.0f} | TP: ${signal_result.take_profit or 0:.0f}\n"
                 f"Confidence: {signal_result.confidence:.2f} | Balance: ${total_balance:.2f}"
             )
 
@@ -659,20 +663,24 @@ def _record_close_from_chain(
     entry_price: float = 0.0,
     side: str = "none",
     ws_reason: str | None = None,
+    ws_price: float = 0.0,
 ) -> None:
     """Record a trade close detected from on-chain state (SL/TP filled).
 
     Args:
         trade_logger: The trade logger instance.
-        report: Market data report (for mid price as exit price).
+        report: Market data report (fallback exit price = cycle-start mid).
         entry_price: The entry price BEFORE the tracker was cleared.
         side: The position side BEFORE the tracker was cleared.
         ws_reason: "stop_loss" or "take_profit" from WebSocket event,
             if the WS cleared the tracker before this call. Takes
             priority over price-based inference.
+        ws_price: Actual trigger fill price from the WebSocket event.
+            Takes priority over the (stale) cycle-start mid — with adaptive
+            intervals the cycle may run long after the SL actually fired.
     """
     market = report.get("market")
-    exit_price = market.mid_price if market else 0.0
+    exit_price = ws_price if ws_price > 0 else (market.mid_price if market else 0.0)
 
     # Priority: 1) WS event reason (most accurate) → 2) price inference
     if ws_reason:
@@ -792,7 +800,8 @@ def run_loop():
             "Loaded trade history: %d trades | Win Rate: %.1f%% | Net P&L: $%.2f",
             stats.total_trades, stats.win_rate, stats.net_pnl,
         )
-        recent = trade_logger.get_all_trades()[-10:]
+        all_trades = trade_logger.get_all_trades()
+        recent = all_trades[-10:]
         consecutive = 0
         for t in reversed(recent):
             if not t.is_win:
@@ -801,6 +810,20 @@ def run_loop():
                 break
         risk.consecutive_losses = consecutive
         risk.total_realized_pnl = stats.net_pnl
+        # total_realized_pnl is all-time; subtract P&L already realized today
+        # so the daily drawdown check only counts TODAY's losses.
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).isoformat()
+        today_pnl = sum(
+            t.net_pnl for t in all_trades
+            if t.closed_at and t.closed_at >= today_start
+        )
+        risk.seed_daily(today_pnl)
+        logger.info(
+            "Daily baseline seeded: today's P&L so far $%.2f (all-time $%.2f)",
+            today_pnl, stats.net_pnl,
+        )
         if consecutive > 0:
             logger.info("Seeded circuit breaker: %d consecutive losses from history",
                         consecutive)
@@ -1233,22 +1256,7 @@ def cmd_status():
     if mid_price > 0:
         print(f"  {coin} Mid Price:  ${mid_price:,.2f}")
 
-    # Try to get 24h change from metadata
-    try:
-        from kimi_quant.data import retry_api_call as _retry
-        meta = _retry(
-            lambda: info.meta_and_asset_ctxs(),
-            description="meta",
-        )
-        for m in meta[0] if isinstance(meta, tuple) else meta:
-            if isinstance(m, dict) and m.get("name") == coin:
-                day_change = float(m.get("dayNtlVlm", 0))
-                break
-        # Actually, let's get proper 24h change from the market data
-    except Exception:
-        pass
-
-    # Show funding rate if available
+    # 24h change / funding / OI from the full market snapshot
     try:
         from kimi_quant.data import DataProvider
         dp = DataProvider()

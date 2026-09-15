@@ -518,14 +518,16 @@ Main Loop (every 600s)                Monitor (real-time)
 | Order rejected | Clear tracker | `🚫 Order rejected #12349` |
 | Position liquidated | Clear tracker | `💀 Position liquidated @ $70000` |
 
+> **Data sources**: fill events come from the `userFills` subscription (real fill prices — trigger orders like SL/TP execute as market, so the actual price differs from the trigger level); `orderUpdates` supplies cancel/reject/partial transitions. Batched payloads are processed in full — a TPSL batch carrying "SL filled + TP auto-cancelled" never loses the second event.
+
 ### Thread Safety
 
-`PositionTracker` has built-in `threading.Lock`, mutually exclusive concurrent access between main loop and Monitor background thread:
+`PositionTracker` has built-in `threading.RLock`, mutually exclusive concurrent access between main loop and Monitor background thread:
 
 - **Main thread**: `sync_with_chain()`, `execute()`, `to_summary()` etc. read/write
 - **Monitor thread**: WebSocket callbacks call `apply_ws_event()` write
 
-All public mutation methods (`clear()`, `update_from_open()`, `confirm_active()`, `tick_resting()`, `apply_ws_event()`) hold the lock.
+All public mutation methods (`clear()`, `update_from_open()`, `confirm_active()`, `tick_resting()`, `sync_active()`, `recover_position()`, `record_sl()`, `record_tp()`, `clear_oid()`, `apply_ws_event()`) hold the lock. Chain re-sync also corrects a drifted position **side** (e.g. after an external manual trade), so SL/TP order direction is always derived from the actual chain state.
 
 ### Flash Model Fallback Protection
 
@@ -587,6 +589,12 @@ FlashReporter sent: ✅ Order filled #12345...
 git clone <repo-url> && cd kimi_quant
 uv sync
 cp .env.example .env
+```
+
+Optionally verify the codebase with the unit test suite (offline, no API keys needed):
+
+```bash
+uv run pytest          # add --group dev if pytest is missing: uv sync --group dev
 ```
 
 ### Minimal Configuration
@@ -892,7 +900,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `LLM_MAX_TOKENS` | `2048` | Max output tokens (doesn't affect 1M context input) |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate mode Judge temperature |
 | `JUDGE_PRIMARY_LLM` | (same as `PRIMARY_LLM`) | Judge-specific primary model: `kimi` or `deepseek`. Leave blank to match debaters. Recommend `kimi` (strong reasoning for rulings) |
-| `JUDGE_MODEL` | (provider default) | Judge-specific model version (e.g. `deepseek-v4-pro`, `kimi-k3`). Leave blank to use provider default. Only meaningful when `JUDGE_PRIMARY_LLM` is also set |
+| `JUDGE_MODEL` | (provider default) | Judge-specific model version (e.g. `deepseek-v4-pro`, `kimi-k3`). Leave blank to use provider default. Applied **only** to the Judge's provider — `JUDGE_PRIMARY_LLM` if set, otherwise `PRIMARY_LLM` (the model name must match that provider; the other provider keeps its own default) |
 | `JUDGE_REASONING_EFFORT` | (same as `REASONING_EFFORT`) | Judge-specific reasoning effort: `max`/`high`/`medium`/`low`/`minimal`/`off`. Leave blank to use global setting. Allows Judge to have independent reasoning intensity |
 | `DEBATE_REBUTTAL_ENABLED` | `false` | Enable rebuttal round: debaters rebut each other before Judge ruling (+3 LLM calls/cycle) |
 | `CACHE_WARMUP_DELAY` | `2.0` | Debate mode cache write delay in seconds. Increase to ensure Bull/Bear cache hits, set to 0 to disable. Only affects timing, not decision quality |
@@ -1086,8 +1094,11 @@ Exchange buy USDC → Withdraw to Arbitrum chain (your 0x... address)
 | `SHORT` | Bearish signal | Open short + SL + TP (bulk_orders atomic) |
 | `CLOSE` | Close signal | Market close position |
 | `HOLD` | Wait/uncertain | No operation |
-| `MODIFY_SL` | Move stop loss | Move SL to new price (breakeven/trailing) |
-| `MODIFY_TP` | Move take profit | Move TP to new price (adjust target) |
+| `MODIFY_SL` | Move stop loss | Move SL to new price (breakeven/trailing). **Restore capable**: if the tracked SL order is gone from the chain (cancelled / never placed), a fresh reduce-only trigger order is placed automatically |
+| `MODIFY_TP` | Move take profit | Move TP to new price (adjust target). Same restore capability as MODIFY_SL |
+| `CANCEL_STALE` | Clean up leftovers | Cancel open orders the tracker doesn't own (failed-open leftovers, manual orders). Tracked entry/SL/TP are preserved |
+
+> **Naked opposite entries are rejected**: while holding a long, a bare `SHORT` (without `CLOSE` first) is rejected by risk control — it would orphan the existing position's SL/TP orders and trade record. Always flip via `["CLOSE", "SHORT"]`.
 
 ### Multi-Operation Combos (`actions` array)
 
@@ -1097,6 +1108,8 @@ A single cycle can execute an ordered sequence of operations. The executor runs 
 |----------|-----------|-------------|
 | Flip position | `["CLOSE", "SHORT"]` | Close long first, then open short |
 | Adjust SL/TP | `["MODIFY_SL", "MODIFY_TP"]` | Move SL and TP simultaneously |
+| Protect then enter | `["MODIFY_SL", "LONG"]` | Restore a missing SL first, then open |
+| Clean up then decide | `["CANCEL_STALE", "LONG"]` | Remove stale orders first, then open |
 | Single operation | `["LONG"]` | Equivalent to legacy `action="LONG"` |
 
 **Field Notes**:
@@ -1138,11 +1151,12 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 # Risk Constraints (this cycle)
 
 ⚠️  CIRCUIT BREAKER ACTIVE — 4 consecutive losses, 3 cycles remaining
-  → NEW POSITIONS BLOCKED. ALLOWED: CLOSE, MODIFY_SL, MODIFY_TP, HOLD.
+  → NEW POSITIONS BLOCKED. ALLOWED: CLOSE, MODIFY_SL, MODIFY_TP, CANCEL_STALE, HOLD.
 
 ## Hard Limits
 - Min confidence: 0.7 | Max position: 0.001 BTC | Leverage: 3x
 - SL min distance: 0.5% | SL REQUIRED for directional trades
+- SL must sit on the LOSING side of entry (LONG: SL < entry < TP; SHORT reversed)
 - R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.
 - Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). Factor into P&L.
 
@@ -1155,7 +1169,8 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 - If risk > $100.00 → HARD REJECT
 
 ## Direction Constraints
-- You HOLD a LONG position → LONG rejected, CLOSE/SHORT OK
+- You HOLD a LONG position
+  → LONG rejected; naked SHORT rejected; flip via ["CLOSE", "SHORT"]
 ```
 
 **Effect**:
@@ -1173,16 +1188,16 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 
 | Layer | Check | Rule |
 |-------|-------|------|
-| 1 | **Circuit Breaker** | 4 consecutive losses → pause 6 cycles; daily drawdown > 5% freeze; no cooldown extension during cooldown |
+| 1 | **Circuit Breaker** | 4 consecutive losses → pause 6 cycles; daily drawdown > 5% of equity freeze (UTC day, restart-aware: same-day P&L is re-seeded from trade history so pre-restart losses still count); no cooldown extension during cooldown |
 | 2 | **Confidence** | >= `MIN_CONFIDENCE` (default 0.7) to execute directional trades |
 | 3 | **Position Cap** | Not exceeding `MAX_POSITION_SIZE` |
 | 4 | **Margin Requirement** | `size × price / leverage` ≤ 95% available balance; reject and suggest appropriate size if exceeded |
 | 5 | **Risk Amount** | Single trade SL loss > 1% account warning, > 2% reject (`\|entry - SL\| × size`) |
-| 6 | **Stop Loss Distance** | ≥ 0.5% from entry (BTC noise ~0.3%, reject below this threshold) |
+| 6 | **Stop Loss Distance + Side** | ≥ 0.5% from entry (BTC noise ~0.3%, reject below this threshold). Side validated: LONG needs SL < entry < TP, SHORT the mirror — a wrong-side SL (would trigger instantly) or wrong-side TP is rejected, abs()-distance alone can't catch these |
 | 7 | **Risk/Reward Ratio** | ≥ 1.5:1 (`|TP - entry| / |SL - entry|`) when TP is set. Trades with poor R:R (e.g., risking 2% to make 0.5%) are rejected. TP is optional — trades without TP skip this check |
-| 8 | **Direction** | Same-direction position rejected; CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation |
-| — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; if missing, prompt warning + push notification |
-| — | **SL/TP Real-Time Detection** | WebSocket detects SL/TP fills at millisecond latency → instant push notification (🛑/🎯). Tracker preserves close reason across WS-triggered clear() so the next main-loop cycle records accurate close_reason ("stop_loss"/"take_profit") instead of "manual" |
+| 8 | **Direction** | Same-direction position rejected; **naked opposite entry rejected** (bare SHORT while long would orphan the existing position's SL/TP and trade record — flip via `["CLOSE", "SHORT"]`); CLOSE/MODIFY_SL/MODIFY_TP require existing position; flips (CLOSE+LONG/SHORT) pass through `validate_sequence()` state simulation. MODIFY_SL to the wrong side of current price (instant trigger) is also rejected |
+| — | **SL/TP On-Chain Verification** | Each cycle before LLM call: cross-reference tracker oid with on-chain `open_orders`; missing oid **or no tracked SL at all** (live mode) → prompt warning + push notification. `MODIFY_SL`/`MODIFY_TP` then **re-place** the order automatically (restore path) instead of failing on a dead oid |
+| — | **SL/TP Real-Time Detection** | WebSocket detects SL/TP fills at millisecond latency → instant push notification (🛑/🎯). Tracker preserves close reason **and actual trigger fill price** across WS-triggered clear() so the next main-loop cycle records accurate close_reason and P&L instead of guessing from a stale mid price |
 | — | **Multi-Operation Fail-Fast** | Any non-HOLD operation in sequence fails → immediately stop subsequent operations, prevent half-completed states |
 
 ### Risk Rejection Feedback Correction

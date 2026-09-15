@@ -64,6 +64,7 @@ def _build_model_registry(
     tokens: int,
     include_thinking: bool = True,
     model: str | None = None,
+    model_provider: str | None = None,
     reasoning_effort: str | None = None,
 ) -> dict[str, ChatOpenAI]:
     """Build available LLM instances keyed by provider name.
@@ -77,8 +78,12 @@ def _build_model_registry(
         include_thinking: If False, disable reasoning/thinking params.
             Must be False when using structured output (json_mode) because
             reasoning_effort / thinking conflict with response_format.
-        model: Optional model name override for all providers.
-            When set, replaces the default model from config.
+        model: Optional model name override. Only applied to `model_provider`;
+            the other provider keeps its configured default — model names are
+            provider-specific, so a global override would send e.g. a Kimi
+            model name to the DeepSeek endpoint (HTTP 400 on every call).
+        model_provider: Which provider `model` applies to ("kimi"/"deepseek").
+            Required for the override to take effect; None = no override.
         reasoning_effort: Optional reasoning effort override for all providers.
             When set, replaces per-provider and global settings (highest priority).
             Resolution order: this param > *_REASONING_EFFORT > REASONING_EFFORT.
@@ -95,7 +100,9 @@ def _build_model_registry(
 
     # Kimi / Moonshot
     if config.moonshot_api_key:
-        kimi_model = model or config.kimi_model
+        kimi_model = (
+            model if (model and model_provider == "kimi") else config.kimi_model
+        )
         # Kimi K3 only supports temperature=1 (reasoning model).
         # Using any other value returns HTTP 400.
         kimi_temp = 1.0
@@ -118,7 +125,9 @@ def _build_model_registry(
 
     # DeepSeek
     if config.deepseek_api_key:
-        ds_model = model or config.deepseek_model
+        ds_model = (
+            model if (model and model_provider == "deepseek") else config.deepseek_model
+        )
         ds_kwargs: dict[str, Any] = dict(
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
@@ -182,6 +191,7 @@ def create_llm(
     max_tokens: int | None = None,
     primary: str | None = None,
     model: str | None = None,
+    model_provider: str | None = None,
     reasoning_effort: str | None = None,
 ) -> ChatOpenAI:
     """Create a ChatOpenAI with automatic fallback chain.
@@ -194,8 +204,9 @@ def create_llm(
         max_tokens: Override default max_tokens.
         primary: Override PRIMARY_LLM for this instance (None = use default).
             e.g., "kimi" or "deepseek". Empty string also falls back to default.
-        model: Optional model name override for all providers.
-            When set, replaces the provider's default model from config.
+        model: Optional model name override, scoped to `model_provider`.
+        model_provider: Provider the `model` override applies to. The other
+            provider keeps its configured default model.
         reasoning_effort: Optional reasoning effort override.
             When set, replaces the global REASONING_EFFORT from config.
 
@@ -207,6 +218,7 @@ def create_llm(
     registry = _build_model_registry(
         temp, tokens,
         model=model,
+        model_provider=model_provider,
         reasoning_effort=reasoning_effort,
     )
     primary_name = primary or config.primary_llm
@@ -219,6 +231,7 @@ def create_structured_llm(
     max_tokens: int | None = None,
     primary: str | None = None,
     model: str | None = None,
+    model_provider: str | None = None,
     reasoning_effort: str | None = None,
 ):
     """Create a structured-output LLM with automatic fallback chain.
@@ -233,8 +246,9 @@ def create_structured_llm(
         max_tokens: Override default max_tokens.
         primary: Override PRIMARY_LLM for this instance (None = use default).
             e.g., "kimi" or "deepseek". Empty string also falls back to default.
-        model: Optional model name override for all providers.
-            When set, replaces the provider's default model from config.
+        model: Optional model name override, scoped to `model_provider`.
+        model_provider: Provider the `model` override applies to. The other
+            provider keeps its configured default model.
         reasoning_effort: Optional reasoning effort override.
             When set, replaces the global REASONING_EFFORT from config.
     """
@@ -244,6 +258,7 @@ def create_structured_llm(
     registry = _build_model_registry(
         temp, tokens, include_thinking=False,
         model=model,
+        model_provider=model_provider,
         reasoning_effort=reasoning_effort,
     )
 
@@ -261,12 +276,15 @@ class TradingSignal(BaseModel):
     """Structured trading signal from the LLM analysis.
 
     Supported actions:
-      LONG  — open a long position (with SL + TP)
+      LONG — open a long position (with SL + TP)
       SHORT — open a short position (with SL + TP)
       CLOSE — close the current position
-      HOLD  — no action
-      MODIFY_SL — move existing stop loss to a new price (trailing/breakeven)
-      MODIFY_TP — move existing take profit to a new price
+      HOLD — no action
+      MODIFY_SL — move existing stop loss to a new price (trailing/breakeven),
+                  or RESTORE it by placing a new SL order if it is missing
+      MODIFY_TP — move existing take profit to a new price (or restore it)
+      CANCEL_STALE — cancel open orders the strategy doesn't track
+                     (leftovers from failed opens, manual orders)
 
     Multi-action support: use `actions` (ordered list) to execute a sequence
     in one cycle. Examples:
@@ -278,7 +296,8 @@ class TradingSignal(BaseModel):
 
     action: str = Field(
         default="HOLD",
-        description="Trading action: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, or MODIFY_TP. "
+        description="Trading action: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, MODIFY_TP, "
+                    "or CANCEL_STALE (clean up untracked orders). "
                     "Use `actions` for multi-action sequences instead.",
     )
     actions: list[str] | None = Field(
@@ -433,8 +452,9 @@ Step 0 — ASSESS EXISTING STATE FIRST (before any market analysis):
   b. Check open orders: are the tracked SL/TP orders actually on the chain?
      If SL/TP are MISSING from chain → position is UNPROTECTED → use MODIFY_SL
      or MODIFY_TP immediately, or CLOSE. This is the highest priority action.
+     (MODIFY_SL re-places the order automatically when it is gone.)
   c. Are there stale/manual orders on chain not matching your strategy?
-     Decide whether to clean them up (CLOSE or cancel).
+     Clean them up with CANCEL_STALE (cancels untracked orders only).
   d. Are SL/TP levels still appropriate for current volatility (ATR)?
      Tighten if volatility dropped, widen if it spiked.
 
@@ -477,8 +497,11 @@ Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing
 
 Output JSON only (no markdown):
 - actions: ordered list of actions to execute sequentially. Use this for:
-  - Single action: ["LONG"], ["SHORT"], ["CLOSE"], ["HOLD"], ["MODIFY_SL"], ["MODIFY_TP"]
+  - Single action: ["LONG"], ["SHORT"], ["CLOSE"], ["HOLD"], ["MODIFY_SL"],
+    ["MODIFY_TP"], ["CANCEL_STALE"]
   - Flip position: ["CLOSE", "SHORT"] or ["CLOSE", "LONG"]
+    (NEVER emit a naked opposite entry while holding a position — it is
+    rejected by risk control; always CLOSE first)
   - Adjust both stops: ["MODIFY_SL", "MODIFY_TP"]
   The executor runs actions in order and stops on first failure.
   For backward compatibility, you may also output a single `action` string
@@ -578,11 +601,13 @@ Please adjust your signal. Here are your options (pick the ONE that applies):
 
   A. SIZE TOO LARGE → reduce size to fit within the margin or risk budget.
   B. SL TOO TIGHT → widen stop loss to ≥ 0.5% from entry, or ≥ 1.5× ATR.
+     Also check SL SIDE: LONG needs SL below entry, SHORT above entry.
   C. MARGIN EXCEEDED → reduce size so that notional / leverage ≤ 95% available.
   D. HARD BLOCK (circuit breaker, daily drawdown cap, or uncorrectable) →
      output HOLD with confidence=0.0. Do NOT try to work around the block.
-  E. DIRECTION ERROR (LONG while long, CLOSE with no position) →
-     use the correct action for the current position state.
+  E. DIRECTION ERROR (LONG while long, naked SHORT while long, CLOSE with
+     no position) → use the correct action for the current position state;
+     flip with ["CLOSE", "SHORT"] / ["CLOSE", "LONG"].
 
 Keep everything else the same — only fix what was rejected."""
 

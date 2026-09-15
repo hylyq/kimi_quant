@@ -160,7 +160,8 @@ REBUTTAL_HOLD_PROMPT = (
 
 JUDGE_SYSTEM_PROMPT = """\
 You are the Head Trader. Your team (Bull/Long, Bear/Short, Risk/Hold) debated. \
-Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, or MODIFY_TP. \
+Weigh their arguments and decide: LONG, SHORT, CLOSE, HOLD, MODIFY_SL, MODIFY_TP, \
+or CANCEL_STALE (clean up untracked orders). \
 For multi-step actions, use the `actions` array: ["CLOSE", "SHORT"] to flip, \
 ["MODIFY_SL", "MODIFY_TP"] to adjust both stops.
 
@@ -172,7 +173,8 @@ Step 0 — ASSESS EXISTING STATE FIRST (before weighing the debate):
   b. Check open orders: are SL/TP orders actually on the chain? If MISSING →
      position is UNPROTECTED → MODIFY_SL/MODIFY_TP immediately, or CLOSE.
      This takes priority over everything else.
-  c. Are there stale orders on chain? Clean them up if needed.
+     (MODIFY_SL re-places the order automatically when it is gone.)
+  c. Are there stale orders on chain? Clean them up with CANCEL_STALE.
   d. Are SL/TP levels appropriate for current ATR? Adjust if not.
 
 You now have access to the RAW MARKET DATA section below the account context.
@@ -222,7 +224,10 @@ Step 1.5 — FORCED CHECK (answer each point in your reasoning BEFORE finalizing
 
 Output TradingSignal JSON:
 - actions: ordered list of actions (preferred). Use for flip ["CLOSE", "SHORT"],
-  adjust both ["MODIFY_SL", "MODIFY_TP"], or single ["LONG"].
+  adjust both ["MODIFY_SL", "MODIFY_TP"], cleanup ["CANCEL_STALE"], or
+  single ["LONG"]. NEVER emit a naked opposite entry while holding a position
+  (e.g. bare SHORT while long) — it is rejected by risk control; flip with
+  ["CLOSE", "SHORT"] instead.
   For backward compatibility, may also output a single `action` string.
 - confidence, reasoning, size (BTC), entry_price (informational — all entries
   are market/Ioc; set to null or your estimated fill price for risk calc),
@@ -266,9 +271,14 @@ def _is_placeholder(text: str) -> bool:
     return False
 
 
-async def _make_skip_msg(msg: str) -> str:
-    """Return a placeholder string — used when skipping a rebuttal agent."""
-    return f"[{msg} to produce arguments]"
+def _skip_msg(agent: str) -> str:
+    """Placeholder string used when skipping a rebuttal agent."""
+    return f"[{agent} skipped — both opponents failed to produce arguments]"
+
+
+async def _const(text: str) -> str:
+    """Trivial coroutine used in gather() alongside real agent calls."""
+    return text
 
 
 # ─── Single-Turn Agent ──────────────────────────────────────────────────────
@@ -386,33 +396,36 @@ class JudgeAgent:
         # Judge can use a different primary model from the debaters.
         # Set JUDGE_PRIMARY_LLM in .env to override (e.g., "deepseek").
         # Set JUDGE_MODEL to override the specific model version
-        #   (e.g., "deepseek-v4-pro").
+        #   (e.g., "deepseek-v4-pro") — it only applies to the Judge's
+        #   provider (JUDGE_PRIMARY_LLM if set, otherwise PRIMARY_LLM).
         # Set JUDGE_REASONING_EFFORT to override reasoning effort
         #   independently (e.g., "max").
         # Fallback chain always includes all available models (kimi + deepseek).
         judge_primary = config.judge_primary_llm or None  # "" → None → use default
         judge_model = config.judge_model or None           # "" → None → use default
         judge_effort = config.judge_reasoning_effort or None
+        judge_provider = judge_primary or config.primary_llm
         self.structured_llm = create_structured_llm(
             TradingSignal,
             temperature=config.judge_temperature,
             max_tokens=4096,  # Judge needs more room for synthesizing 3 arguments
             primary=judge_primary,
             model=judge_model,
+            model_provider=judge_provider,
             reasoning_effort=judge_effort,
         )
-        if judge_primary:
-            model_desc = judge_model or (
-                config.kimi_model if judge_primary == "kimi" else config.deepseek_model
-            )
-            logger.info(
-                "Judge: primary=%s model=%s temp=%.2f effort=%s",
-                judge_primary, model_desc, config.judge_temperature,
-                judge_effort or config.reasoning_effort,
-            )
+        model_desc = judge_model or (
+            config.kimi_model if judge_provider == "kimi"
+            else config.deepseek_model
+        )
+        logger.info(
+            "Judge: primary=%s model=%s temp=%.2f effort=%s",
+            judge_provider, model_desc, config.judge_temperature,
+            judge_effort or config.reasoning_effort,
+        )
 
     async def ajudge(
-        self, account_summary: str, bull: str, bear: str, hold: str,
+        self, bull: str, bear: str, hold: str,
         market_prompt: str = "",
         bull_rebuttal: str = "",
         bear_rebuttal: str = "",
@@ -421,10 +434,11 @@ class JudgeAgent:
     ) -> TradingSignal | None:
         """Asynchronously judge the debate and produce a TradingSignal.
 
-        The account summary, trading constraints, and raw market data are
-        included so the Judge sees the same data the debaters saw — prices,
-        levels, order book, multi-timeframe trends, risk context — and can
-        cross-reference their claims against the source data.
+        `market_prompt` must already include the account/risk context prefix
+        (see DebateStrategy._build_debate_prompt) — it is shared verbatim
+        with the debaters so the Judge can cross-reference their claims
+        against the same position state, constraints, prices, levels,
+        order book, and multi-timeframe data.
 
         Args:
             extra_context: Optional text appended after the debate transcript
@@ -439,10 +453,7 @@ class JudgeAgent:
                 f"When in doubt, use smaller size. Never exceed {size_limit} BTC."
             )
             debate_transcript = (
-                "# === ACCOUNT CONTEXT ===\n"
-                f"{account_summary}\n"
-                f"Trading constraints: {constraints}\n\n"
-                "# === RAW MARKET DATA ===\n"
+                "# === RAW MARKET DATA (includes account status & risk constraints) ===\n"
                 f"{market_prompt}\n\n"
                 "# === DEBATE TRANSCRIPT ===\n\n"
                 "## 🐂 BULL ANALYST (LONG Case)\n"
@@ -751,7 +762,7 @@ class DebateStrategy:
             )
         else:
             skipped.append("BullRebut (both opponents failed)")
-            bull_coro = _make_skip_msg("BullRebut skipped — both Bear and Hold failed")
+            bull_coro = _const(_skip_msg("BullRebut"))
 
         # Bear rebuts Bull + Hold.
         if bull_ok or hold_ok:
@@ -765,7 +776,7 @@ class DebateStrategy:
             )
         else:
             skipped.append("BearRebut (both opponents failed)")
-            bear_coro = _make_skip_msg("BearRebut skipped — both Bull and Hold failed")
+            bear_coro = _const(_skip_msg("BearRebut"))
 
         bull_rebuttal, bear_rebuttal = await asyncio.gather(bull_coro, bear_coro)
 
@@ -786,7 +797,6 @@ class DebateStrategy:
     async def _adjudicate_node(self, state: DebateState) -> DebateState:
         """Judge synthesizes all arguments into a TradingSignal."""
         signal = await self.judge.ajudge(
-            state["account_summary"],
             state["bull_argument"],
             state["bear_argument"],
             state["hold_argument"],
@@ -810,6 +820,19 @@ class DebateStrategy:
         """Build the market prompt from data (with multi-timeframe analysis)."""
         from kimi_quant.data import DataProvider
         return DataProvider.build_llm_prompt(market_data)
+
+    def _build_debate_prompt(self, market_data: dict[str, Any]) -> str:
+        """Build the market prompt with the account-status prefix attached.
+
+        The enriched account summary (position, tracked orders, SL/TP status)
+        is prepended so the debaters AND the Judge all see current position
+        state. Risk constraints are NOT prepended — build_llm_prompt() already
+        embeds them at the end of the prompt; duplicating them would double
+        the tokens and risk inconsistency between the two copies.
+        """
+        prompt = self.build_market_prompt(market_data)
+        account_summary = self._build_account_summary(market_data)
+        return f"# 👤 Current Position & Account\n{account_summary}\n\n{prompt}"
 
     @staticmethod
     def _build_account_summary(market_data: dict[str, Any]) -> str:
@@ -861,21 +884,8 @@ class DebateStrategy:
         Returns:
             (signal, debate_transcript). Signal is None on failure.
         """
-        prompt = self.build_market_prompt(market_data)
+        prompt = self._build_debate_prompt(market_data)
         account_summary = self._build_account_summary(market_data)
-
-        # Prepend account + risk context to the shared market prompt so
-        # debaters see current position state and constraints — not just the
-        # Judge. This enables position-aware arguments (e.g. "add to existing
-        # long" rather than generic "go long").
-        account_ctx = (
-            "# 👤 Current Position & Account\n"
-            f"{account_summary}\n"
-        )
-        risk_ctx = market_data.get("risk_context", "")
-        if risk_ctx:
-            account_ctx += "\n" + risk_ctx
-        prompt = account_ctx + "\n" + prompt
 
         cycle_id = datetime.now(timezone.utc).isoformat()
 
@@ -980,8 +990,9 @@ class DebateStrategy:
         hasn't changed — only the final decision needs adjustment.
         """
         try:
-            prompt = self.build_market_prompt(market_data)
-            account_summary = self._build_account_summary(market_data)
+            # Same prompt the Judge saw during the debate (account prefix
+            # included) — only the decision needs adjusting.
+            prompt = self._build_debate_prompt(market_data)
 
             actions = original_signal.get_actions()
             correction_block = f"""
@@ -1002,17 +1013,18 @@ Please adjust your signal. Here are your options (pick the ONE that applies):
 
   A. SIZE TOO LARGE → reduce size to fit within the margin or risk budget.
   B. SL TOO TIGHT → widen stop loss to ≥ 0.5% from entry, or ≥ 1.5× ATR.
+     Also check SL SIDE: LONG needs SL below entry, SHORT above entry.
   C. MARGIN EXCEEDED → reduce size so that notional / leverage ≤ 95% available.
   D. HARD BLOCK (circuit breaker, daily drawdown cap, or uncorrectable) →
      output HOLD with confidence=0.0. Do NOT try to work around the block.
-  E. DIRECTION ERROR (LONG while long, CLOSE with no position) →
-     use the correct action for the current position state.
+  E. DIRECTION ERROR (LONG while long, naked SHORT while long, CLOSE with
+     no position) → use the correct action for the current position state;
+     flip with ["CLOSE", "SHORT"] / ["CLOSE", "LONG"].
 
 Keep everything else the same — only fix what was rejected."""
 
             logger.info("Requesting risk correction from Judge...")
             signal = await self.judge.ajudge(
-                account_summary,
                 transcript.get("bull", ""),
                 transcript.get("bear", ""),
                 transcript.get("hold", ""),

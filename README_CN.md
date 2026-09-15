@@ -519,14 +519,16 @@ Hyperliquid WebSocket
 | 订单被拒 | 清除 tracker | `🚫 订单被拒 #12349` |
 | 仓位清算 | 清除 tracker | `💀 仓位被清算 @ $70000` |
 
+> **数据来源**：成交事件来自 `userFills` 订阅（真实成交价——SL/TP 触发单按市价执行，实际成交价与触发价不同）；`orderUpdates` 提供撤销/拒绝/部分成交状态。批量推送全量处理——TPSL 场景"SL 成交 + TP 自动撤销"打包在同一批推送时，第二个事件不会丢失。
+
 ### 线程安全
 
-`PositionTracker` 内置 `threading.Lock`，主循环和 Monitor 后台线程并发访问互斥：
+`PositionTracker` 内置 `threading.RLock`，主循环和 Monitor 后台线程并发访问互斥：
 
 - **主线程**：`sync_with_chain()`、`execute()`、`to_summary()` 等读写
 - **Monitor 线程**：WebSocket 回调中调用 `apply_ws_event()` 写入
 
-所有公开的 mutation 方法（`clear()`、`update_from_open()`、`confirm_active()`、`tick_resting()`、`apply_ws_event()`）均持有锁。
+所有公开的 mutation 方法（`clear()`、`update_from_open()`、`confirm_active()`、`tick_resting()`、`sync_active()`、`recover_position()`、`record_sl()`、`record_tp()`、`clear_oid()`、`apply_ws_event()`）均持有锁。链上同步还会修正漂移的仓位**方向**（如外部手动交易后），确保 SL/TP 下单方向始终依据链上实际状态推导。
 
 ### Flash 模型降级保护
 
@@ -588,6 +590,12 @@ FlashReporter sent: ✅ 订单成交 #12345...
 git clone <repo-url> && cd kimi_quant
 uv sync
 cp .env.example .env
+```
+
+可选：跑一遍单元测试验证代码库（离线运行，无需 API Key）：
+
+```bash
+uv run pytest          # 若缺 pytest 先执行: uv sync --group dev
 ```
 
 ### 最小配置
@@ -893,7 +901,7 @@ pgrep -f kimi-quant || echo "WARNING: Bot is not running!"
 | `LLM_MAX_TOKENS` | `2048` | 最大输出 token（不影响 1M 上下文输入） |
 | `JUDGE_TEMPERATURE` | `0.05` | Debate 模式 Judge 温度 |
 | `JUDGE_PRIMARY_LLM` | (同 `PRIMARY_LLM`) | Judge 专用主模型：`kimi` 或 `deepseek`。留空则与辩手相同。推荐 `kimi`（强推理裁决） |
-| `JUDGE_MODEL` | (厂家的默认模型) | Judge 专用模型版本（如 `deepseek-v4-pro`、`kimi-k3`）。留空则使用厂家默认。仅在设置了 `JUDGE_PRIMARY_LLM` 时生效 |
+| `JUDGE_MODEL` | (厂家的默认模型) | Judge 专用模型版本（如 `deepseek-v4-pro`、`kimi-k3`）。留空则使用厂家默认。**仅作用于 Judge 的 provider**——设置了 `JUDGE_PRIMARY_LLM` 就是它，否则用 `PRIMARY_LLM`（模型名必须与该厂商匹配；另一家保留自己的默认模型） |
 | `JUDGE_REASONING_EFFORT` | (同 `REASONING_EFFORT`) | Judge 专用推理强度：`max`/`high`/`medium`/`low`/`minimal`/`off`。留空使用全局设置，允许 Judge 有独立的推理强度 |
 | `DEBATE_REBUTTAL_ENABLED` | `false` | 开启反驳轮：辩手互相反驳后再由 Judge 裁决（+3 次 LLM 调用/周期） |
 | `CACHE_WARMUP_DELAY` | `2.0` | Debate 模式缓存落盘等待秒数。增大确保 Bull/Bear 命中缓存，设 0 关闭。仅影响时序，不影响决策质量 |
@@ -1087,8 +1095,11 @@ Hyperliquid 支持三种账户模式：
 | `SHORT` | 看空信号 | 开空仓 + SL + TP（bulk_orders 原子执行） |
 | `CLOSE` | 平仓信号 | 市价平仓 |
 | `HOLD` | 观望/不确定 | 无操作 |
-| `MODIFY_SL` | 移动止损 | 将 SL 移至新价格（保本/追踪止损） |
-| `MODIFY_TP` | 移动止盈 | 将 TP 移至新价格（调整目标） |
+| `MODIFY_SL` | 移动止损 | 将 SL 移至新价格（保本/追踪止损）。**支持恢复**：若跟踪的 SL 单已从链上消失（被撤/从未下过），会自动补下一张新的 reduce-only 触发单 |
+| `MODIFY_TP` | 移动止盈 | 将 TP 移至新价格（调整目标）。同样支持恢复 |
+| `CANCEL_STALE` | 清理残留挂单 | 撤销 tracker 未跟踪的挂单（失败开仓残留、手动单）。跟踪中的 entry/SL/TP 不受影响 |
+
+> **裸反向开仓会被拒绝**：持多仓时直接输出 `SHORT`（不带 `CLOSE`）会被风控拒绝——这会导致现有仓位的 SL/TP 挂单和交易记录失去关联。翻仓必须用 `["CLOSE", "SHORT"]`。
 
 ### 多操作组合（`actions` 数组）
 
@@ -1098,6 +1109,8 @@ Hyperliquid 支持三种账户模式：
 |------|-----------|------|
 | 翻转仓位 | `["CLOSE", "SHORT"]` | 先平多仓，再开空仓 |
 | 调整止盈止损 | `["MODIFY_SL", "MODIFY_TP"]` | 同时移动 SL 和 TP |
+| 先保护再开仓 | `["MODIFY_SL", "LONG"]` | 先恢复丢失的 SL，再开新仓 |
+| 先清理再决策 | `["CANCEL_STALE", "LONG"]` | 先撤销残留挂单，再开仓 |
 | 单操作 | `["LONG"]` | 等价于旧格式 `action="LONG"` |
 
 **字段说明**：
@@ -1139,11 +1152,12 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 # Risk Constraints (this cycle)
 
 ⚠️  CIRCUIT BREAKER ACTIVE — 4 consecutive losses, 3 cycles remaining
-  → NEW POSITIONS BLOCKED. ALLOWED: CLOSE, MODIFY_SL, MODIFY_TP, HOLD.
+  → NEW POSITIONS BLOCKED. ALLOWED: CLOSE, MODIFY_SL, MODIFY_TP, CANCEL_STALE, HOLD.
 
 ## Hard Limits
 - Min confidence: 0.7 | Max position: 0.001 BTC | Leverage: 3x
 - SL min distance: 0.5% | SL REQUIRED for directional trades
+- SL must sit on the LOSING side of entry (LONG: SL < entry < TP; SHORT reversed)
 - R:R minimum: 1.5:1 (|TP-entry| / |SL-entry|). If TP is set, R:R is enforced.
 - Taker fees: ~0.07% round-trip (entry+exit are Ioc market orders). Factor into P&L.
 
@@ -1156,7 +1170,8 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 - If risk > $100.00 → HARD REJECT
 
 ## Direction Constraints
-- You HOLD a LONG position → LONG rejected, CLOSE/SHORT OK
+- You HOLD a LONG position
+  → LONG rejected; naked SHORT rejected; flip via ["CLOSE", "SHORT"]
 ```
 
 **效果**：
@@ -1174,16 +1189,16 @@ Risk: min_confidence=0.65 | max_position=0.0010 BTC | max_leverage=3x
 
 | 层级 | 检查项 | 规则 |
 |------|--------|------|
-| 1 | **熔断机制** | 连续 4 笔亏损 → 暂停 6 个 cycle；日回撤 > 5% 冻结；cooldown 内不延长 |
+| 1 | **熔断机制** | 连续 4 笔亏损 → 暂停 6 个 cycle；日回撤 > 5%（按 UTC 日结算，且重启后会从交易历史重播当日盈亏，重启前的亏损依然计入）；cooldown 内不延长 |
 | 2 | **置信度** | >= `MIN_CONFIDENCE` (默认 0.7) 才执行方向性交易 |
 | 3 | **仓位上限** | 不超过 `MAX_POSITION_SIZE` |
 | 4 | **保证金需求** | `size × price / leverage` ≤ 可用余额的 95%，超出则拒绝并建议合理 size |
 | 5 | **风险金额** | 单笔止损亏损 > 1% 账户警告，> 2% 拒绝（`\|entry - SL\| × size`） |
-| 6 | **止损距离** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝） |
+| 6 | **止损距离 + 方向** | ≥ 0.5% 距入场价（BTC 噪音 ~0.3%，低于此阈值拒绝）。同时校验侧别：做多要求 SL < 入场价 < TP，做空镜像相反——SL 放错侧（下单即触发）或 TP 放错侧都会被拒绝，单纯 abs() 距离检查无法发现这类问题 |
 | 7 | **盈亏比 (R:R)** | ≥ 1.5:1（`|TP - entry| / |SL - entry|`），当设置了止盈时强制执行。盈亏比差的交易（如冒 2% 风险博 0.5% 收益）会被拒绝。止盈为可选字段——未设止盈则跳过此检查 |
-| 8 | **方向** | 已有同向仓位拒绝；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换 |
-| — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`，丢失时 prompt 告警 + 推送通知 |
-| — | **SL/TP 实时检测** | WebSocket 毫秒级感知 SL/TP 触发 → 即时推送（🛑/🎯）。Tracker 在 WS 清除时保留平仓原因，下一轮主循环可准确记录 close_reason（"stop_loss"/"take_profit"）而非 "manual" |
+| 8 | **方向** | 已有同向仓位拒绝；**裸反向开仓拒绝**（持多仓时直接 SHORT 会导致现有仓位的 SL/TP 和交易记录失去关联——翻仓必须用 `["CLOSE", "SHORT"]`）；CLOSE/MODIFY_SL/MODIFY_TP 需已持仓；翻转（CLOSE+LONG/SHORT）通过 `validate_sequence()` 模拟状态转换。MODIFY_SL 移到现价错误一侧（会立即触发）同样拒绝 |
+| — | **SL/TP 链上验证** | 每周期 LLM 调用前交叉对比 tracker oid 与链上 `open_orders`；oid 丢失**或根本没有跟踪的 SL**（live 模式）→ prompt 告警 + 推送通知。随后 `MODIFY_SL`/`MODIFY_TP` 会自动**补下新单**（恢复路径），而不是在已失效的 oid 上失败 |
+| — | **SL/TP 实时检测** | WebSocket 毫秒级感知 SL/TP 触发 → 即时推送（🛑/🎯）。Tracker 在 WS 清除时保留平仓原因**和真实触发成交价**，下一轮主循环记录的 close_reason 和盈亏基于实际成交，而非用可能过期的 mid 价猜测 |
 | — | **多操作失败即停** | 序列中任一非 HOLD 操作失败，立即停止后续操作，防止半完成状态 |
 
 ### 风控拒绝反馈修正（Risk Correction）
