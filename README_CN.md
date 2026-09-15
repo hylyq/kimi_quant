@@ -178,7 +178,7 @@
 | LLM 编排 | LangChain + LangGraph StateGraph |
 | 状态持久化 | LangGraph MemorySaver + JSONL 文件（fcntl 锁） |
 | 交易所 | Hyperliquid (Perpetual DEX) |
-| 实时监控 | Hyperliquid WebSocket + deepseek-v4-flash (轻量汇报) |
+| 实时监控 | Hyperliquid WebSocket + deepseek-flash (轻量汇报) |
 | 结构化输出 | Pydantic + LangChain json_mode (response_format: json_object) |
 | 交易执行 | hyperliquid-python-sdk (15/15 全覆盖) |
 
@@ -475,8 +475,8 @@ Redis 配置（可选，默认 localhost:6379）：
 > ```
 > OrderMonitor started (address=0x...)
 > WebSocket subscribed: orderUpdates(#1) + userFills(#2)
-> FlashReporter started (model=deepseek-v4-flash, llm=enabled)   ← "fallback-only" = 没有 API key，退化为模板通知
-> Flash LLM health check OK (model=deepseek-v4-flash)             ← Flash 模型真实可达
+> FlashReporter started (model=deepseek-flash, llm=enabled)   ← "fallback-only" = 没有 API key，退化为模板通知
+> Flash LLM health check OK (model=deepseek-flash)             ← Flash 模型真实可达
 > ```
 >
 > 如果 Flash 模型运行中调用失败（限流、模型名错误等），通知会退化为固定中文模板并在冷却后自动重试 LLM——**推送不会静默消失**。如果连一条订单推送都收不到，说明 monitor 根本没启动（即还在 dry-run），而不是 Flash 模型挂了。
@@ -497,7 +497,7 @@ Hyperliquid WebSocket
          ▼
    FlashReporter (后台线程)
     ├── 消费事件
-    ├── Flash LLM 生成中文通知 (deepseek-v4-flash)
+    ├── Flash LLM 生成中文通知 (deepseek-flash)
     │    失败时降级为确定性格式化
     └── Notifier → 微信/飞书推送
 ```
@@ -559,7 +559,7 @@ Hyperliquid WebSocket
 ```bash
 # .env
 MONITOR_ENABLED=true                     # 开启实时监控（默认开启）
-MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash 模型（便宜快速）
+MONITOR_FLASH_MODEL=deepseek-flash    # Flash 模型（便宜快速）
 # MONITOR_FLASH_API_KEY=                 # 留空则复用 DEEPSEEK_API_KEY
 # MONITOR_FLASH_BASE_URL=                # 留空则复用 DEEPSEEK_BASE_URL
 ```
@@ -567,7 +567,7 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash 模型（便宜快速）
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `MONITOR_ENABLED` | `true` | 开启/关闭实时监控。**必须 `DRY_RUN=false` 才生效**——dry-run 模式下监控（及 Flash 模型）完全不启动 |
-| `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash 模型名称。约 ¥0.14/1M tokens，<1s 延迟 |
+| `MONITOR_FLASH_MODEL` | `deepseek-flash` | Flash 模型名称。约 ¥0.14/1M tokens，<1s 延迟 |
 | `MONITOR_FLASH_API_KEY` | 同 `DEEPSEEK_API_KEY` | Flash 模型 API Key。不配则复用 DeepSeek key |
 | `MONITOR_FLASH_BASE_URL` | 同 `DEEPSEEK_BASE_URL` | Flash 模型 API 端点 |
 
@@ -578,8 +578,8 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash 模型（便宜快速）
 ```
 OrderMonitor started (address=0xAeFB...)
 WebSocket subscribed: orderUpdates(#1) + userFills(#2)
-Order monitor active (flash_model=deepseek-v4-flash, llm=enabled)
-FlashReporter LLM ready: deepseek-v4-flash
+Order monitor active (flash_model=deepseek-flash, llm=enabled)
+FlashReporter LLM ready: deepseek-flash
 ```
 
 运行时 WS 事件同步日志：
@@ -967,7 +967,7 @@ systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 | `RISK_CORRECTION_ENABLED` | `true` | 风控拒绝后给 LLM 一次更正机会（设为 `false` 关闭） |
 | **订单监控 (实时 WebSocket + Flash LLM)** | | |
 | `MONITOR_ENABLED` | `true` | 开启实时订单状态监控 |
-| `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash 模型（轻量汇报） |
+| `MONITOR_FLASH_MODEL` | `deepseek-flash` | Flash 模型（轻量汇报） |
 | `MONITOR_FLASH_BASE_URL` | 同 `DEEPSEEK_BASE_URL` | Flash 模型 API 端点 |
 | `MONITOR_FLASH_API_KEY` | 同 `DEEPSEEK_API_KEY` | Flash 模型 API Key（留空复用） |
 | **日志** | | |
@@ -1859,7 +1859,7 @@ curl -s https://api.deepseek.com/v1/chat/completions \
 ```bash
 # .env
 MONITOR_ENABLED=true                  # 开启（默认）
-MONITOR_FLASH_MODEL=deepseek-v4-flash # Flash 模型
+MONITOR_FLASH_MODEL=deepseek-flash # Flash 模型
 ```
 
 通知事件包括：入场成交、止损/止盈触发、部分成交、订单取消/被拒、仓位清算。如果 Flash 模型不可用，自动降级为格式化文本通知。

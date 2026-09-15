@@ -550,7 +550,7 @@ class FlashReporter:
     def __init__(
         self,
         event_queue: queue.Queue,
-        model: str = "deepseek-v4-flash",
+        model: str = "deepseek-flash",
         api_key: str | None = None,
         base_url: str | None = None,
         tracker: Any = None,  # PositionTracker for oid→type mapping

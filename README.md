@@ -178,7 +178,7 @@ This design is enforced through three-layer prompting (System Prompt + User Prom
 | LLM Orchestration | LangChain + LangGraph StateGraph |
 | State Persistence | LangGraph MemorySaver + JSONL files (fcntl locks) |
 | Exchange | Hyperliquid (Perpetual DEX) |
-| Real-Time Monitoring | Hyperliquid WebSocket + deepseek-v4-flash (lightweight reporting) |
+| Real-Time Monitoring | Hyperliquid WebSocket + deepseek-flash (lightweight reporting) |
 | Structured Output | Pydantic + LangChain json_mode (response_format: json_object) |
 | Trade Execution | hyperliquid-python-sdk (15/15 full coverage) |
 
@@ -475,8 +475,8 @@ After the LLM places orders, they may fill at any time between cycles (especiall
 > ```
 > OrderMonitor started (address=0x...)
 > WebSocket subscribed: orderUpdates(#1) + userFills(#2)
-> FlashReporter started (model=deepseek-v4-flash, llm=enabled)   ← "fallback-only" = no API key, template notifications
-> Flash LLM health check OK (model=deepseek-v4-flash)             ← Flash model actually reachable
+> FlashReporter started (model=deepseek-flash, llm=enabled)   ← "fallback-only" = no API key, template notifications
+> Flash LLM health check OK (model=deepseek-flash)             ← Flash model actually reachable
 > ```
 >
 > If the Flash model later fails (rate limit, invalid model name), notifications degrade to fixed templates and the LLM is retried after a cooldown — pushes never disappear silently. Receiving NO order pushes at all means the monitor didn't start, not that the Flash model is down.
@@ -497,7 +497,7 @@ Hyperliquid WebSocket
          ▼
    FlashReporter (background thread)
     ├── Consume events
-    ├── Flash LLM generates Chinese notifications (deepseek-v4-flash)
+    ├── Flash LLM generates Chinese notifications (deepseek-flash)
     │    Falls back to deterministic formatting on failure
     └── Notifier → WeChat/Feishu push
 ```
@@ -559,7 +559,7 @@ LONG 0.0100 BTC @ $67200.0
 ```bash
 # .env
 MONITOR_ENABLED=true                     # Enable real-time monitoring (default on)
-MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash model (cheap & fast)
+MONITOR_FLASH_MODEL=deepseek-flash    # Flash model (cheap & fast)
 # MONITOR_FLASH_API_KEY=                 # Leave blank to reuse DEEPSEEK_API_KEY
 # MONITOR_FLASH_BASE_URL=                # Leave blank to reuse DEEPSEEK_BASE_URL
 ```
@@ -567,7 +567,7 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash model (cheap & fast)
 | Config | Default | Description |
 |--------|---------|-------------|
 | `MONITOR_ENABLED` | `true` | Enable/disable real-time monitoring. **Requires `DRY_RUN=false`** — the monitor (and Flash model) never starts in dry-run mode |
-| `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash model name. ~$0.02/1M tokens, <1s latency |
+| `MONITOR_FLASH_MODEL` | `deepseek-flash` | Flash model name. ~$0.02/1M tokens, <1s latency |
 | `MONITOR_FLASH_API_KEY` | Same as `DEEPSEEK_API_KEY` | Flash model API Key. Leave blank to reuse DeepSeek key |
 | `MONITOR_FLASH_BASE_URL` | Same as `DEEPSEEK_BASE_URL` | Flash model API endpoint |
 
@@ -578,8 +578,8 @@ MONITOR_FLASH_MODEL=deepseek-v4-flash    # Flash model (cheap & fast)
 ```
 OrderMonitor started (address=0xAeFB...)
 WebSocket subscribed: orderUpdates(#1) + userFills(#2)
-Order monitor active (flash_model=deepseek-v4-flash, llm=enabled)
-FlashReporter LLM ready: deepseek-v4-flash
+Order monitor active (flash_model=deepseek-flash, llm=enabled)
+FlashReporter LLM ready: deepseek-flash
 ```
 
 Runtime WS event sync logs:
@@ -968,7 +968,7 @@ systemctl is-active kimi-quant || echo "WARNING: Bot is not running!"
 | `RISK_CORRECTION_ENABLED` | `true` | Give LLM one correction chance after risk rejection (set `false` to disable) |
 | **Order Monitoring (RT WebSocket + Flash LLM)** | | |
 | `MONITOR_ENABLED` | `true` | Enable real-time order state monitoring |
-| `MONITOR_FLASH_MODEL` | `deepseek-v4-flash` | Flash model (lightweight reporting) |
+| `MONITOR_FLASH_MODEL` | `deepseek-flash` | Flash model (lightweight reporting) |
 | `MONITOR_FLASH_BASE_URL` | Same as `DEEPSEEK_BASE_URL` | Flash model API endpoint |
 | `MONITOR_FLASH_API_KEY` | Same as `DEEPSEEK_API_KEY` | Flash model API Key (leave blank to reuse) |
 | **Logging** | | |
@@ -1860,7 +1860,7 @@ Yes. **OrderMonitor** subscribes to order state changes via Hyperliquid WebSocke
 ```bash
 # .env
 MONITOR_ENABLED=true                  # Enable (default)
-MONITOR_FLASH_MODEL=deepseek-v4-flash # Flash model
+MONITOR_FLASH_MODEL=deepseek-flash # Flash model
 ```
 
 Notification events include: entry fills, SL/TP triggers, partial fills, order cancelation/rejection, position liquidation. If Flash model is unavailable, auto-fallback to formatted text notifications.

@@ -184,7 +184,7 @@ class Config:
     )
     monitor_flash_model: str = field(
         default_factory=lambda: os.getenv(
-            "MONITOR_FLASH_MODEL", "deepseek-v4-flash"
+            "MONITOR_FLASH_MODEL", "deepseek-flash"
         )
     )
     monitor_flash_base_url: str = field(
